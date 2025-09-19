@@ -1,0 +1,7 @@
+/target
+/temp
+/.direnv
+/docs/.obsidian/workspace.json
+/perf.data*
+/flamegraph.svg
+/scripts/present
