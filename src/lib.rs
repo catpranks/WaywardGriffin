@@ -5,6 +5,7 @@ mod display;
 pub mod sizer;
 
 use crate::capture::plotter::{Plotter, PlotterHandle};
+use crate::sizer::{SharedSizer, Sizer};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use clap::Parser;
@@ -45,7 +46,8 @@ pub fn run() -> Result<()> {
         capture: !opts.nocapture,
         force_relative: false,
     }));
-    let plotter = Plotter::new(global_state.clone());
+    let sizer: SharedSizer = Arc::new(ArcSwap::from_pointee(Sizer::default()));
+    let plotter = Plotter::new(global_state.clone(), sizer.clone());
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("info,{}=debug", crate_name)));
     let ph = plotter.handle();
@@ -63,7 +65,8 @@ pub fn run() -> Result<()> {
         .init();
     let ph = plotter.handle();
     let opts2 = opts.clone();
-    std::thread::spawn(move || display::run(opts2, global_state, ph));
+    let sizer2 = sizer.clone();
+    std::thread::spawn(move || display::run(opts2, global_state, ph, sizer2));
     plotter.run(opts.tdelay)
 }
 

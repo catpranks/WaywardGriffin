@@ -8,7 +8,6 @@ use crate::display::input::{InputThreadHandle, InputThreadInit};
 use crate::sizer::{SharedSizer, Sizer};
 use crate::{GlobalState, Opts};
 use anyhow::{Context as _, Result, anyhow, bail};
-use arc_swap::ArcSwap;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -379,7 +378,12 @@ delegate_shm!(App);
 delegate_simple!(App, WpFractionalScaleManagerV1, 1);
 delegate_simple!(App, WpViewporter, 1);
 
-fn run_internal(opts: Opts, global_state: GlobalState, ph: PlotterHandle) -> Result<()> {
+fn run_internal(
+    opts: Opts,
+    global_state: GlobalState,
+    ph: PlotterHandle,
+    sizer: SharedSizer,
+) -> Result<()> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
     let conn = Connection::connect_to_env()?;
@@ -408,8 +412,6 @@ fn run_internal(opts: Opts, global_state: GlobalState, ph: PlotterHandle) -> Res
     window.set_title("WaywardGriffin");
     window.set_app_id("waygriff");
     window.commit();
-    let sizer = Arc::new(ArcSwap::from_pointee(Sizer::default()));
-
     let cursor_surface = compositor_state.create_surface(&qh);
     let init = InputThreadInit {
         conn: conn.clone(),
@@ -509,6 +511,6 @@ fn run_internal(opts: Opts, global_state: GlobalState, ph: PlotterHandle) -> Res
     }
 }
 
-pub fn run(opts: Opts, global_state: GlobalState, ph: PlotterHandle) {
-    ph.fatal(run_internal(opts, global_state, ph.clone()).context("display thread"));
+pub fn run(opts: Opts, global_state: GlobalState, ph: PlotterHandle, sizer: SharedSizer) {
+    ph.fatal(run_internal(opts, global_state, ph.clone(), sizer).context("display thread"));
 }

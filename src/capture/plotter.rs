@@ -1,6 +1,7 @@
 use crate::GlobalState;
 use crate::GlobalStateInner;
 use crate::capture::nvcapture::FrameInfo;
+use crate::sizer::SharedSizer;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use crossterm::event::{self, Event, KeyCode};
@@ -69,22 +70,24 @@ pub struct Plotter {
     handle: PlotterHandle,
     rx: mpsc::Receiver<PlotEvent>,
     global_state: Arc<ArcSwap<GlobalStateInner>>,
+    sizer: SharedSizer,
 }
 
 impl Plotter {
-    pub fn new(global_state: Arc<ArcSwap<GlobalStateInner>>) -> Self {
+    pub fn new(global_state: Arc<ArcSwap<GlobalStateInner>>, sizer: SharedSizer) -> Self {
         let (tx, rx) = mpsc::sync_channel(1024);
         Self {
             handle: PlotterHandle(tx),
             rx,
             global_state,
+            sizer,
         }
     }
 
     pub fn run(self, delay: Option<Duration>) -> Result<()> {
         let mut res = Ok(());
         if let Some(delay) = delay {
-            let mut app = App::new(delay, self.global_state.clone());
+            let mut app = App::new(delay, self.global_state.clone(), self.sizer.clone());
             let terminal = ratatui::init();
             let app_result = app.run(&self.rx, terminal);
             ratatui::restore();
@@ -235,6 +238,7 @@ struct App {
     delay: Duration,
     log_scroll: usize,
     global_state: GlobalState,
+    sizer: SharedSizer,
     present_frames: VecDeque<Instant>,
     capture_frames: VecDeque<Instant>,
     present_drops: VecDeque<Instant>,
@@ -242,13 +246,14 @@ struct App {
 }
 
 impl App {
-    fn new(delay: Duration, global_state: GlobalState) -> Self {
+    fn new(delay: Duration, global_state: GlobalState, sizer: SharedSizer) -> Self {
         Self {
             logs: Vec::new(),
             timings: Timings(VecDeque::new()),
             delay,
             log_scroll: 0,
             global_state,
+            sizer,
             present_frames: VecDeque::new(),
             capture_frames: VecDeque::new(),
             present_drops: VecDeque::new(),
@@ -436,8 +441,20 @@ impl App {
             .split(chunks[0]);
         let data_area = chart_chunks[1];
 
+        let sizer = self.sizer.load();
+        let source_size = self
+            .timings
+            .back()
+            .map(|t| t.info.size)
+            .unwrap_or(sizer.source_size);
+        let render_size = sizer.render_size;
+        let chart_title = format!(
+            "Frame timings {}x{} -> {}x{}",
+            source_size.0, source_size.1, render_size.0, render_size.1
+        );
+
         let chart = Chart::new(datasets)
-            .block(Block::bordered().title("Frame timings"))
+            .block(Block::bordered().title(chart_title))
             .x_axis(
                 Axis::default()
                     .style(Style::default().fg(Color::Gray))
