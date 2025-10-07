@@ -16,6 +16,7 @@ use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
 use std::collections::VecDeque;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
+use tracing::info;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, ClearColorImageInfo, CommandBuffer, CommandBufferBeginInfo,
@@ -533,17 +534,26 @@ impl Capture {
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
-        unsafe { ifl.fence.reset() }?;
 
         let AcquiredImage {
             image_index,
-            is_suboptimal: _is_suboptimal,
+            is_suboptimal,
         } = unsafe {
             self.swapchain.acquire_next_image(&AcquireNextImageInfo {
                 semaphore: Some(ifl.acquire.clone()),
                 ..Default::default()
             })
         }?;
+        if is_suboptimal {
+            info!("suboptimal, resizing");
+            self.bufs.push_back(source_buf);
+            self.resize(sizer)?;
+            self.ph.drop(plotter::EventType::Present);
+            self.wl_surface.commit();
+            return Ok(());
+        };
+
+        unsafe { ifl.fence.reset() }?;
 
         let fb = self.images[image_index as usize].clone();
         let swapchain_image = self.images[image_index as usize].attachments()[0]
