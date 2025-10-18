@@ -91,7 +91,8 @@ impl Capture {
         let stream = std::ptr::null_mut();
         self.capturer.bind_thread()?;
         let start = Instant::now();
-        let (dptr, info) = self.capturer.capture_frame(Some(CAPTURE_WAIT))?;
+        // let (dptr, info) = self.capturer.capture_frame(Some(CAPTURE_WAIT))?;
+        let (dptr, info) = self.capturer.capture_frame(Some(Duration::default()))?;
         if info.is_new_frame {
             self.ph.frame(plotter::EventType::Capture);
         } else {
