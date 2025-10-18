@@ -112,7 +112,7 @@ struct InFlight {
 pub enum CaptureCommand {
     Resize(Sizer),
     Frame(Sizer),
-    ForceRender,
+    ForceRender(Sizer),
 }
 
 #[derive(Clone)]
@@ -129,8 +129,8 @@ impl CaptureHandle {
         let _ = self.cmd.send(CaptureCommand::Frame(sizer.clone()));
     }
 
-    pub fn force_render(&self) {
-        let _ = self.cmd.send(CaptureCommand::ForceRender);
+    pub fn force_render(&self, sizer: &Sizer) {
+        let _ = self.cmd.send(CaptureCommand::ForceRender(sizer.clone()));
     }
 }
 
@@ -425,7 +425,7 @@ impl Capture {
             match cmd {
                 CaptureCommand::Resize(sizer) => self.resize(&sizer)?,
                 CaptureCommand::Frame(sizer) => self.render(&sizer)?,
-                CaptureCommand::ForceRender => self.force_render()?,
+                CaptureCommand::ForceRender(sizer) => self.force_render(&sizer)?,
             }
         }
         Ok(())
@@ -456,21 +456,28 @@ impl Capture {
         Ok(())
     }
 
-    pub fn force_render(&mut self) -> Result<()> {
+    pub fn force_render(&mut self, sizer: &Sizer) -> Result<()> {
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
-        unsafe { ifl.fence.reset() }?;
 
         let AcquiredImage {
             image_index,
-            is_suboptimal: _is_suboptimal,
+            is_suboptimal,
         } = unsafe {
             self.swapchain.acquire_next_image(&AcquireNextImageInfo {
                 semaphore: Some(ifl.acquire.clone()),
                 ..Default::default()
             })
         }?;
+        if is_suboptimal {
+            info!("suboptimal, resizing");
+            self.resize(sizer)?;
+            self.wl_surface.commit();
+            return Ok(());
+        }
+
+        unsafe { ifl.fence.reset() }?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
@@ -522,7 +529,7 @@ impl Capture {
 
     pub fn render(&mut self, sizer: &Sizer) -> Result<()> {
         if !self.global_state.load().capture {
-            return self.force_render();
+            return self.force_render(sizer);
         }
         let Some(frame) = self.capture()? else {
             self.ph.drop(plotter::EventType::Present);

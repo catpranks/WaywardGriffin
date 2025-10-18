@@ -193,7 +193,8 @@ impl WindowHandler for App {
             if let Err(e) = self.renderer.render() {
                 self.res = Some(Err(e).context("first UI render"));
             }
-            self.ch.force_render();
+            let sizer = (**self.sizer.load()).clone();
+            self.ch.force_render(&sizer);
             info!("render forced");
         } else {
             self.sched_resize();
