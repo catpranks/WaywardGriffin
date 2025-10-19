@@ -83,7 +83,7 @@ impl Drop for CudaArray {
 unsafe impl Send for CudaArray {}
 unsafe impl Sync for CudaArray {}
 
-const CAPTURE_WAIT: Duration = Duration::from_millis(2);
+// const CAPTURE_WAIT: Duration = Duration::from_millis(2);
 
 impl Capture {
     pub fn capture(&mut self) -> Result<Option<CapturedFrame>> {
