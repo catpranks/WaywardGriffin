@@ -13,31 +13,31 @@ lto = "fat"
 codegen-units = 1
 
 [dependencies]
-anyhow = { version = "1.0.99", features = ["backtrace"] }
-arc-swap = "1.7.1"
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+arc-swap = "1.8.0"
 ash = "0.38.0"
-bytemuck = "1.23.2"
-clap = { version = "4.5.47", features = ["derive"] }
+bytemuck = "1.24.0"
+clap = { version = "4.5.54", features = ["derive"] }
 copypasta = "0.10.2"
 crossterm = "0.29.0"
-cudarc = { version = "0.17.3", features = ["cuda-version-from-build-system"] }
+cudarc = { version = "0.18.2", features = ["cuda-version-from-build-system"] }
 drm-fourcc = "2.2.0"
 humantime = "2.3.0"
 itertools = "0.14.0"
-pastey = "0.1.1"
-ratatui = "0.29.0"
-ratatui-widgets = "0.2.2"
+pastey = "0.2.1"
+ratatui = "0.30.0"
+ratatui-widgets = "0.3.0"
 smallvec = "1.15.1"
 smithay-client-toolkit = "0.20.0"
-thiserror = "2.0.16"
+thiserror = "2.0.17"
 tinyvec = "1.10.0"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 vulkano = "0.35.2"
 vulkano-shaders = "0.35.0"
-wayland-backend = { version = "0.3.11", features = ["client_system"] }
+wayland-backend = { version = "0.3.12", features = ["client_system"] }
 x11rb = { version = "0.13.2", features = ["xtest"] }
 xkeysym = "0.2.1"
 
 [build-dependencies]
-cc = "1.2.37"
+cc = "1.2.51"

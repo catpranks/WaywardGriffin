@@ -52,7 +52,7 @@ impl CudaArray {
                 NumChannels: 4,
                 Flags: CUDA_ARRAY3D_COLOR_ATTACHMENT | CUDA_ARRAY3D_SURFACE_LDST,
             },
-            ..Default::default()
+            reserved: [0; 16],
         };
         unsafe { cuExternalMemoryGetMappedMipmappedArray(&mut marray as _, ext_mem, &desc as _) }
             .result()?;
@@ -123,14 +123,22 @@ impl Capture {
         let (width, height) = info.size;
         let pitch = (width * 4) as usize;
         let copy = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
             srcMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            srcHost: std::ptr::null(),
             srcDevice: dptr,
+            srcArray: std::ptr::null_mut(),
             srcPitch: pitch,
+            dstXInBytes: 0,
+            dstY: 0,
             dstMemoryType: CUmemorytype::CU_MEMORYTYPE_ARRAY,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: 0,
             dstArray: buf.cumem.array,
+            dstPitch: 0,
             WidthInBytes: pitch,
             Height: height as usize,
-            ..Default::default()
         };
         unsafe { cuMemcpy2DAsync_v2(&copy as _, stream) }.result()?;
         unsafe { stream::synchronize(stream) }?;
