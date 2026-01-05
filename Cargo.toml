@@ -22,15 +22,11 @@ copypasta = "0.10.2"
 crossterm = "0.29.0"
 cudarc = { version = "0.17.3", features = ["cuda-version-from-build-system"] }
 drm-fourcc = "2.2.0"
-egui = "0.32.3"
-egui-wgpu = "0.32.3"
 humantime = "2.3.0"
 itertools = "0.14.0"
 pastey = "0.1.1"
-pollster = "0.4.0"
 ratatui = "0.29.0"
 ratatui-widgets = "0.2.2"
-raw-window-handle = "0.6.2"
 smallvec = "1.15.1"
 smithay-client-toolkit = "0.20.0"
 thiserror = "2.0.16"
@@ -40,7 +36,6 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 vulkano = "0.35.2"
 vulkano-shaders = "0.35.0"
 wayland-backend = { version = "0.3.11", features = ["client_system"] }
-wgpu = "25"
 x11rb = { version = "0.13.2", features = ["xtest"] }
 xkeysym = "0.2.1"
 

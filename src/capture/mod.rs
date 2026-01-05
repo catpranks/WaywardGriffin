@@ -15,7 +15,7 @@ use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
 use std::collections::VecDeque;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::info;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
@@ -60,6 +60,15 @@ use vulkano::sync::{
 };
 use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
 
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct BorderPushConstants {
+    time: f32,
+    show_border: u32,
+    content_width: f32,
+    content_height: f32,
+}
+
 mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
@@ -94,9 +103,34 @@ mod fs {
             layout(set = 0, binding = 0) uniform sampler s;
             layout(set = 0, binding = 1) uniform texture2D tex;
 
+            layout(push_constant) uniform PushConstants {
+                float time;
+                uint show_border;
+                float content_width;
+                float content_height;
+            } pc;
+
             void main() {
                 f_color = texture(sampler2D(tex, s), tex_coords);
                 f_color.a = 1.0;
+
+                if (pc.show_border != 0u) {
+                    float sine_val = (sin(pc.time * 2.0) + 1.0) / 2.0;
+                    float border_width_px = 15.0 + sine_val * 10.0;
+                    float alpha = (5.0 + sine_val * 150.0) / 255.0;
+
+                    // Convert to pixel coords
+                    float px = tex_coords.x * pc.content_width;
+                    float py = tex_coords.y * pc.content_height;
+
+                    float edge_dist = min(min(px, pc.content_width - px),
+                                          min(py, pc.content_height - py));
+
+                    if (edge_dist < border_width_px) {
+                        vec3 teal = vec3(0.0, 0.78, 0.78);
+                        f_color.rgb = mix(f_color.rgb, teal, alpha);
+                    }
+                }
             }
         ",
     }
@@ -165,6 +199,7 @@ pub struct Capture {
     ctx: Arc<CudaContext>,
     device: Arc<Device>,
     _surface: Arc<Surface>,
+    start_time: Instant,
 }
 
 impl Capture {
@@ -272,7 +307,7 @@ impl Capture {
                     image_color_space: ColorSpace::SrgbNonLinear,
                     image_extent: [1, 1],
                     image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
-                    composite_alpha: CompositeAlpha::PreMultiplied,
+                    composite_alpha: CompositeAlpha::Opaque,
                     present_mode: PresentMode::Mailbox,
                     ..Default::default()
                 },
@@ -411,6 +446,7 @@ impl Capture {
             ctx,
             device,
             _surface: surface,
+            start_time: Instant::now(),
         };
         Ok(this)
     }
@@ -650,6 +686,17 @@ impl Capture {
                 .as_raw()],
                 &[],
             )?;
+            let push_constants = BorderPushConstants {
+                time: self.start_time.elapsed().as_secs_f32(),
+                show_border: if self.global_state.load().confine {
+                    0
+                } else {
+                    1
+                },
+                content_width: content.width as f32,
+                content_height: content.height as f32,
+            };
+            cmd.push_constants(self.pipeline.layout(), 0, &push_constants)?;
             // Full-screen triangle via gl_VertexIndex in the VS
             cmd.draw(3, 1, 0, 0)?;
             cmd.end_render_pass(&Default::default())?;

@@ -1,5 +1,4 @@
 mod input;
-mod render;
 mod xinput;
 
 use crate::capture::plotter::{self, PlotterHandle};
@@ -18,7 +17,6 @@ use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
-use smithay_client_toolkit::reexports::client::protocol::wl_subsurface::WlSubsurface;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::{
@@ -36,11 +34,9 @@ use smithay_client_toolkit::shell::xdg::window::{
     Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
-use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{
     delegate_compositor, delegate_dmabuf, delegate_output, delegate_registry, delegate_shm,
-    delegate_simple, delegate_subcompositor, delegate_xdg_shell, delegate_xdg_window,
-    registry_handlers,
+    delegate_simple, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +56,6 @@ struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     compositor_state: CompositorState,
-    _subcompositor_state: SubcompositorState,
     dmabuf_state: DmabufState,
     shm_state: Shm,
     _xdg_shell: XdgShell,
@@ -69,18 +64,14 @@ struct App {
 
     // Wayland Objects
     surface: WlSurface,
-    _ui_surface: WlSurface,
-    _subsurface: WlSubsurface,
     viewport: WpViewport,
     _wp_frac: Option<WpFractionalScaleV1>,
 
     // Application Logic
     ch: CaptureHandle,
     sizer: SharedSizer,
-    _global_state: GlobalState,
 
     // Window & Render State
-    renderer: render::Renderer,
     size: (u32, u32),
     scale120: u32,
     last_commited_sizer: Option<Sizer>,
@@ -112,7 +103,6 @@ impl App {
         }
         self.sizer
             .rcu(|s| s.with_window_size(self.size, self.scale120));
-        self.renderer.resize(&self.sizer.load());
     }
 
     fn sched_resize(&mut self) {
@@ -152,11 +142,6 @@ impl App {
                 .unwrap();
         }
 
-        if let Err(e) = self.renderer.render() {
-            self.res = Some(Err(e).context("ui render"));
-            return;
-        }
-
         self.ch.frame(&sizer);
     }
 }
@@ -190,9 +175,6 @@ impl WindowHandler for App {
             self.handle_resize();
 
             self.surface.frame(qh, self.surface.clone());
-            if let Err(e) = self.renderer.render() {
-                self.res = Some(Err(e).context("first UI render"));
-            }
             let sizer = (**self.sizer.load()).clone();
             self.ch.force_render(&sizer);
             info!("render forced");
@@ -371,7 +353,6 @@ impl ShmHandler for App {
 delegate_xdg_window!(App);
 delegate_xdg_shell!(App);
 delegate_compositor!(App);
-delegate_subcompositor!(App);
 delegate_dmabuf!(App);
 delegate_output!(App);
 delegate_registry!(App);
@@ -396,16 +377,9 @@ fn run_internal(
     let (tx_input, rx_input) = channel();
     let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let compositor_state = CompositorState::bind(&globals, &qh)?;
-    let subcompositor_state =
-        SubcompositorState::bind(compositor_state.wl_compositor().clone(), &globals, &qh)?;
     let shm_state = Shm::bind(&globals, &qh)?;
     let wl_shm = shm_state.wl_shm().clone();
     let surface = compositor_state.create_surface(&qh);
-    let (subsurface, ui_surface) = subcompositor_state.create_subsurface(surface.clone(), &qh);
-    let empty_region = Region::new(&compositor_state)?;
-    ui_surface.set_input_region(Some(empty_region.wl_region()));
-    subsurface.set_position(0, 0);
-    subsurface.place_above(&surface);
     let wp_viewporter = SimpleGlobal::<WpViewporter, 1>::bind(&globals, &qh)?;
     let viewport = wp_viewporter.get()?.get_viewport(&surface, &qh, ());
 
@@ -445,7 +419,6 @@ fn run_internal(
     let ch = capture.handle.clone();
     std::thread::spawn(move || capture.run());
     ch.resize(&sizer.load());
-    let renderer = render::Renderer::new(&conn, &ui_surface, global_state.clone())?;
 
     let mut app = App {
         // Handles
@@ -457,7 +430,6 @@ fn run_internal(
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         compositor_state,
-        _subcompositor_state: subcompositor_state,
         dmabuf_state: DmabufState::new(&globals, &qh),
         shm_state,
         _xdg_shell: xdg_shell,
@@ -466,18 +438,14 @@ fn run_internal(
 
         // Wayland Objects
         surface: surface.clone(),
-        _ui_surface: ui_surface,
-        _subsurface: subsurface,
         viewport,
         _wp_frac: wp_frac,
 
         // Application Logic
         ch,
         sizer,
-        _global_state: global_state,
 
         // Window & Render State
-        renderer,
         size: (0, 0),
         scale120: 120,
         last_commited_sizer: None,
