@@ -33,6 +33,9 @@ struct Opts {
     /// don't capture from start
     #[arg(long)]
     nocapture: bool,
+
+    #[command(flatten)]
+    capture_opts: capture::CaptureOpts,
 }
 
 pub fn run() -> Result<()> {

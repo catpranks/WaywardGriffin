@@ -7,6 +7,15 @@ use crate::capture::cuda::MyBuffer;
 use crate::capture::nvcapture::NvCapture;
 use crate::capture::plotter::PlotterHandle;
 use crate::sizer::{SharedSizer, Sizer};
+
+use clap::Args;
+
+#[derive(Debug, Clone, Args)]
+pub struct CaptureOpts {
+    /// ignore NVFBC frame dirty indicator
+    #[arg(long, default_value_t = true)]
+    pub ignore_nvfbc_dirty: bool,
+}
 use anyhow::{Context as _, Result};
 use cudarc::driver::safe::CudaContext;
 use cudarc::driver::sys::CUctx_flags;
@@ -175,6 +184,7 @@ pub struct Capture {
     rx_cmd: mpsc::Receiver<CaptureCommand>,
     ph: PlotterHandle,
     global_state: GlobalState,
+    opts: CaptureOpts,
 
     sizer: SharedSizer,
     wl_surface: WlSurface,
@@ -206,6 +216,7 @@ impl Capture {
     pub fn new(
         ph: PlotterHandle,
         global_state: GlobalState,
+        opts: CaptureOpts,
         conn: &Connection,
         wl_surface: &WlSurface,
         sizer: SharedSizer,
@@ -428,6 +439,7 @@ impl Capture {
             rx_cmd,
             ph,
             global_state,
+            opts,
             sizer,
             wl_surface: wl_surface.clone(),
             frame_idx: 0,

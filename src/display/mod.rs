@@ -412,6 +412,7 @@ fn run_internal(
     let mut capture = Capture::new(
         ph.clone(),
         global_state.clone(),
+        opts.capture_opts.clone(),
         &conn,
         &surface,
         sizer.clone(),

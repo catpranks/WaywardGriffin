@@ -97,7 +97,9 @@ impl Capture {
             self.ph.frame(plotter::EventType::Capture);
         } else {
             self.ph.drop(plotter::EventType::Capture);
-            return Ok(None);
+            if !self.opts.ignore_nvfbc_dirty {
+                return Ok(None);
+            }
         }
         let capture_time = start.elapsed();
         if self.sizer.load().source_size != info.size {
