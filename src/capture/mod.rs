@@ -549,9 +549,7 @@ impl Capture {
                 ..SemaphoreSubmitInfo::new(ifl.acquire.clone())
             }],
             command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
-            signal_semaphores: vec![SemaphoreSubmitInfo {
-                ..SemaphoreSubmitInfo::new(ifl.present.clone())
-            }],
+            signal_semaphores: vec![SemaphoreSubmitInfo::new(ifl.present.clone())],
             ..Default::default()
         };
 

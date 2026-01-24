@@ -24,13 +24,11 @@ cudarc = { version = "0.18.2", features = ["cuda-version-from-build-system"] }
 drm-fourcc = "2.2.0"
 humantime = "2.3.0"
 itertools = "0.14.0"
-pastey = "0.2.1"
 ratatui = "0.30.0"
 ratatui-widgets = "0.3.0"
 smallvec = "1.15.1"
 smithay-client-toolkit = "0.20.0"
 thiserror = "2.0.17"
-tinyvec = "1.10.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 vulkano = "0.35.2"

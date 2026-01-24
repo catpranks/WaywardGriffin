@@ -83,23 +83,19 @@ pub struct GlobalStateInner {
     pub force_relative: bool,
 }
 
-macro_rules! with_field {
-    ($field:ident) => {
-        pastey::paste! {
-        pub fn [<with_ $field>](&self, $field: bool) -> Self {
-                let mut new_state = self.clone();
-                new_state.$field = $field;
-                new_state
-            }
-        }
-    };
-}
-
 impl GlobalStateInner {
-    with_field!(cursor_visible);
-    with_field!(confine);
-    with_field!(capture);
-    with_field!(force_relative);
+    pub fn with_cursor_visible(&self, v: bool) -> Self {
+        Self { cursor_visible: v, ..self.clone() }
+    }
+    pub fn with_confine(&self, v: bool) -> Self {
+        Self { confine: v, ..self.clone() }
+    }
+    pub fn with_capture(&self, v: bool) -> Self {
+        Self { capture: v, ..self.clone() }
+    }
+    pub fn with_force_relative(&self, v: bool) -> Self {
+        Self { force_relative: v, ..self.clone() }
+    }
 }
 
 struct PlotterWriter {
@@ -124,29 +120,23 @@ impl Drop for PlotterWriter {
     }
 }
 
-macro_rules! impl_owning_wrapper {
-    ($wrapper_name:ident, $inner_type:ty) => {
-        pub struct $wrapper_name(pub $inner_type);
+pub struct OwningWlBuffer(pub WlBuffer);
 
-        impl std::ops::Deref for $wrapper_name {
-            type Target = $inner_type;
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl std::ops::DerefMut for $wrapper_name {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.0
-            }
-        }
-
-        impl Drop for $wrapper_name {
-            fn drop(&mut self) {
-                self.0.destroy();
-            }
-        }
-    };
+impl std::ops::Deref for OwningWlBuffer {
+    type Target = WlBuffer;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl_owning_wrapper!(OwningWlBuffer, WlBuffer);
+impl std::ops::DerefMut for OwningWlBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for OwningWlBuffer {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}

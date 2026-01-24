@@ -9,7 +9,6 @@ use ratatui::DefaultTerminal;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::collections::VecDeque;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -164,49 +163,68 @@ impl FrameTimings {
     }
 }
 
-struct Timings(VecDeque<FrameTimings>);
+const DENSITY_FACTOR: usize = 8;
+const SCROLL_FROM_START: bool = true;
 
-impl Deref for Timings {
-    type Target = VecDeque<FrameTimings>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+struct App {
+    logs: Vec<String>,
+    timings: VecDeque<FrameTimings>,
+    delay: Duration,
+    log_scroll: usize,
+    global_state: GlobalState,
+    sizer: SharedSizer,
+    present_frames: VecDeque<Instant>,
+    capture_frames: VecDeque<Instant>,
+    present_drops: VecDeque<Instant>,
+    capture_drops: VecDeque<Instant>,
 }
 
-impl DerefMut for Timings {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl App {
+    fn new(delay: Duration, global_state: GlobalState, sizer: SharedSizer) -> Self {
+        Self {
+            logs: Vec::new(),
+            timings: VecDeque::new(),
+            delay,
+            log_scroll: 0,
+            global_state,
+            sizer,
+            present_frames: VecDeque::new(),
+            capture_frames: VecDeque::new(),
+            present_drops: VecDeque::new(),
+            capture_drops: VecDeque::new(),
+        }
     }
-}
 
-impl Timings {
-    fn avg(&self) -> (f64, f64, f64, f64) {
-        if self.is_empty() {
+    fn timings_avg(&self) -> (f64, f64, f64, f64) {
+        if self.timings.is_empty() {
             return (0.0, 0.0, 0.0, 0.0);
         }
         let (capture, wait, cuda, commit) = self
+            .timings
             .iter()
             .fold((0.0, 0.0, 0.0, 0.0), |(cap, w, cu, cm), t| {
                 (cap + t.capture, w + t.wait, cu + t.cuda, cm + t.commit)
             });
-        let len = self.len() as f64;
+        let len = self.timings.len() as f64;
         (capture / len, wait / len, cuda / len, commit / len)
     }
 
-    fn commit_min_max(&self) -> (f64, f64) {
-        if self.is_empty() {
+    fn timings_commit_min_max(&self) -> (f64, f64) {
+        if self.timings.is_empty() {
             return (0.0, 0.0);
         }
-        self.iter()
+        self.timings
+            .iter()
             .map(|t| t.commit)
-            .fold((f64::MAX, f64::MIN), |(min, max), v| {
-                (min.min(v), max.max(v))
-            })
+            .fold((f64::MAX, f64::MIN), |(min, max), v| (min.min(v), max.max(v)))
     }
 
-    fn fps(&self) -> f64 {
-        let Some(now) = self.back() else { return 0.0 };
+    fn timings_fps(&self) -> f64 {
+        let Some(now) = self.timings.back() else {
+            return 0.0;
+        };
         let recent_frames: Vec<_> = self
+            .timings
             .iter()
             .rev()
             .take_while(|t| now.start.duration_since(t.start) <= Duration::from_secs(2))
@@ -227,39 +245,6 @@ impl Timings {
 
         (recent_frames.len() - 1) as f64 / seconds
     }
-}
-
-const DENSITY_FACTOR: usize = 8;
-const SCROLL_FROM_START: bool = true;
-
-struct App {
-    logs: Vec<String>,
-    timings: Timings,
-    delay: Duration,
-    log_scroll: usize,
-    global_state: GlobalState,
-    sizer: SharedSizer,
-    present_frames: VecDeque<Instant>,
-    capture_frames: VecDeque<Instant>,
-    present_drops: VecDeque<Instant>,
-    capture_drops: VecDeque<Instant>,
-}
-
-impl App {
-    fn new(delay: Duration, global_state: GlobalState, sizer: SharedSizer) -> Self {
-        Self {
-            logs: Vec::new(),
-            timings: Timings(VecDeque::new()),
-            delay,
-            log_scroll: 0,
-            global_state,
-            sizer,
-            present_frames: VecDeque::new(),
-            capture_frames: VecDeque::new(),
-            present_drops: VecDeque::new(),
-            capture_drops: VecDeque::new(),
-        }
-    }
 
     fn run(&mut self, rx: &mpsc::Receiver<PlotEvent>, mut terminal: DefaultTerminal) -> Result<()> {
         loop {
@@ -269,34 +254,15 @@ impl App {
             }
 
             let two_seconds_ago = Instant::now() - Duration::from_secs(2);
-            while self
-                .present_frames
-                .front()
-                .is_some_and(|t| *t < two_seconds_ago)
-            {
-                self.present_frames.pop_front();
-            }
-            while self
-                .capture_frames
-                .front()
-                .is_some_and(|t| *t < two_seconds_ago)
-            {
-                self.capture_frames.pop_front();
-            }
-            while self
-                .present_drops
-                .front()
-                .is_some_and(|t| *t < two_seconds_ago)
-            {
-                self.present_drops.pop_front();
-            }
-            while self
-                .capture_drops
-                .front()
-                .is_some_and(|t| *t < two_seconds_ago)
-            {
-                self.capture_drops.pop_front();
-            }
+            let trim_old = |q: &mut VecDeque<Instant>| {
+                while q.front().is_some_and(|t| *t < two_seconds_ago) {
+                    q.pop_front();
+                }
+            };
+            trim_old(&mut self.present_frames);
+            trim_old(&mut self.capture_frames);
+            trim_old(&mut self.present_drops);
+            trim_old(&mut self.capture_drops);
 
             terminal.draw(|f| self.ui(f, history_size))?;
 
@@ -554,9 +520,9 @@ impl App {
         let state_vis = Paragraph::new(braille_chars);
         f.render_widget(state_vis, state_render_area);
 
-        let (avg_capture, avg_wait, avg_cuda, avg_commit) = self.timings.avg();
-        let (min_commit, max_commit) = self.timings.commit_min_max();
-        let render_fps = self.timings.fps();
+        let (avg_capture, avg_wait, avg_cuda, avg_commit) = self.timings_avg();
+        let (min_commit, max_commit) = self.timings_commit_min_max();
+        let render_fps = self.timings_fps();
 
         let present_fps = if self.present_frames.len() < 2 {
             0.0

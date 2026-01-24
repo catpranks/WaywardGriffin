@@ -1,6 +1,5 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
-use tinyvec::ArrayVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rect {
@@ -10,10 +9,9 @@ pub struct Rect {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sizing {
     pub content: Rect,
-    pub opaque: ArrayVec<[Rect; 2]>,
 }
 
 pub type SharedSizer = Arc<ArcSwap<Sizer>>;
@@ -129,54 +127,13 @@ impl Sizer {
         let scaled_x = (win_w - scaled_w) / 2;
         let scaled_y = (win_h - scaled_h) / 2;
 
-        let content = Rect {
-            x: scaled_x,
-            y: scaled_y,
-            width: scaled_w,
-            height: scaled_h,
-        };
-
-        let mut opaque = ArrayVec::new();
-        if scaled_w < win_w {
-            // Pillarbox
-            if scaled_x > 0 {
-                opaque.push(Rect {
-                    x: 0,
-                    y: 0,
-                    width: scaled_x,
-                    height: win_h,
-                });
-            }
-            let right_bar_x = scaled_x + scaled_w;
-            if right_bar_x < win_w {
-                opaque.push(Rect {
-                    x: right_bar_x,
-                    y: 0,
-                    width: win_w - right_bar_x,
-                    height: win_h,
-                });
-            }
-        } else if scaled_h < win_h {
-            // Letterbox
-            if scaled_y > 0 {
-                opaque.push(Rect {
-                    x: 0,
-                    y: 0,
-                    width: win_w,
-                    height: scaled_y,
-                });
-            }
-            let bottom_bar_y = scaled_y + scaled_h;
-            if bottom_bar_y < win_h {
-                opaque.push(Rect {
-                    x: 0,
-                    y: bottom_bar_y,
-                    width: win_w,
-                    height: win_h - bottom_bar_y,
-                });
-            }
+        Sizing {
+            content: Rect {
+                x: scaled_x,
+                y: scaled_y,
+                width: scaled_w,
+                height: scaled_h,
+            },
         }
-
-        Sizing { content, opaque }
     }
 }
