@@ -219,31 +219,16 @@ impl App {
             .fold((f64::MAX, f64::MIN), |(min, max), v| (min.min(v), max.max(v)))
     }
 
-    fn timings_fps(&self) -> f64 {
-        let Some(now) = self.timings.back() else {
-            return 0.0;
-        };
-        let recent_frames: Vec<_> = self
+    fn timings_fps(&self) -> Option<f64> {
+        let now = self.timings.back()?;
+        let (count, oldest) = self
             .timings
             .iter()
             .rev()
             .take_while(|t| now.start.duration_since(t.start) <= Duration::from_secs(2))
-            .collect();
-
-        if recent_frames.len() < 2 {
-            return 0.0;
-        }
-
-        let oldest = recent_frames.last().unwrap().start;
-        let newest = recent_frames.first().unwrap().start;
-        let duration = newest.duration_since(oldest);
-
-        let seconds = duration.as_secs_f64();
-        if seconds < 1e-9 {
-            return 0.0;
-        }
-
-        (recent_frames.len() - 1) as f64 / seconds
+            .fold((0, now.start), |(n, _), t| (n + 1, t.start));
+        let seconds = now.start.duration_since(oldest).as_secs_f64();
+        (count > 1 && seconds > 1e-9).then(|| (count - 1) as f64 / seconds)
     }
 
     fn run(&mut self, rx: &mpsc::Receiver<PlotEvent>, mut terminal: DefaultTerminal) -> Result<()> {
@@ -522,7 +507,7 @@ impl App {
 
         let (avg_capture, avg_wait, avg_cuda, avg_commit) = self.timings_avg();
         let (min_commit, max_commit) = self.timings_commit_min_max();
-        let render_fps = self.timings_fps();
+        let render_fps = self.timings_fps().unwrap_or(0.0);
 
         let present_fps = if self.present_frames.len() < 2 {
             0.0
