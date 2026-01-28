@@ -13,7 +13,7 @@ use clap::Args;
 #[derive(Debug, Clone, Args)]
 pub struct CaptureOpts {
     /// ignore NVFBC frame dirty indicator
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub ignore_nvfbc_dirty: bool,
 }
 use anyhow::{Context as _, Result};
@@ -221,6 +221,7 @@ impl Capture {
         wl_surface: &WlSurface,
         sizer: SharedSizer,
     ) -> Result<Self> {
+        info!("ignore_nvfbc_dirty: {}", opts.ignore_nvfbc_dirty);
         let ctx = CudaContext::new(0)?;
         ctx.set_flags(CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
         ctx.bind_to_thread()?;
