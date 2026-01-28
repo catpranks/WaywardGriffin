@@ -1,42 +1,17 @@
-mod cuda;
-mod nvcapture;
+pub mod backend;
 pub mod plotter;
 
 use crate::GlobalState;
-use crate::capture::cuda::MyBuffer;
-use crate::capture::nvcapture::NvCapture;
+use crate::capture::backend::{CaptureBackend, CaptureBackendBuilder};
 use crate::capture::plotter::PlotterHandle;
 use crate::sizer::{SharedSizer, Sizer};
-
-use clap::{Args, ValueEnum};
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CaptureBackend {
-    Nvfbc,
-    WlrScreencopy,
-    ExtImageCopy,
-    Kms,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct CaptureOpts {
-    /// Capture backend to use
-    #[arg(long, value_enum)]
-    pub backend: CaptureBackend,
-
-    /// ignore NVFBC frame dirty indicator
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub ignore_nvfbc_dirty: bool,
-}
 use anyhow::{Context as _, Result};
-use cudarc::driver::safe::CudaContext;
-use cudarc::driver::sys::CUctx_flags;
+use clap::{Args, ValueEnum};
 use smallvec::smallvec;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
-use std::collections::VecDeque;
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::info;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
@@ -80,6 +55,30 @@ use vulkano::sync::{
     AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer,
 };
 use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BackendType {
+    Nvfbc,
+    WlrScreencopy,
+    ExtImageCopy,
+    Kms,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CaptureOpts {
+    /// Capture backend to use
+    #[arg(long, value_enum)]
+    pub backend: BackendType,
+}
+
+pub fn create_backend_builder(opts: &CaptureOpts) -> Result<Box<dyn CaptureBackendBuilder>> {
+    match opts.backend {
+        BackendType::Nvfbc => Ok(Box::new(backend::nvfbc::Builder::new()?)),
+        BackendType::WlrScreencopy => todo!("wlr-screencopy backend"),
+        BackendType::ExtImageCopy => todo!("ext-image-copy backend"),
+        BackendType::Kms => todo!("kms backend"),
+    }
+}
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -189,22 +188,18 @@ impl CaptureHandle {
     }
 }
 
-const NUM_BUFFERS: usize = 3;
-
 pub struct Capture {
     pub handle: CaptureHandle,
     rx_cmd: mpsc::Receiver<CaptureCommand>,
     ph: PlotterHandle,
     global_state: GlobalState,
-    opts: CaptureOpts,
 
     sizer: SharedSizer,
     wl_surface: WlSurface,
 
     frame_idx: usize,
 
-    capturer: NvCapture,
-    bufs: VecDeque<MyBuffer>,
+    backend: Box<dyn CaptureBackend>,
 
     in_flight: Vec<InFlight>,
     images: Vec<Arc<Framebuffer>>,
@@ -215,10 +210,8 @@ pub struct Capture {
 
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    allocator: Arc<StandardMemoryAllocator>,
 
     queue: Arc<Queue>,
-    ctx: Arc<CudaContext>,
     device: Arc<Device>,
     _surface: Arc<Surface>,
     start_time: Instant,
@@ -228,17 +221,13 @@ impl Capture {
     pub fn new(
         ph: PlotterHandle,
         global_state: GlobalState,
-        opts: CaptureOpts,
+        backend_builder: Box<dyn CaptureBackendBuilder>,
         conn: &Connection,
         wl_surface: &WlSurface,
         sizer: SharedSizer,
     ) -> Result<Self> {
-        info!("ignore_nvfbc_dirty: {}", opts.ignore_nvfbc_dirty);
-        let ctx = CudaContext::new(0)?;
-        ctx.set_flags(CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
-        ctx.bind_to_thread()?;
-        // info!("Created CUDA context on device {}", ctx.name()?);
-        let capturer = NvCapture::new()?;
+        let device_uuid = backend_builder.device_uuid();
+
         let library = VulkanLibrary::new().expect("no local Vulkan library/driver found");
         let required_extensions = InstanceExtensions {
             khr_wayland_surface: true,
@@ -263,9 +252,6 @@ impl Capture {
             ..DeviceExtensions::empty()
         };
 
-        let cuda_uuid = ctx.uuid()?;
-        let cuda_uuid_u8: [u8; 16] = bytemuck::cast(cuda_uuid.bytes);
-
         let surface = unsafe {
             Surface::from_wayland(
                 instance.clone(),
@@ -275,10 +261,17 @@ impl Capture {
             )?
         };
 
-        let physical_device = instance
-            .enumerate_physical_devices()?
-            .find(|p| p.properties().device_uuid == Some(cuda_uuid_u8))
-            .context("No physical device found with matching CUDA UUID")?;
+        let physical_device = if let Some(uuid) = device_uuid {
+            instance
+                .enumerate_physical_devices()?
+                .find(|p| p.properties().device_uuid == Some(uuid))
+                .context("No physical device found with matching UUID")?
+        } else {
+            instance
+                .enumerate_physical_devices()?
+                .next()
+                .context("No physical devices found")?
+        };
 
         let queue_family_index = physical_device
             .queue_family_properties()
@@ -412,11 +405,7 @@ impl Capture {
             },
         )?;
 
-        let (_, info) = capturer.capture_frame(Some(Duration::ZERO))?;
-        capturer.release_thread()?;
-        let bufs = (0..NUM_BUFFERS)
-            .map(|_| MyBuffer::new(device.clone(), &allocator, ctx.clone(), info.size))
-            .collect::<Result<VecDeque<_>>>()?;
+        let backend = backend_builder.build(device.clone(), allocator.clone(), ph.clone())?;
 
         let in_flight = (0..3)
             .map(|_| {
@@ -452,12 +441,10 @@ impl Capture {
             rx_cmd,
             ph,
             global_state,
-            opts,
             sizer,
             wl_surface: wl_surface.clone(),
             frame_idx: 0,
-            capturer,
-            bufs,
+            backend,
             in_flight,
             images: vec![],
             pipeline,
@@ -466,9 +453,7 @@ impl Capture {
             swapchain,
             command_buffer_allocator,
             descriptor_set_allocator,
-            allocator,
             queue,
-            ctx,
             device,
             _surface: surface,
             start_time: Instant::now(),
@@ -590,12 +575,24 @@ impl Capture {
         if !self.global_state.load().capture {
             return self.force_render(sizer);
         }
-        let Some(frame) = self.capture()? else {
-            self.ph.drop(plotter::EventType::Present);
+        let Some(frame) = self.backend.capture()? else {
+            self.ph.skip();
             self.wl_surface.commit();
             return Ok(());
         };
-        let mut source_buf = frame.buf;
+
+        // Update sizer/global_state from frame info
+        let frame_size = frame.image.extent();
+        let frame_size = (frame_size[0], frame_size[1]);
+        if self.sizer.load().source_size != frame_size {
+            self.sizer.rcu(|s| s.with_source_size(frame_size));
+        }
+        if self.global_state.load().cursor_visible != frame.info.cursor_visible {
+            self.global_state
+                .rcu(|s| s.with_cursor_visible(frame.info.cursor_visible));
+        }
+
+        let source_image = frame.image.clone();
 
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
@@ -612,9 +609,9 @@ impl Capture {
         }?;
         if is_suboptimal {
             info!("suboptimal, resizing");
-            self.bufs.push_back(source_buf);
+            self.backend.release(frame, None);
             self.resize(sizer)?;
-            self.ph.drop(plotter::EventType::Present);
+            self.ph.skip();
             self.wl_surface.commit();
             return Ok(());
         };
@@ -652,7 +649,7 @@ impl Capture {
                         mip_levels: 0..1,
                         array_layers: 0..1,
                     },
-                    ..ImageMemoryBarrier::image(source_buf.image.clone())
+                    ..ImageMemoryBarrier::image(source_image.clone())
                 }],
                 ..Default::default()
             })?;
@@ -701,7 +698,7 @@ impl Capture {
                         WriteDescriptorSet::sampler(0, self.sampler.clone()),
                         WriteDescriptorSet::image_view(
                             1,
-                            ImageView::new_default(source_buf.image.clone())?,
+                            ImageView::new_default(source_image.clone())?,
                         ),
                     ],
                     [],
@@ -756,7 +753,7 @@ impl Capture {
                         mip_levels: 0..1,
                         array_layers: 0..1,
                     },
-                    ..ImageMemoryBarrier::image(source_buf.image.clone())
+                    ..ImageMemoryBarrier::image(source_image.clone())
                 }],
                 ..Default::default()
             })?;
@@ -800,12 +797,11 @@ impl Capture {
                 .context("present")
         })?;
 
-        source_buf.fence = Some(ifl.fence.clone());
-        self.bufs.push_back(source_buf);
+        let mut info = frame.info.clone();
+        self.backend.release(frame, Some(ifl.fence.clone()));
 
-        let mut info = frame.info;
         info.mark_commit();
-        self.ph.draw(info);
+        self.ph.render(info);
         self.frame_idx += 1;
         Ok(())
     }

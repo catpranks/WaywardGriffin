@@ -103,7 +103,10 @@ impl NvCapture {
         Ok(())
     }
 
-    pub fn capture_frame(&self, timeout: Option<Duration>) -> Result<(CUdeviceptr, NvfbcFrameInfo)> {
+    pub fn capture_frame(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<(CUdeviceptr, NvfbcFrameInfo)> {
         let timeout_ms = timeout.map(|d| d.as_millis() as u32).unwrap_or(1000);
         let mut dptr: CUdeviceptr = 0;
         let mut info = RawFrameGrabInfo::default();

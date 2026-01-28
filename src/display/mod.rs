@@ -1,8 +1,8 @@
 mod input;
 mod xinput;
 
-use crate::capture::plotter::{self, PlotterHandle};
-use crate::capture::{Capture, CaptureHandle};
+use crate::capture::plotter::PlotterHandle;
+use crate::capture::{Capture, CaptureHandle, create_backend_builder};
 use crate::display::input::{InputThreadHandle, InputThreadInit};
 use crate::sizer::{SharedSizer, Sizer};
 use crate::{GlobalState, Opts};
@@ -50,7 +50,6 @@ struct App {
     // Handles
     loop_handle: LoopHandle<'static, App>,
     input_handle: InputThreadHandle,
-    ph: PlotterHandle,
 
     // Wayland State
     registry_state: RegistryState,
@@ -213,7 +212,6 @@ impl CompositorHandler for App {
         _time: u32,
     ) {
         // info!("frame");
-        self.ph.frame(plotter::EventType::Present);
         self.surface.frame(qh, self.surface.clone());
         self.draw_capture();
     }
@@ -409,10 +407,11 @@ fn run_internal(
         wp_frac_mgr = Some(mgr);
     }
 
+    let backend_builder = create_backend_builder(&opts.capture_opts)?;
     let mut capture = Capture::new(
         ph.clone(),
         global_state.clone(),
-        opts.capture_opts.clone(),
+        backend_builder,
         &conn,
         &surface,
         sizer.clone(),
@@ -425,7 +424,6 @@ fn run_internal(
         // Handles
         loop_handle: loop_handle.clone(),
         input_handle: tx_input,
-        ph,
 
         // Wayland State
         registry_state: RegistryState::new(&globals),

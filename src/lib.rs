@@ -85,16 +85,28 @@ pub struct GlobalStateInner {
 
 impl GlobalStateInner {
     pub fn with_cursor_visible(&self, v: bool) -> Self {
-        Self { cursor_visible: v, ..self.clone() }
+        Self {
+            cursor_visible: v,
+            ..self.clone()
+        }
     }
     pub fn with_confine(&self, v: bool) -> Self {
-        Self { confine: v, ..self.clone() }
+        Self {
+            confine: v,
+            ..self.clone()
+        }
     }
     pub fn with_capture(&self, v: bool) -> Self {
-        Self { capture: v, ..self.clone() }
+        Self {
+            capture: v,
+            ..self.clone()
+        }
     }
     pub fn with_force_relative(&self, v: bool) -> Self {
-        Self { force_relative: v, ..self.clone() }
+        Self {
+            force_relative: v,
+            ..self.clone()
+        }
     }
 }
 

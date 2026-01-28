@@ -12,24 +12,13 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy)]
-pub enum EventType {
-    Present,
-    Capture,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FrameEvent {
-    pub time: Instant,
-    pub ty: EventType,
-}
-
 #[derive(Debug)]
 enum PlotEvent {
     Log(String),
-    Draw(FrameInfo),
-    Frame(FrameEvent),
-    Drop(FrameEvent),
+    Render(FrameInfo),
+    Skip(Instant),
+    Capture(Instant),
+    CaptureMiss(Instant),
     Fatal(Result<()>),
 }
 
@@ -41,22 +30,20 @@ impl PlotterHandle {
         self.0.send(PlotEvent::Log(msg.into())).unwrap();
     }
 
-    pub fn draw(&self, timings: FrameInfo) {
-        let _ = self.0.try_send(PlotEvent::Draw(timings));
+    pub fn render(&self, info: FrameInfo) {
+        let _ = self.0.try_send(PlotEvent::Render(info));
     }
 
-    pub fn frame(&self, ty: EventType) {
-        let _ = self.0.try_send(PlotEvent::Frame(FrameEvent {
-            time: Instant::now(),
-            ty,
-        }));
+    pub fn skip(&self) {
+        let _ = self.0.try_send(PlotEvent::Skip(Instant::now()));
     }
 
-    pub fn drop(&self, ty: EventType) {
-        let _ = self.0.try_send(PlotEvent::Drop(FrameEvent {
-            time: Instant::now(),
-            ty,
-        }));
+    pub fn capture(&self) {
+        let _ = self.0.try_send(PlotEvent::Capture(Instant::now()));
+    }
+
+    pub fn capture_miss(&self) {
+        let _ = self.0.try_send(PlotEvent::CaptureMiss(Instant::now()));
     }
 
     pub fn fatal(&self, res: Result<()>) {
@@ -97,9 +84,10 @@ impl Plotter {
                         let msg = msg.trim_end_matches('\n');
                         println!("{msg}");
                     }
-                    PlotEvent::Draw(_) => {} // Ignore draw events when not running in terminal mode
-                    PlotEvent::Frame(_) => {}
-                    PlotEvent::Drop(_) => {}
+                    PlotEvent::Render(_) => {}
+                    PlotEvent::Skip(_) => {}
+                    PlotEvent::Capture(_) => {}
+                    PlotEvent::CaptureMiss(_) => {}
                     PlotEvent::Fatal(r) => {
                         res = r;
                         break;
@@ -111,7 +99,10 @@ impl Plotter {
         let mut printed = false;
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                PlotEvent::Draw(_) | PlotEvent::Frame(_) | PlotEvent::Drop(_) => continue,
+                PlotEvent::Render(_)
+                | PlotEvent::Skip(_)
+                | PlotEvent::Capture(_)
+                | PlotEvent::CaptureMiss(_) => continue,
                 PlotEvent::Fatal(Ok(())) => continue,
                 _ => {}
             }
@@ -129,7 +120,7 @@ impl Plotter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FrameInfo {
     pub start: Instant,
     pub wait: Instant,
@@ -168,10 +159,9 @@ struct App {
     log_scroll: usize,
     global_state: GlobalState,
     sizer: SharedSizer,
-    present_frames: VecDeque<Instant>,
-    capture_frames: VecDeque<Instant>,
-    present_drops: VecDeque<Instant>,
-    capture_drops: VecDeque<Instant>,
+    captures: VecDeque<Instant>,
+    capture_misses: VecDeque<Instant>,
+    skips: VecDeque<Instant>,
 }
 
 impl App {
@@ -183,10 +173,9 @@ impl App {
             log_scroll: 0,
             global_state,
             sizer,
-            present_frames: VecDeque::new(),
-            capture_frames: VecDeque::new(),
-            present_drops: VecDeque::new(),
-            capture_drops: VecDeque::new(),
+            captures: VecDeque::new(),
+            capture_misses: VecDeque::new(),
+            skips: VecDeque::new(),
         }
     }
 
@@ -194,12 +183,9 @@ impl App {
         if self.timings.is_empty() {
             return (0.0, 0.0, 0.0);
         }
-        let (wait, obtain, commit) = self
-            .timings
-            .iter()
-            .fold((0.0, 0.0, 0.0), |(w, o, c), t| {
-                (w + t.wait_ms(), o + t.obtain_ms(), c + t.commit_ms())
-            });
+        let (wait, obtain, commit) = self.timings.iter().fold((0.0, 0.0, 0.0), |(w, o, c), t| {
+            (w + t.wait_ms(), o + t.obtain_ms(), c + t.commit_ms())
+        });
         let len = self.timings.len() as f64;
         (wait / len, obtain / len, commit / len)
     }
@@ -211,7 +197,9 @@ impl App {
         self.timings
             .iter()
             .map(|t| t.commit_ms())
-            .fold((f64::MAX, f64::MIN), |(min, max), v| (min.min(v), max.max(v)))
+            .fold((f64::MAX, f64::MIN), |(min, max), v| {
+                (min.min(v), max.max(v))
+            })
     }
 
     fn timings_fps(&self) -> Option<f64> {
@@ -239,10 +227,9 @@ impl App {
                     q.pop_front();
                 }
             };
-            trim_old(&mut self.present_frames);
-            trim_old(&mut self.capture_frames);
-            trim_old(&mut self.present_drops);
-            trim_old(&mut self.capture_drops);
+            trim_old(&mut self.captures);
+            trim_old(&mut self.capture_misses);
+            trim_old(&mut self.skips);
 
             terminal.draw(|f| self.ui(f, history_size))?;
 
@@ -278,17 +265,18 @@ impl App {
                         self.logs.extend(msg.split('\n').map(str::to_owned));
                         self.log_scroll = 0;
                     }
-                    PlotEvent::Draw(timings) => {
-                        self.timings.push_back(timings);
+                    PlotEvent::Render(info) => {
+                        self.timings.push_back(info);
                     }
-                    PlotEvent::Frame(frame_event) => match frame_event.ty {
-                        EventType::Present => self.present_frames.push_back(frame_event.time),
-                        EventType::Capture => self.capture_frames.push_back(frame_event.time),
-                    },
-                    PlotEvent::Drop(drop_event) => match drop_event.ty {
-                        EventType::Present => self.present_drops.push_back(drop_event.time),
-                        EventType::Capture => self.capture_drops.push_back(drop_event.time),
-                    },
+                    PlotEvent::Skip(t) => {
+                        self.skips.push_back(t);
+                    }
+                    PlotEvent::Capture(t) => {
+                        self.captures.push_back(t);
+                    }
+                    PlotEvent::CaptureMiss(t) => {
+                        self.capture_misses.push_back(t);
+                    }
                     PlotEvent::Fatal(res) => {
                         return res;
                     }
@@ -396,30 +384,19 @@ impl App {
         let (min_commit, max_commit) = self.timings_commit_min_max();
         let render_fps = self.timings_fps().unwrap_or(0.0);
 
-        let present_fps = if self.present_frames.len() < 2 {
+        let capture_fps = if self.captures.len() < 2 {
             0.0
         } else {
             let duration = self
-                .present_frames
+                .captures
                 .back()
                 .unwrap()
-                .duration_since(*self.present_frames.front().unwrap());
-            (self.present_frames.len() - 1) as f64 / duration.as_secs_f64().max(1e-9)
+                .duration_since(*self.captures.front().unwrap());
+            (self.captures.len() - 1) as f64 / duration.as_secs_f64().max(1e-9)
         };
 
-        let capture_fps = if self.capture_frames.len() < 2 {
-            0.0
-        } else {
-            let duration = self
-                .capture_frames
-                .back()
-                .unwrap()
-                .duration_since(*self.capture_frames.front().unwrap());
-            (self.capture_frames.len() - 1) as f64 / duration.as_secs_f64().max(1e-9)
-        };
-
-        let present_drops = self.present_drops.len();
-        let capture_drops = self.capture_drops.len();
+        let skip_count = self.skips.len();
+        let miss_count = self.capture_misses.len();
 
         let state = self.global_state.load();
         let cursor_visible = self.timings.back().is_some_and(|t| t.cursor_visible);
@@ -439,12 +416,11 @@ impl App {
         let state_display = format!("[{}]", state_tags.join(" "));
 
         let status_text = format!(
-            "R{:.1} P{:.1} C{:.1} | D:{}/{} {} | W:{:.1} O:{:.1} C:{:.1} ({:.1}-{:.1})",
+            "R{:.1} C{:.1} | S:{} M:{} {} | W:{:.1} O:{:.1} C:{:.1} ({:.1}-{:.1})",
             render_fps,
-            present_fps,
             capture_fps,
-            present_drops,
-            capture_drops,
+            skip_count,
+            miss_count,
             state_display,
             avg_wait,
             avg_obtain,
