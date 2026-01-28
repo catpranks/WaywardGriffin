@@ -8,10 +8,22 @@ use crate::capture::nvcapture::NvCapture;
 use crate::capture::plotter::PlotterHandle;
 use crate::sizer::{SharedSizer, Sizer};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CaptureBackend {
+    Nvfbc,
+    WlrScreencopy,
+    ExtImageCopy,
+    Kms,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct CaptureOpts {
+    /// Capture backend to use
+    #[arg(long, value_enum)]
+    pub backend: CaptureBackend,
+
     /// ignore NVFBC frame dirty indicator
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub ignore_nvfbc_dirty: bool,
