@@ -2,11 +2,11 @@ pub mod backend;
 pub mod plotter;
 
 use crate::GlobalState;
-use crate::capture::backend::{CaptureBackend, CaptureBackendBuilder};
+use crate::capture::backend::{BackendType, CaptureBackend, CaptureBackendBuilder};
 use crate::capture::plotter::PlotterHandle;
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
-use clap::{Args, ValueEnum};
+use clap::Args;
 use smallvec::smallvec;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
@@ -56,28 +56,11 @@ use vulkano::sync::{
 };
 use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum BackendType {
-    Nvfbc,
-    WlrScreencopy,
-    ExtImageCopy,
-    Kms,
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct CaptureOpts {
     /// Capture backend to use
     #[arg(long, value_enum)]
     pub backend: BackendType,
-}
-
-pub fn create_backend_builder(opts: &CaptureOpts) -> Result<Box<dyn CaptureBackendBuilder>> {
-    match opts.backend {
-        BackendType::Nvfbc => Ok(Box::new(backend::nvfbc::Builder::new()?)),
-        BackendType::WlrScreencopy => todo!("wlr-screencopy backend"),
-        BackendType::ExtImageCopy => todo!("ext-image-copy backend"),
-        BackendType::Kms => todo!("kms backend"),
-    }
 }
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

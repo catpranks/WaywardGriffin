@@ -1,8 +1,9 @@
 mod input;
 mod xinput;
 
+use crate::capture::backend::create_backend_builder;
 use crate::capture::plotter::PlotterHandle;
-use crate::capture::{Capture, CaptureHandle, create_backend_builder};
+use crate::capture::{Capture, CaptureHandle};
 use crate::display::input::{InputThreadHandle, InputThreadInit};
 use crate::sizer::{SharedSizer, Sizer};
 use crate::{GlobalState, Opts};
