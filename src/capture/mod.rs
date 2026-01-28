@@ -15,9 +15,9 @@ use std::time::Instant;
 use tracing::info;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, ClearColorImageInfo, CommandBuffer, CommandBufferBeginInfo,
-    CommandBufferLevel, CommandBufferSubmitInfo, CommandBufferUsage, RecordingCommandBuffer,
-    RenderPassBeginInfo, SemaphoreSubmitInfo, SubmitInfo, SubpassBeginInfo,
+    AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferBeginInfo, CommandBufferLevel,
+    CommandBufferSubmitInfo, CommandBufferUsage, RecordingCommandBuffer, RenderPassBeginInfo,
+    SemaphoreSubmitInfo, SubmitInfo, SubpassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -143,7 +143,7 @@ struct InFlight {
     acquire: Arc<Semaphore>,
     present: Arc<Semaphore>,
     fence: Arc<Fence>,
-    last_command_buffer: Option<Arc<CommandBuffer>>,
+    last_command_buffer: Option<Arc<dyn Send + Sync>>,
 }
 
 pub enum CaptureCommand {
@@ -523,6 +523,7 @@ impl Capture {
             )
         })?;
         let command_buffer = builder.build()?;
+        ifl.last_command_buffer = Some(command_buffer.clone() as Arc<dyn Send + Sync>);
 
         let submit_info = SubmitInfo {
             wait_semaphores: vec![SemaphoreSubmitInfo {
@@ -746,7 +747,7 @@ impl Capture {
         let command_buffer_handle = vec![command_buffer.handle()];
 
         // Keep alive
-        ifl.last_command_buffer = Some(command_buffer);
+        ifl.last_command_buffer = Some(command_buffer as Arc<dyn Send + Sync>);
 
         // Build submit info
         let render_semaphore = [ifl.acquire.handle()];
