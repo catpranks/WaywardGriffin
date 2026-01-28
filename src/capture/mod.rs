@@ -803,9 +803,9 @@ impl Capture {
         source_buf.fence = Some(ifl.fence.clone());
         self.bufs.push_back(source_buf);
 
-        let mut timings = frame.timings;
-        timings.mark_commit();
-        self.ph.draw(timings);
+        let mut info = frame.info;
+        info.mark_commit();
+        self.ph.draw(info);
         self.frame_idx += 1;
         Ok(())
     }

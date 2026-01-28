@@ -1,5 +1,5 @@
 use crate::capture::Capture;
-use crate::capture::plotter::{self, FrameTimings};
+use crate::capture::plotter::{self, FrameInfo};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
@@ -101,7 +101,6 @@ impl Capture {
                 return Ok(None);
             }
         }
-        let capture_time = start.elapsed();
         if self.sizer.load().source_size != info.size {
             self.sizer.rcu(|s| s.with_source_size(info.size));
         }
@@ -121,7 +120,7 @@ impl Capture {
         if let Some(fence) = buf.fence.take() {
             fence.wait(None)?;
         }
-        let wait_time = start.elapsed();
+        let wait = Instant::now();
         let (width, height) = info.size;
         let pitch = (width * 4) as usize;
         let copy = CUDA_MEMCPY2D {
@@ -144,10 +143,16 @@ impl Capture {
         };
         unsafe { cuMemcpy2DAsync_v2(&copy as _, stream) }.result()?;
         unsafe { stream::synchronize(stream) }?;
-        let cuda_time = start.elapsed();
+        let obtain = Instant::now();
         let frame = CapturedFrame {
             buf,
-            timings: FrameTimings::new(start, capture_time, wait_time, cuda_time, info),
+            info: FrameInfo {
+                start,
+                wait,
+                obtain,
+                commit: None,
+                cursor_visible: info.cursor_visible,
+            },
         };
         Ok(Some(frame))
     }
@@ -210,5 +215,5 @@ impl MyBuffer {
 
 pub struct CapturedFrame {
     pub buf: MyBuffer,
-    pub timings: FrameTimings,
+    pub info: FrameInfo,
 }

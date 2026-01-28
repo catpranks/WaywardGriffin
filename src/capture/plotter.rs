@@ -1,6 +1,5 @@
 use crate::GlobalState;
 use crate::GlobalStateInner;
-use crate::capture::nvcapture::FrameInfo;
 use crate::sizer::SharedSizer;
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -28,7 +27,7 @@ pub struct FrameEvent {
 #[derive(Debug)]
 enum PlotEvent {
     Log(String),
-    Draw(FrameTimings),
+    Draw(FrameInfo),
     Frame(FrameEvent),
     Drop(FrameEvent),
     Fatal(Result<()>),
@@ -42,7 +41,7 @@ impl PlotterHandle {
         self.0.send(PlotEvent::Log(msg.into())).unwrap();
     }
 
-    pub fn draw(&self, timings: FrameTimings) {
+    pub fn draw(&self, timings: FrameInfo) {
         let _ = self.0.try_send(PlotEvent::Draw(timings));
     }
 
@@ -131,35 +130,31 @@ impl Plotter {
 }
 
 #[derive(Debug)]
-pub struct FrameTimings {
-    start: Instant,
-    capture: f64,
-    wait: f64,
-    cuda: f64,
-    commit: f64,
-    info: FrameInfo,
+pub struct FrameInfo {
+    pub start: Instant,
+    pub wait: Instant,
+    pub obtain: Instant,
+    pub commit: Option<Instant>,
+    pub cursor_visible: bool,
 }
 
-impl FrameTimings {
-    pub fn new(
-        start: Instant,
-        capture: Duration,
-        wait: Duration,
-        cuda: Duration,
-        info: FrameInfo,
-    ) -> Self {
-        Self {
-            start,
-            capture: capture.as_secs_f64() * 1000.0,
-            wait: wait.as_secs_f64() * 1000.0,
-            cuda: cuda.as_secs_f64() * 1000.0,
-            commit: 0.0,
-            info,
-        }
+impl FrameInfo {
+    pub fn mark_commit(&mut self) {
+        self.commit = Some(Instant::now());
     }
 
-    pub fn mark_commit(&mut self) {
-        self.commit = self.start.elapsed().as_secs_f64() * 1000.0;
+    fn wait_ms(&self) -> f64 {
+        self.wait.duration_since(self.start).as_secs_f64() * 1000.0
+    }
+
+    fn obtain_ms(&self) -> f64 {
+        self.obtain.duration_since(self.start).as_secs_f64() * 1000.0
+    }
+
+    fn commit_ms(&self) -> f64 {
+        self.commit
+            .map(|c| c.duration_since(self.start).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
     }
 }
 
@@ -168,7 +163,7 @@ const SCROLL_FROM_START: bool = true;
 
 struct App {
     logs: Vec<String>,
-    timings: VecDeque<FrameTimings>,
+    timings: VecDeque<FrameInfo>,
     delay: Duration,
     log_scroll: usize,
     global_state: GlobalState,
@@ -195,18 +190,18 @@ impl App {
         }
     }
 
-    fn timings_avg(&self) -> (f64, f64, f64, f64) {
+    fn timings_avg(&self) -> (f64, f64, f64) {
         if self.timings.is_empty() {
-            return (0.0, 0.0, 0.0, 0.0);
+            return (0.0, 0.0, 0.0);
         }
-        let (capture, wait, cuda, commit) = self
+        let (wait, obtain, commit) = self
             .timings
             .iter()
-            .fold((0.0, 0.0, 0.0, 0.0), |(cap, w, cu, cm), t| {
-                (cap + t.capture, w + t.wait, cu + t.cuda, cm + t.commit)
+            .fold((0.0, 0.0, 0.0), |(w, o, c), t| {
+                (w + t.wait_ms(), o + t.obtain_ms(), c + t.commit_ms())
             });
         let len = self.timings.len() as f64;
-        (capture / len, wait / len, cuda / len, commit / len)
+        (wait / len, obtain / len, commit / len)
     }
 
     fn timings_commit_min_max(&self) -> (f64, f64) {
@@ -215,7 +210,7 @@ impl App {
         }
         self.timings
             .iter()
-            .map(|t| t.commit)
+            .map(|t| t.commit_ms())
             .fold((f64::MAX, f64::MIN), |(min, max), v| (min.min(v), max.max(v)))
     }
 
@@ -309,7 +304,6 @@ impl App {
             .constraints(
                 [
                     Constraint::Percentage(50), // Chart
-                    Constraint::Length(1),      // State Chart
                     Constraint::Length(1),      // Status
                     Constraint::Min(7),         // Log
                 ]
@@ -324,47 +318,36 @@ impl App {
         };
         let x_axis_bounds = [lower_bound, 0.0];
 
-        let wait_data = self
+        let wait_data: Vec<_> = self
             .timings
             .iter()
             .enumerate()
-            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.wait))
-            .collect::<Vec<_>>();
-        let capture_data = self
+            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.wait_ms()))
+            .collect();
+        let obtain_data: Vec<_> = self
             .timings
             .iter()
             .enumerate()
-            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.capture))
-            .collect::<Vec<_>>();
-        let cuda_data = self
+            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.obtain_ms()))
+            .collect();
+        let commit_data: Vec<_> = self
             .timings
             .iter()
             .enumerate()
-            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.cuda))
-            .collect::<Vec<_>>();
-        let commit_data = self
-            .timings
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.commit))
-            .collect::<Vec<_>>();
+            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.commit_ms()))
+            .collect();
 
         let datasets = vec![
-            Dataset::default()
-                .name("Capture")
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Yellow))
-                .data(&capture_data),
             Dataset::default()
                 .name("Wait")
                 .marker(symbols::Marker::Braille)
                 .style(Style::default().fg(Color::Cyan))
                 .data(&wait_data),
             Dataset::default()
-                .name("Cuda")
+                .name("Obtain")
                 .marker(symbols::Marker::Braille)
                 .style(Style::default().fg(Color::Magenta))
-                .data(&cuda_data),
+                .data(&obtain_data),
             Dataset::default()
                 .name("Commit")
                 .marker(symbols::Marker::Braille)
@@ -375,7 +358,7 @@ impl App {
         let max_timing = self
             .timings
             .iter()
-            .map(|t| t.capture.max(t.wait).max(t.cuda).max(t.commit))
+            .map(|t| t.wait_ms().max(t.obtain_ms()).max(t.commit_ms()))
             .fold(0.0, f64::max);
         let y_axis_bounds = [0.0, (max_timing * 1.2).max(16.67)];
 
@@ -385,19 +368,8 @@ impl App {
             format!("{:.1}", y_axis_bounds[1]).into(),
         ];
 
-        let y_axis_width = 5; // Width for Y-axis labels and title
-        let chart_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(y_axis_width), Constraint::Min(0)])
-            .split(chunks[0]);
-        let data_area = chart_chunks[1];
-
         let sizer = self.sizer.load();
-        let source_size = self
-            .timings
-            .back()
-            .map(|t| t.info.size)
-            .unwrap_or(sizer.source_size);
+        let source_size = sizer.source_size;
         let render_size = sizer.render_size;
         let chart_title = format!(
             "Frame timings {}x{} -> {}x{}",
@@ -420,92 +392,7 @@ impl App {
             );
         f.render_widget(chart, chunks[0]);
 
-        let states_meta = [
-            "post_processing",
-            "direct_capture",
-            "cursor_visible",
-            "cursor_composited",
-        ];
-
-        let state_render_area = Rect {
-            x: data_area.x,
-            y: chunks[1].y,
-            width: data_area.width,
-            height: 1,
-        };
-
-        let state_vis_width = state_render_area.width as usize;
-        let num_slots = (state_vis_width.saturating_sub(1)) * 2;
-        let mut bins = vec![[false; 4]; num_slots];
-        if !self.timings.is_empty() && history_size > 0 {
-            for (i, t) in self.timings.iter().enumerate() {
-                let relative_idx = i + history_size - self.timings.len();
-                let slot = relative_idx * num_slots / history_size;
-
-                if slot < num_slots {
-                    let bools = [
-                        t.info.required_post_processing,
-                        t.info.direct_capture,
-                        t.info.cursor_visible,
-                        t.info.cursor_composited,
-                    ];
-                    for (j, &is_set) in bools.iter().enumerate() {
-                        if is_set {
-                            bins[slot][j] = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut braille_chars: String = bins
-            .chunks(2)
-            .map(|chunk| {
-                let left = chunk[0];
-                let right = if chunk.len() > 1 {
-                    chunk[1]
-                } else {
-                    [false; 4]
-                };
-
-                let mut byte = 0u8;
-                if left[0] {
-                    byte |= 0x01;
-                } // Top-left
-                if left[1] {
-                    byte |= 0x02;
-                } // Middle-top-left
-                if left[2] {
-                    byte |= 0x04;
-                } // Middle-bottom-left
-                if left[3] {
-                    byte |= 0x40;
-                } // Bottom-left
-                if right[0] {
-                    byte |= 0x08;
-                } // Top-right
-                if right[1] {
-                    byte |= 0x10;
-                } // Middle-top-right
-                if right[2] {
-                    byte |= 0x20;
-                } // Middle-bottom-right
-                if right[3] {
-                    byte |= 0x80;
-                } // Bottom-right
-
-                std::char::from_u32(0x2800 + byte as u32).unwrap_or(' ')
-            })
-            .collect();
-
-        if state_vis_width > 0 {
-            braille_chars.push('\u{28FF}');
-        }
-
-        let state_vis = Paragraph::new(braille_chars);
-        f.render_widget(state_vis, state_render_area);
-
-        let (avg_capture, avg_wait, avg_cuda, avg_commit) = self.timings_avg();
+        let (avg_wait, avg_obtain, avg_commit) = self.timings_avg();
         let (min_commit, max_commit) = self.timings_commit_min_max();
         let render_fps = self.timings_fps().unwrap_or(0.0);
 
@@ -535,6 +422,7 @@ impl App {
         let capture_drops = self.capture_drops.len();
 
         let state = self.global_state.load();
+        let cursor_visible = self.timings.back().is_some_and(|t| t.cursor_visible);
         let mut state_tags = Vec::new();
         if state.confine {
             state_tags.push("G");
@@ -545,28 +433,30 @@ impl App {
         if state.force_relative {
             state_tags.push("FR");
         }
+        if cursor_visible {
+            state_tags.push("Cur");
+        }
         let state_display = format!("[{}]", state_tags.join(" "));
 
         let status_text = format!(
-            "FPS: R {:.1}, P {:.1}, C {:.1} | Drops: P {}, C {} {} | Capture: {:.2}ms, Wait: {:.2}ms, Cuda: {:.2}ms, Commit: {:.2}ms (min: {:.2}, max: {:.2})",
+            "R{:.1} P{:.1} C{:.1} | D:{}/{} {} | W:{:.1} O:{:.1} C:{:.1} ({:.1}-{:.1})",
             render_fps,
             present_fps,
             capture_fps,
             present_drops,
             capture_drops,
             state_display,
-            avg_capture,
             avg_wait,
-            avg_cuda,
+            avg_obtain,
             avg_commit,
             min_commit,
             max_commit
         );
         let status = Paragraph::new(status_text);
-        f.render_widget(status, chunks[2]);
+        f.render_widget(status, chunks[1]);
 
         let log_block = Block::default();
-        let log_inner_area = log_block.inner(chunks[3]);
+        let log_inner_area = log_block.inner(chunks[2]);
         let log_height = log_inner_area.height as usize;
         let wrapped_logs: Vec<String> = self
             .logs
@@ -604,30 +494,6 @@ impl App {
             .map(|m| ListItem::new(Line::from(m.as_str())))
             .collect();
         let log = List::new(log_lines).block(log_block);
-        f.render_widget(log, chunks[3]);
-
-        let legend_indicators = ['\u{28B9}', '\u{28BA}', '\u{28BC}', '\u{28F8}'];
-        let legend_lines: Vec<Line> = states_meta
-            .iter()
-            .zip(legend_indicators)
-            .map(|(name, indicator)| {
-                Line::from(vec![Span::raw(format!("{indicator} ")), Span::raw(*name)])
-            })
-            .collect();
-
-        let legend = Paragraph::new(legend_lines);
-        let legend_width = states_meta
-            .iter()
-            .map(|name| name.len() + 2)
-            .max()
-            .unwrap_or(0) as u16;
-        let legend_height = states_meta.len() as u16;
-        let legend_area = Rect {
-            x: log_inner_area.right() - legend_width,
-            y: log_inner_area.y,
-            width: legend_width,
-            height: legend_height,
-        };
-        f.render_widget(legend, legend_area);
+        f.render_widget(log, chunks[2]);
     }
 }

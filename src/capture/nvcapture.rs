@@ -30,7 +30,7 @@ struct RawFrameGrabInfo {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-pub struct FrameInfo {
+pub struct NvfbcFrameInfo {
     pub size: (u32, u32),
     pub byte_size: u32,
     pub current_frame: u32,
@@ -43,7 +43,7 @@ pub struct FrameInfo {
     pub cursor_composited: bool,
 }
 
-impl From<RawFrameGrabInfo> for FrameInfo {
+impl From<RawFrameGrabInfo> for NvfbcFrameInfo {
     fn from(raw: RawFrameGrabInfo) -> Self {
         Self {
             size: (raw.dw_width, raw.dw_height),
@@ -103,7 +103,7 @@ impl NvCapture {
         Ok(())
     }
 
-    pub fn capture_frame(&self, timeout: Option<Duration>) -> Result<(CUdeviceptr, FrameInfo)> {
+    pub fn capture_frame(&self, timeout: Option<Duration>) -> Result<(CUdeviceptr, NvfbcFrameInfo)> {
         let timeout_ms = timeout.map(|d| d.as_millis() as u32).unwrap_or(1000);
         let mut dptr: CUdeviceptr = 0;
         let mut info = RawFrameGrabInfo::default();
@@ -111,7 +111,7 @@ impl NvCapture {
         if status != NVFBC_SUCCESS {
             bail!("NVFBC code: {}", status)
         }
-        let info: FrameInfo = info.into();
+        let info: NvfbcFrameInfo = info.into();
         let (width, height) = info.size;
         if info.byte_size != width * height * 4 {
             bail!(
