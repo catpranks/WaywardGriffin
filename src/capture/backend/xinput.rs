@@ -15,9 +15,9 @@ pub struct XInput {
 }
 
 impl XInput {
-    pub fn new() -> Result<Self> {
+    pub fn new(display: &str) -> Result<Self> {
         let (conn, screen_num) =
-            RustConnection::connect(None).context("Failed to connect to X server")?;
+            RustConnection::connect(Some(display)).context("Failed to connect to X server")?;
         conn.xtest_get_version(2, 1)?.reply()?;
 
         let setup = conn.setup();

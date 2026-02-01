@@ -43,6 +43,7 @@ pub trait CaptureBackendBuilder: Send {
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
+        display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)>;
 }
 

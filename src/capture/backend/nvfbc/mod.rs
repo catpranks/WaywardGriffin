@@ -60,7 +60,10 @@ impl CaptureBackendBuilder for Builder {
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
+        display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
+        // NVFBC reads the display from the DISPLAY env var; there's no API to pass it explicitly.
+        // XInput gets it explicitly below.
         let (_, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
         self.capturer.release_thread()?;
 
@@ -68,7 +71,7 @@ impl CaptureBackendBuilder for Builder {
             .map(|_| PooledBuffer::new(device.clone(), &allocator, self.ctx.clone(), info.size))
             .collect::<Result<VecDeque<_>>>()?;
 
-        let injector = XInput::new()?;
+        let injector = XInput::new(display)?;
 
         Ok((
             Box::new(Backend {

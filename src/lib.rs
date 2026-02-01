@@ -4,6 +4,7 @@ mod capture;
 mod display;
 pub mod sizer;
 
+use crate::capture::backend::BackendType;
 use crate::capture::plotter::{Plotter, PlotterHandle};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::Result;
@@ -36,7 +37,16 @@ struct Opts {
 
 pub fn run() -> Result<()> {
     let opts = Opts::parse();
-    unsafe { std::env::set_var("DISPLAY", opts.capture_opts.display.clone()) };
+    // NVFBC only reads DISPLAY from env var; there's no API to pass it explicitly.
+    // Other backends don't need it set globally.
+    match opts.capture_opts.backend {
+        BackendType::Nvfbc => unsafe {
+            std::env::set_var("DISPLAY", &opts.capture_opts.display);
+        },
+        _ => unsafe {
+            std::env::remove_var("DISPLAY");
+        },
+    }
     let crate_name = env!("CARGO_PKG_NAME");
 
     let global_state = Arc::new(ArcSwap::from_pointee(GlobalStateInner {

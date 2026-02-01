@@ -212,6 +212,7 @@ impl Capture {
         conn: &Connection,
         wl_surface: &WlSurface,
         sizer: SharedSizer,
+        opts: &CaptureOpts,
     ) -> Result<(Self, Box<dyn InputInjector>)> {
         let device_uuid = backend_builder.device_uuid();
 
@@ -393,7 +394,7 @@ impl Capture {
         )?;
 
         let (backend, injector) =
-            backend_builder.build(device.clone(), allocator.clone(), ph.clone())?;
+            backend_builder.build(device.clone(), allocator.clone(), ph.clone(), &opts.display)?;
 
         let in_flight = (0..3)
             .map(|_| {

@@ -410,6 +410,7 @@ fn run_internal(
         &conn,
         &surface,
         sizer.clone(),
+        &opts.capture_opts,
     )?;
     let ch = capture.handle.clone();
     std::thread::spawn(move || capture.run());
