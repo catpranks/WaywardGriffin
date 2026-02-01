@@ -31,7 +31,7 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
 
 ## fun features!
 
-- spiffy TUI shows frame timings and NVFBC states
+- spiffy TUI shows frame timings
 - primary clipboard and selection sync
 - color border with a breathing effect to indicate ungrabbed state
 - absolute coordinate mouse events when the cursor is visible
@@ -55,11 +55,9 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
 
 ## code index
 
-- [main thread](./src/display/mod.rs). Wayland window boilerplate.
+- [display thread](./src/display/mod.rs). Wayland window boilerplate.
   Dispatches frame and resize events to capture thread.
-- [input thread](./src/display/input.rs). Separate Wayland event loop just for input events.
-- [glowing border](./src/display/render.rs). egui-based UI, just the grab indication border for now.
-  Ripped off from the non-winit parts of [winit-egui-wgpu-template](https://github.com/kaphula/winit-egui-wgpu-template)
-- [capture thread](./src/capture/mod.rs). Renders captured frames onto Vulkan swapchain.
-- [cuda](./src/capture/cuda.rs). Captures frames using NVFBC. Also, a buffer abstraction.
+- [input](./src/display/input.rs). Input event forwarding.
+- [capture thread](./src/capture/mod.rs). Renders captured frames onto Vulkan swapchain. Cool breathing border effect when input capture is disabled.
+- [nvfbc](./src/capture/backend/nvfbc/mod.rs). NVFBC capture backend.
 - [plotter](./src/capture/plotter.rs). TUI with frame timing charts.
