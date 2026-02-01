@@ -32,7 +32,7 @@ pub fn create_backend_builder(opts: &CaptureOpts) -> Result<Box<dyn CaptureBacke
 pub struct CapturedFrame {
     pub image: Arc<Image>,
     pub info: FrameInfo,
-    pub(crate) handle: Box<dyn Any + Send>,
+    pub handle: Box<dyn Any + Send>,
 }
 
 pub trait CaptureBackendBuilder: Send {

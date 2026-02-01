@@ -1,28 +1,17 @@
-use crate::GlobalState;
 use crate::capture::backend::InputInjector;
-use crate::capture::plotter::PlotterHandle;
-use crate::sizer::SharedSizer;
-use anyhow::{Context as _, Result};
-use copypasta::wayland_clipboard::{
-    self, Clipboard as WaylandClipboard, Primary as WaylandPrimary,
-};
+use copypasta::wayland_clipboard::{Clipboard as WaylandClipboard, Primary as WaylandPrimary};
 use copypasta::x11_clipboard::{
     Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
 };
-use smithay_client_toolkit::compositor::{Region, SurfaceData};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
-use smithay_client_toolkit::reexports::calloop::channel::{Channel, Event, Sender};
-use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
-use smithay_client_toolkit::reexports::client::globals::GlobalList;
+use smithay_client_toolkit::compositor::Region;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
-use smithay_client_toolkit::reexports::client::protocol::wl_shm::WlShm;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1;
 use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1;
-use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState, SimpleGlobal};
+use smithay_client_toolkit::registry::SimpleGlobal;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
 };
@@ -37,10 +26,9 @@ use smithay_client_toolkit::seat::relative_pointer::{
 };
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::{
-    delegate_keyboard, delegate_pointer, delegate_pointer_constraints, delegate_registry,
-    delegate_relative_pointer, delegate_seat, delegate_simple, registry_handlers,
+    delegate_keyboard, delegate_pointer, delegate_pointer_constraints, delegate_relative_pointer,
+    delegate_seat, delegate_simple,
 };
-use std::sync::Arc;
 use tracing::{error, info};
 
 // breaks rustfmt import sorting for some reason
@@ -49,66 +37,40 @@ use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit
 use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_confined_pointer_v1::ZwpConfinedPointerV1;
 use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
 use smithay_client_toolkit::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
+use super::App;
 
-pub enum InputThreadCommand {
-    UpdateConfinement { region: Region },
-}
-
-pub type InputThreadHandle = Sender<InputThreadCommand>;
-
-pub struct InputThreadInit {
-    pub conn: Connection,
-    pub globals: Arc<GlobalList>,
-    pub surface: WlSurface,
-    pub cursor_surface: WlSurface,
-    pub wl_shm: WlShm,
-    pub sizer: SharedSizer,
-    pub global_state: GlobalState,
-    pub ph: PlotterHandle,
-    pub rx_input: Channel<InputThreadCommand>,
-    pub confined: bool,
-    pub injector: Box<dyn InputInjector>,
-}
-
-struct InputState {
-    // Handles & Shared State
-    qh: QueueHandle<Self>,
-    global_state: GlobalState,
-    sizer: SharedSizer,
-    injector: Box<dyn InputInjector>,
-    _ph: PlotterHandle,
-
+pub struct InputState {
     // Wayland State
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    relative_pointer_state: RelativePointerState,
-    pointer_constraints_state: PointerConstraintsState,
-    shortcuts_inhibit_manager: SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>,
+    pub seat_state: SeatState,
+    pub relative_pointer_state: RelativePointerState,
+    pub pointer_constraints_state: PointerConstraintsState,
+    pub shortcuts_inhibit_manager: SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>,
 
     // Wayland Objects
-    surface: WlSurface,
-    cursor_surface: WlSurface,
-    wl_shm: WlShm,
-    keyboard: Option<WlKeyboard>,
-    pointer: Option<ThemedPointer>,
-    relative_pointer: Option<ZwpRelativePointerV1>,
-    confined_pointer: Option<ZwpConfinedPointerV1>,
-    shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    pub cursor_surface: WlSurface,
+    pub keyboard: Option<WlKeyboard>,
+    pub pointer: Option<ThemedPointer>,
+    pub relative_pointer: Option<ZwpRelativePointerV1>,
+    pub confined_pointer: Option<ZwpConfinedPointerV1>,
+    pub shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
 
     // Internal State
-    modifiers: Modifiers,
-    pointer_serial: u32,
-    confinement_region: Option<Region>,
-    confined: bool,
-    force_relative: bool,
-    cursor_over_surface: bool,
-    keyboard_focus: bool,
+    pub modifiers: Modifiers,
+    pub pointer_serial: u32,
+    pub confinement_region: Option<Region>,
+    pub confined: bool,
+    pub force_relative: bool,
+    pub cursor_over_surface: bool,
+    pub keyboard_focus: bool,
 
     // Clipboards
-    wl_primary: WaylandPrimary,
-    wl_clipboard: WaylandClipboard,
-    x11_primary: X11ClipboardContext<X11Primary>,
-    x11_clipboard: X11ClipboardContext<X11Clipboard>,
+    pub wl_primary: WaylandPrimary,
+    pub wl_clipboard: WaylandClipboard,
+    pub x11_primary: X11ClipboardContext<X11Primary>,
+    pub x11_clipboard: X11ClipboardContext<X11Clipboard>,
+
+    // Input injection
+    pub injector: Box<dyn InputInjector>,
 }
 
 fn sync_clipboards<P1, P2>(p1: &mut P1, p2: &mut P2)
@@ -123,73 +85,76 @@ where
     }
 }
 
-impl InputState {
-    fn set_confined(&mut self, conn: &Connection, confined: bool) {
-        if self.confined == confined {
+impl App {
+    pub fn set_confined(&mut self, conn: &Connection, confined: bool) {
+        if self.input.confined == confined {
             return;
         }
-        self.confined = confined;
+        self.input.confined = confined;
 
-        if self.confined {
-            sync_clipboards(&mut self.wl_primary, &mut self.x11_primary);
-            sync_clipboards(&mut self.wl_clipboard, &mut self.x11_clipboard);
+        if self.input.confined {
+            sync_clipboards(&mut self.input.wl_primary, &mut self.input.x11_primary);
+            sync_clipboards(&mut self.input.wl_clipboard, &mut self.input.x11_clipboard);
         } else {
-            sync_clipboards(&mut self.x11_primary, &mut self.wl_primary);
-            sync_clipboards(&mut self.x11_clipboard, &mut self.wl_clipboard);
+            sync_clipboards(&mut self.input.x11_primary, &mut self.input.wl_primary);
+            sync_clipboards(&mut self.input.x11_clipboard, &mut self.input.wl_clipboard);
         }
 
-        self.update_confine();
-        self.update_shortcut_inhibitor();
-        self.global_state.rcu(|s| s.with_confine(self.confined));
-        self.update_cursor(conn);
+        self.input_update_confine();
+        self.input_update_shortcut_inhibitor();
+        self.global_state
+            .rcu(|s| s.with_confine(self.input.confined));
+        self.input_update_cursor(conn);
     }
 
-    fn update_shortcut_inhibitor(&mut self) {
-        if self.confined {
-            if self.shortcuts_inhibitor.is_some() {
+    fn input_update_shortcut_inhibitor(&mut self) {
+        if self.input.confined {
+            if self.input.shortcuts_inhibitor.is_some() {
                 return;
             }
-            if let Some(seat) = self.seat_state.seats().next() {
-                self.shortcuts_inhibitor = Some(
-                    self.shortcuts_inhibit_manager
+            if let Some(seat) = self.input.seat_state.seats().next() {
+                self.input.shortcuts_inhibitor = Some(
+                    self.input
+                        .shortcuts_inhibit_manager
                         .get()
                         .unwrap()
                         .inhibit_shortcuts(&self.surface, &seat, &self.qh, ()),
                 );
             }
-        } else if let Some(inhibitor) = self.shortcuts_inhibitor.take() {
+        } else if let Some(inhibitor) = self.input.shortcuts_inhibitor.take() {
             inhibitor.destroy();
         }
     }
 
-    fn update_cursor(&mut self, conn: &Connection) {
-        if let Some(pointer) = self.pointer.as_mut() {
-            if !self.confined || !self.cursor_over_surface {
+    fn input_update_cursor(&mut self, conn: &Connection) {
+        if let Some(pointer) = self.input.pointer.as_mut() {
+            if !self.input.confined || !self.input.cursor_over_surface {
                 pointer
                     .set_cursor(conn, CursorIcon::Crosshair)
                     .expect("Failed to set cursor");
             } else {
                 pointer
                     .pointer()
-                    .set_cursor(self.pointer_serial, None, 0, 0);
+                    .set_cursor(self.input.pointer_serial, None, 0, 0);
             }
         }
     }
 
-    fn update_confine(&mut self) -> Option<()> {
-        if !self.confined {
-            if let Some(p) = self.confined_pointer.take() {
+    pub fn input_update_confine(&mut self) -> Option<()> {
+        if !self.input.confined {
+            if let Some(p) = self.input.confined_pointer.take() {
                 p.destroy();
             }
             return None;
         }
-        let pointer = self.pointer.as_ref()?;
-        let region = self.confinement_region.as_ref()?;
-        if let Some(p) = self.confined_pointer.as_mut() {
+        let pointer = self.input.pointer.as_ref()?;
+        let region = self.input.confinement_region.as_ref()?;
+        if let Some(p) = self.input.confined_pointer.as_mut() {
             p.set_region(Some(region.wl_region()));
         } else {
-            self.confined_pointer = self.confined.then_some(
-                self.pointer_constraints_state
+            self.input.confined_pointer = self.input.confined.then_some(
+                self.input
+                    .pointer_constraints_state
                     .confine_pointer(
                         &self.surface,
                         pointer.pointer(),
@@ -204,7 +169,7 @@ impl InputState {
     }
 }
 
-impl PointerConstraintsHandler for InputState {
+impl PointerConstraintsHandler for App {
     fn confined(
         &mut self,
         _conn: &Connection,
@@ -246,7 +211,7 @@ impl PointerConstraintsHandler for InputState {
     }
 }
 
-impl RelativePointerHandler for InputState {
+impl RelativePointerHandler for App {
     fn relative_pointer_motion(
         &mut self,
         _conn: &Connection,
@@ -256,19 +221,19 @@ impl RelativePointerHandler for InputState {
         event: RelativeMotionEvent,
     ) {
         // info!("relative {} {}", event.delta.0, event.delta.1);
-        if self.global_state.load().cursor_visible && !self.force_relative {
+        if self.global_state.load().cursor_visible && !self.input.force_relative {
             return;
         }
-        if !self.confined {
+        if !self.input.confined {
             return;
         }
         let sizer = self.sizer.load();
         let (x, y) = sizer.window_to_source_delta(event.delta);
-        self.injector.mouse_delta(x, y).unwrap();
+        self.input.injector.mouse_delta(x, y).unwrap();
     }
 }
 
-impl PointerHandler for InputState {
+impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
         conn: &Connection,
@@ -284,14 +249,14 @@ impl PointerHandler for InputState {
             match event.kind {
                 Enter { serial, .. } => {
                     // info!("Pointer entered @{:?}", event.position);
-                    self.pointer_serial = serial;
-                    self.cursor_over_surface = true;
-                    self.update_cursor(conn);
+                    self.input.pointer_serial = serial;
+                    self.input.cursor_over_surface = true;
+                    self.input_update_cursor(conn);
                 }
                 Leave { .. } => {
                     // info!("Pointer left");
-                    self.cursor_over_surface = false;
-                    self.update_cursor(conn);
+                    self.input.cursor_over_surface = false;
+                    self.input_update_cursor(conn);
                 }
                 Motion { .. } => {
                     if let Some((sx, sy)) = self
@@ -299,26 +264,29 @@ impl PointerHandler for InputState {
                         .load()
                         .window_to_source((event.position.0 as u32, event.position.1 as u32))
                         && self.global_state.load().cursor_visible
-                        && !self.force_relative
-                        && self.confined
+                        && !self.input.force_relative
+                        && self.input.confined
                     {
-                        self.injector.mouse_absolute(sx as i32, sy as i32).unwrap();
+                        self.input
+                            .injector
+                            .mouse_absolute(sx as i32, sy as i32)
+                            .unwrap();
                     }
                     // info!("motion {event:#?}");
                 }
                 Press { button, .. } => {
                     // info!("Press {:x} @ {:?}", button, event.position);
                     // info!("button {button}");
-                    if self.confined {
-                        self.injector.mouse_press(button).unwrap();
+                    if self.input.confined {
+                        self.input.injector.mouse_press(button).unwrap();
                     }
                 }
                 Release { button, .. } => {
                     // info!("Release {:x} @ {:?}", button, event.position);
-                    if button == BTN_LEFT && !self.confined {
+                    if button == BTN_LEFT && !self.input.confined {
                         self.set_confined(conn, true);
-                    } else if self.confined {
-                        self.injector.mouse_release(button).unwrap();
+                    } else if self.input.confined {
+                        self.input.injector.mouse_release(button).unwrap();
                     }
                 }
                 Axis {
@@ -327,8 +295,9 @@ impl PointerHandler for InputState {
                     ..
                 } => {
                     // info!("Scroll H:{horizontal:?}, V:{vertical:?}");
-                    if self.confined {
-                        self.injector
+                    if self.input.confined {
+                        self.input
+                            .injector
                             .scroll(horizontal.value120, vertical.value120)
                             .unwrap();
                     }
@@ -338,7 +307,7 @@ impl PointerHandler for InputState {
     }
 }
 
-impl KeyboardHandler for InputState {
+impl KeyboardHandler for App {
     fn enter(
         &mut self,
         _: &Connection,
@@ -353,7 +322,7 @@ impl KeyboardHandler for InputState {
             return;
         }
         // info!("Keyboard focus on window with pressed syms: {keysyms:?}");
-        self.keyboard_focus = true;
+        self.input.keyboard_focus = true;
     }
     fn leave(
         &mut self,
@@ -368,7 +337,7 @@ impl KeyboardHandler for InputState {
             return;
         }
         // info!("Release keyboard focus on window");
-        self.keyboard_focus = false;
+        self.input.keyboard_focus = false;
     }
     fn press_key(
         &mut self,
@@ -382,11 +351,11 @@ impl KeyboardHandler for InputState {
         if event.keysym == Keysym::Super_L {
             return;
         }
-        if self.modifiers.logo {
+        if self.input.modifiers.logo {
             return;
         }
-        if self.confined {
-            self.injector.key_press(event.raw_code).unwrap();
+        if self.input.confined {
+            self.input.injector.key_press(event.raw_code).unwrap();
         }
     }
 
@@ -413,15 +382,15 @@ impl KeyboardHandler for InputState {
         if event.keysym == Keysym::Super_L {
             return;
         }
-        if self.modifiers.logo {
+        if self.input.modifiers.logo {
             match event.keysym {
                 Keysym::Escape => {
-                    self.set_confined(conn, !self.confined);
+                    self.set_confined(conn, !self.input.confined);
                 }
                 Keysym::r => {
-                    self.force_relative = !self.force_relative;
+                    self.input.force_relative = !self.input.force_relative;
                     self.global_state
-                        .rcu(|s| s.with_force_relative(self.force_relative));
+                        .rcu(|s| s.with_force_relative(self.input.force_relative));
                 }
                 Keysym::c => {
                     self.global_state.rcu(|s| s.with_capture(!s.capture));
@@ -430,8 +399,8 @@ impl KeyboardHandler for InputState {
             }
             return;
         }
-        if self.confined {
-            self.injector.key_release(event.raw_code).unwrap();
+        if self.input.confined {
+            self.input.injector.key_release(event.raw_code).unwrap();
         }
     }
     fn update_modifiers(
@@ -445,13 +414,13 @@ impl KeyboardHandler for InputState {
         _layout: u32,
     ) {
         // info!("Update modifiers: {modifiers:?}");
-        self.modifiers = modifiers;
+        self.input.modifiers = modifiers;
     }
 }
 
-impl SeatHandler for InputState {
+impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
+        &mut self.input.seat_state
     }
 
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
@@ -464,33 +433,36 @@ impl SeatHandler for InputState {
         cap: Capability,
     ) {
         // info!("seat cap {cap:?}");
-        if cap == Capability::Pointer && self.pointer.is_none() {
+        if cap == Capability::Pointer && self.input.pointer.is_none() {
             let themed_pointer = self
+                .input
                 .seat_state
                 .get_pointer_with_theme(
                     qh,
                     &seat,
-                    &self.wl_shm,
-                    self.cursor_surface.clone(),
+                    self.shm_state.wl_shm(),
+                    self.input.cursor_surface.clone(),
                     ThemeSpec::default(),
                 )
                 .expect("Failed to create themed pointer");
 
-            self.relative_pointer = Some(
-                self.relative_pointer_state
+            self.input.relative_pointer = Some(
+                self.input
+                    .relative_pointer_state
                     .get_relative_pointer(themed_pointer.pointer(), qh)
                     .expect("Failed to create relative pointer"),
             );
-            self.pointer = Some(themed_pointer);
-            self.update_confine();
+            self.input.pointer = Some(themed_pointer);
+            self.input_update_confine();
         }
-        if cap == Capability::Keyboard && self.keyboard.is_none() {
+        if cap == Capability::Keyboard && self.input.keyboard.is_none() {
             // info!("Set keyboard capability");
             let keyboard = self
+                .input
                 .seat_state
                 .get_keyboard(qh, &seat, None)
                 .expect("Failed to create keyboard");
-            self.keyboard = Some(keyboard);
+            self.input.keyboard = Some(keyboard);
         }
     }
 
@@ -501,15 +473,15 @@ impl SeatHandler for InputState {
         _: WlSeat,
         cap: Capability,
     ) {
-        if cap == Capability::Keyboard && self.keyboard.is_some() {
+        if cap == Capability::Keyboard && self.input.keyboard.is_some() {
             // info!("Unset keyboard capability");
-            self.keyboard.take().unwrap().release();
+            self.input.keyboard.take().unwrap().release();
         }
-        if cap == Capability::Pointer && self.pointer.is_some() {
+        if cap == Capability::Pointer && self.input.pointer.is_some() {
             // info!("Unset pointer capability");
-            self.pointer.take().unwrap().pointer().release();
-            self.relative_pointer.take().unwrap().destroy();
-            if let Some(confined) = self.confined_pointer.take() {
+            self.input.pointer.take().unwrap().pointer().release();
+            self.input.relative_pointer.take().unwrap().destroy();
+            if let Some(confined) = self.input.confined_pointer.take() {
                 confined.destroy();
             }
         }
@@ -518,14 +490,7 @@ impl SeatHandler for InputState {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
 }
 
-impl ProvidesRegistryState for InputState {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![SeatState];
-}
-
-impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for InputState {
+impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
     fn event(
         state: &mut Self,
         _proxy: &ZwpKeyboardShortcutsInhibitorV1,
@@ -544,113 +509,15 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for InputState {
     }
 }
 
-impl AsMut<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>> for InputState {
+impl AsMut<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>> for App {
     fn as_mut(&mut self) -> &mut SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1> {
-        &mut self.shortcuts_inhibit_manager
+        &mut self.input.shortcuts_inhibit_manager
     }
 }
 
-impl Dispatch<WlSurface, SurfaceData> for InputState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WlSurface,
-        _event: <WlSurface as smithay_client_toolkit::reexports::client::Proxy>::Event,
-        _data: &SurfaceData,
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-delegate_seat!(InputState);
-delegate_pointer!(InputState);
-delegate_relative_pointer!(InputState);
-delegate_keyboard!(InputState);
-delegate_pointer_constraints!(InputState);
-delegate_registry!(InputState);
-delegate_simple!(InputState, ZwpKeyboardShortcutsInhibitManagerV1, 1);
-
-fn run_internal(init: InputThreadInit) -> Result<()> {
-    let mut event_loop: EventLoop<InputState> = EventLoop::try_new()?;
-    let loop_handle = event_loop.handle();
-
-    let conn = init.conn;
-    let mut event_queue = conn.new_event_queue();
-    let qh = event_queue.handle();
-    let (wl_primary, wl_clipboard) = unsafe {
-        wayland_clipboard::create_clipboards_from_external(conn.display().id().as_ptr() as *mut _)
-    };
-    let x11_primary = X11ClipboardContext::<X11Primary>::new().unwrap();
-    let x11_clipboard = X11ClipboardContext::<X11Clipboard>::new().unwrap();
-
-    let mut state = InputState {
-        // Handles & Shared State
-        qh: qh.clone(),
-        global_state: init.global_state,
-        sizer: init.sizer,
-        injector: init.injector,
-        _ph: init.ph,
-
-        // Wayland State
-        registry_state: RegistryState::new(&init.globals),
-        seat_state: SeatState::new(&init.globals, &qh),
-        relative_pointer_state: RelativePointerState::bind(&init.globals, &qh),
-        pointer_constraints_state: PointerConstraintsState::bind(&init.globals, &qh),
-        shortcuts_inhibit_manager: SimpleGlobal::bind(&init.globals, &qh)?,
-
-        // Wayland Objects
-        surface: init.surface,
-        cursor_surface: init.cursor_surface,
-        wl_shm: init.wl_shm,
-        keyboard: None,
-        pointer: None,
-        relative_pointer: None,
-        confined_pointer: None,
-        shortcuts_inhibitor: None,
-
-        // Internal State
-        modifiers: Modifiers::default(),
-        pointer_serial: 0,
-        confinement_region: None,
-        confined: init.confined,
-        force_relative: false,
-        cursor_over_surface: false,
-        keyboard_focus: false,
-
-        // Clipboards
-        wl_primary,
-        wl_clipboard,
-        x11_primary,
-        x11_clipboard,
-    };
-
-    event_queue
-        .roundtrip(&mut state)
-        .context("Failed to discover seats")?;
-
-    loop_handle
-        .insert_source(init.rx_input, |event, _, state| {
-            if let Event::Msg(cmd) = event {
-                match cmd {
-                    InputThreadCommand::UpdateConfinement { region } => {
-                        state.confinement_region = Some(region);
-                        state.update_confine();
-                    }
-                }
-            }
-        })
-        .unwrap();
-
-    WaylandSource::new(conn, event_queue)
-        .insert(loop_handle)
-        .unwrap();
-
-    loop {
-        event_loop.dispatch(None, &mut state)?;
-    }
-}
-
-pub fn run(init: InputThreadInit) {
-    let ph = init.ph.clone();
-    ph.fatal(run_internal(init).context("input thread"));
-}
+delegate_seat!(App);
+delegate_pointer!(App);
+delegate_relative_pointer!(App);
+delegate_keyboard!(App);
+delegate_pointer_constraints!(App);
+delegate_simple!(App, ZwpKeyboardShortcutsInhibitManagerV1, 1);

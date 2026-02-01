@@ -3,14 +3,17 @@ mod input;
 use crate::capture::backend::create_backend_builder;
 use crate::capture::plotter::PlotterHandle;
 use crate::capture::{Capture, CaptureHandle};
-use crate::display::input::{InputThreadHandle, InputThreadInit};
+use crate::display::input::InputState;
 use crate::sizer::{SharedSizer, Sizer};
 use crate::{GlobalState, Opts};
 use anyhow::{Context as _, Result, anyhow, bail};
+use copypasta::wayland_clipboard;
+use copypasta::x11_clipboard::{
+    Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
+};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::channel::channel;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -18,7 +21,7 @@ use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
 };
@@ -28,6 +31,10 @@ use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_vie
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay_client_toolkit::registry::SimpleGlobal;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::SeatState;
+use smithay_client_toolkit::seat::keyboard::Modifiers;
+use smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState;
+use smithay_client_toolkit::seat::relative_pointer::RelativePointerState;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
@@ -49,26 +56,30 @@ use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::clie
 struct App {
     // Handles
     loop_handle: LoopHandle<'static, App>,
-    input_handle: InputThreadHandle,
+    pub qh: QueueHandle<App>,
+    pub global_state: GlobalState,
 
     // Wayland State
     registry_state: RegistryState,
     output_state: OutputState,
     compositor_state: CompositorState,
     dmabuf_state: DmabufState,
-    shm_state: Shm,
+    pub shm_state: Shm,
     _xdg_shell: XdgShell,
     wp_viewporter: SimpleGlobal<WpViewporter, 1>,
     wp_frac_mgr: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
 
     // Wayland Objects
-    surface: WlSurface,
+    pub surface: WlSurface,
     viewport: WpViewport,
     _wp_frac: Option<WpFractionalScaleV1>,
 
     // Application Logic
     ch: CaptureHandle,
-    sizer: SharedSizer,
+    pub sizer: SharedSizer,
+
+    // Input State
+    pub input: InputState,
 
     // Window & Render State
     size: (u32, u32),
@@ -136,9 +147,8 @@ impl App {
             self.viewport.set_destination(w_w as i32, w_h as i32);
             self.surface.set_opaque_region(Some(region.wl_region()));
             self.surface.set_input_region(Some(region.wl_region()));
-            self.input_handle
-                .send(input::InputThreadCommand::UpdateConfinement { region })
-                .unwrap();
+            self.input.confinement_region = Some(region);
+            self.input_update_confine();
         }
 
         self.ch.frame(&sizer);
@@ -372,11 +382,9 @@ fn run_internal(
     let globals = Arc::new(globals);
     let qh = event_queue.handle();
 
-    let (tx_input, rx_input) = channel();
     let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let shm_state = Shm::bind(&globals, &qh)?;
-    let wl_shm = shm_state.wl_shm().clone();
     let surface = compositor_state.create_surface(&qh);
     let wp_viewporter = SimpleGlobal::<WpViewporter, 1>::bind(&globals, &qh)?;
     let viewport = wp_viewporter.get()?.get_viewport(&surface, &qh, ());
@@ -407,25 +415,18 @@ fn run_internal(
     std::thread::spawn(move || capture.run());
     ch.resize(&sizer.load());
 
-    let init = InputThreadInit {
-        conn: conn.clone(),
-        globals: globals.clone(),
-        surface: surface.clone(),
-        cursor_surface,
-        wl_shm,
-        sizer: sizer.clone(),
-        global_state: global_state.clone(),
-        ph: ph.clone(),
-        rx_input,
-        confined: opts.confine,
-        injector,
+    // Initialize clipboards
+    let (wl_primary, wl_clipboard) = unsafe {
+        wayland_clipboard::create_clipboards_from_external(conn.display().id().as_ptr() as *mut _)
     };
-    std::thread::spawn(move || input::run(init));
+    let x11_primary = X11ClipboardContext::<X11Primary>::new().unwrap();
+    let x11_clipboard = X11ClipboardContext::<X11Clipboard>::new().unwrap();
 
     let mut app = App {
         // Handles
         loop_handle: loop_handle.clone(),
-        input_handle: tx_input,
+        qh: qh.clone(),
+        global_state: global_state.clone(),
 
         // Wayland State
         registry_state: RegistryState::new(&globals),
@@ -446,6 +447,32 @@ fn run_internal(
         ch,
         sizer,
 
+        // Input State
+        input: InputState {
+            seat_state: SeatState::new(&globals, &qh),
+            relative_pointer_state: RelativePointerState::bind(&globals, &qh),
+            pointer_constraints_state: PointerConstraintsState::bind(&globals, &qh),
+            shortcuts_inhibit_manager: SimpleGlobal::bind(&globals, &qh)?,
+            cursor_surface,
+            keyboard: None,
+            pointer: None,
+            relative_pointer: None,
+            confined_pointer: None,
+            shortcuts_inhibitor: None,
+            modifiers: Modifiers::default(),
+            pointer_serial: 0,
+            confinement_region: None,
+            confined: opts.confine,
+            force_relative: false,
+            cursor_over_surface: false,
+            keyboard_focus: false,
+            wl_primary,
+            wl_clipboard,
+            x11_primary,
+            x11_clipboard,
+            injector,
+        },
+
         // Window & Render State
         size: (0, 0),
         scale120: 120,
@@ -458,7 +485,9 @@ fn run_internal(
         pending_resize: None,
     };
 
+    // Discover seats
     event_queue.roundtrip(&mut app)?;
+
     if let Some(4..) = app.dmabuf_state.version() {
         app.dmabuf_state.get_surface_feedback(&surface, &qh)?;
     } else {
