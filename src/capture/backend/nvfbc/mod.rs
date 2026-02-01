@@ -1,7 +1,8 @@
 mod nvcapture;
 
 use self::nvcapture::NvCapture;
-use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
+use super::xinput::XInput;
+use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame, InputInjector};
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
@@ -59,7 +60,7 @@ impl CaptureBackendBuilder for Builder {
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
-    ) -> Result<Box<dyn CaptureBackend>> {
+    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
         let (_, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
         self.capturer.release_thread()?;
 
@@ -67,14 +68,19 @@ impl CaptureBackendBuilder for Builder {
             .map(|_| PooledBuffer::new(device.clone(), &allocator, self.ctx.clone(), info.size))
             .collect::<Result<VecDeque<_>>>()?;
 
-        Ok(Box::new(Backend {
-            ctx: self.ctx,
-            capturer: self.capturer,
-            device,
-            allocator,
-            bufs,
-            ph,
-        }))
+        let injector = XInput::new()?;
+
+        Ok((
+            Box::new(Backend {
+                ctx: self.ctx,
+                capturer: self.capturer,
+                device,
+                allocator,
+                bufs,
+                ph,
+            }),
+            Box::new(injector),
+        ))
     }
 }
 
@@ -156,7 +162,9 @@ impl CaptureBackend for Backend {
                 commit: None,
                 cursor_visible: info.cursor_visible,
             },
-            handle: Box::new(BufferHandle { cumem: pooled.cumem }),
+            handle: Box::new(BufferHandle {
+                cumem: pooled.cumem,
+            }),
         };
         Ok(Some(frame))
     }

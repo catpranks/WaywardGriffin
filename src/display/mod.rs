@@ -1,5 +1,4 @@
 mod input;
-mod xinput;
 
 use crate::capture::backend::create_backend_builder;
 use crate::capture::plotter::PlotterHandle;
@@ -387,6 +386,27 @@ fn run_internal(
     window.set_app_id("waygriff");
     window.commit();
     let cursor_surface = compositor_state.create_surface(&qh);
+
+    let mut wp_frac_mgr = None;
+    let mut wp_frac = None;
+    if let Ok(mgr) = SimpleGlobal::<WpFractionalScaleManagerV1, 1>::bind(&globals, &qh) {
+        wp_frac = Some(mgr.get()?.get_fractional_scale(&surface, &qh, ()));
+        wp_frac_mgr = Some(mgr);
+    }
+
+    let backend_builder = create_backend_builder(&opts.capture_opts)?;
+    let (mut capture, injector) = Capture::new(
+        ph.clone(),
+        global_state.clone(),
+        backend_builder,
+        &conn,
+        &surface,
+        sizer.clone(),
+    )?;
+    let ch = capture.handle.clone();
+    std::thread::spawn(move || capture.run());
+    ch.resize(&sizer.load());
+
     let init = InputThreadInit {
         conn: conn.clone(),
         globals: globals.clone(),
@@ -398,28 +418,9 @@ fn run_internal(
         ph: ph.clone(),
         rx_input,
         confined: opts.confine,
+        injector,
     };
     std::thread::spawn(move || input::run(init));
-
-    let mut wp_frac_mgr = None;
-    let mut wp_frac = None;
-    if let Ok(mgr) = SimpleGlobal::<WpFractionalScaleManagerV1, 1>::bind(&globals, &qh) {
-        wp_frac = Some(mgr.get()?.get_fractional_scale(&surface, &qh, ()));
-        wp_frac_mgr = Some(mgr);
-    }
-
-    let backend_builder = create_backend_builder(&opts.capture_opts)?;
-    let mut capture = Capture::new(
-        ph.clone(),
-        global_state.clone(),
-        backend_builder,
-        &conn,
-        &surface,
-        sizer.clone(),
-    )?;
-    let ch = capture.handle.clone();
-    std::thread::spawn(move || capture.run());
-    ch.resize(&sizer.load());
 
     let mut app = App {
         // Handles

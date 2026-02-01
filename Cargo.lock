@@ -2442,7 +2442,6 @@ dependencies = [
  "vulkano-shaders",
  "wayland-backend",
  "x11rb",
- "xkeysym",
 ]
 
 [[package]]

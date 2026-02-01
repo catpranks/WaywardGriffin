@@ -1,6 +1,6 @@
 use crate::GlobalState;
+use crate::capture::backend::InputInjector;
 use crate::capture::plotter::PlotterHandle;
-use crate::display::xinput::XInput;
 use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result};
 use copypasta::wayland_clipboard::{
@@ -67,6 +67,7 @@ pub struct InputThreadInit {
     pub ph: PlotterHandle,
     pub rx_input: Channel<InputThreadCommand>,
     pub confined: bool,
+    pub injector: Box<dyn InputInjector>,
 }
 
 struct InputState {
@@ -74,7 +75,7 @@ struct InputState {
     qh: QueueHandle<Self>,
     global_state: GlobalState,
     sizer: SharedSizer,
-    xinput: XInput,
+    injector: Box<dyn InputInjector>,
     _ph: PlotterHandle,
 
     // Wayland State
@@ -263,7 +264,7 @@ impl RelativePointerHandler for InputState {
         }
         let sizer = self.sizer.load();
         let (x, y) = sizer.window_to_source_delta(event.delta);
-        self.xinput.mouse_delta(x, y).unwrap();
+        self.injector.mouse_delta(x, y).unwrap();
     }
 }
 
@@ -301,7 +302,7 @@ impl PointerHandler for InputState {
                         && !self.force_relative
                         && self.confined
                     {
-                        self.xinput.mouse_absolute(sx as i32, sy as i32).unwrap();
+                        self.injector.mouse_absolute(sx as i32, sy as i32).unwrap();
                     }
                     // info!("motion {event:#?}");
                 }
@@ -309,7 +310,7 @@ impl PointerHandler for InputState {
                     // info!("Press {:x} @ {:?}", button, event.position);
                     // info!("button {button}");
                     if self.confined {
-                        self.xinput.mouse_press(button).unwrap();
+                        self.injector.mouse_press(button).unwrap();
                     }
                 }
                 Release { button, .. } => {
@@ -317,7 +318,7 @@ impl PointerHandler for InputState {
                     if button == BTN_LEFT && !self.confined {
                         self.set_confined(conn, true);
                     } else if self.confined {
-                        self.xinput.mouse_release(button).unwrap();
+                        self.injector.mouse_release(button).unwrap();
                     }
                 }
                 Axis {
@@ -327,7 +328,7 @@ impl PointerHandler for InputState {
                 } => {
                     // info!("Scroll H:{horizontal:?}, V:{vertical:?}");
                     if self.confined {
-                        self.xinput
+                        self.injector
                             .scroll(horizontal.value120, vertical.value120)
                             .unwrap();
                     }
@@ -385,7 +386,7 @@ impl KeyboardHandler for InputState {
             return;
         }
         if self.confined {
-            self.xinput.press(event.keysym).unwrap();
+            self.injector.key_press(event.raw_code).unwrap();
         }
     }
 
@@ -430,7 +431,7 @@ impl KeyboardHandler for InputState {
             return;
         }
         if self.confined {
-            self.xinput.release(event.keysym).unwrap();
+            self.injector.key_release(event.raw_code).unwrap();
         }
     }
     fn update_modifiers(
@@ -587,7 +588,7 @@ fn run_internal(init: InputThreadInit) -> Result<()> {
         qh: qh.clone(),
         global_state: init.global_state,
         sizer: init.sizer,
-        xinput: XInput::new()?,
+        injector: init.injector,
         _ph: init.ph,
 
         // Wayland State

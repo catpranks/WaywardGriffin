@@ -18,10 +18,6 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 #[derive(Debug, Clone, Parser)]
 #[command(version, about, long_about = None)]
 struct Opts {
-    /// The display to capture
-    #[arg(long)]
-    display: String,
-
     /// Delay between TUI frames
     #[arg(long, value_parser = humantime::parse_duration)]
     tdelay: Option<std::time::Duration>,
@@ -40,7 +36,7 @@ struct Opts {
 
 pub fn run() -> Result<()> {
     let opts = Opts::parse();
-    unsafe { std::env::set_var("DISPLAY", opts.display.clone()) };
+    unsafe { std::env::set_var("DISPLAY", opts.capture_opts.display.clone()) };
     let crate_name = env!("CARGO_PKG_NAME");
 
     let global_state = Arc::new(ArcSwap::from_pointee(GlobalStateInner {

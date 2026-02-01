@@ -35,7 +35,6 @@ vulkano = "0.35.2"
 vulkano-shaders = "0.35.0"
 wayland-backend = { version = "0.3.12", features = ["client_system"] }
 x11rb = { version = "0.13.2", features = ["xtest"] }
-xkeysym = "0.2.1"
 
 [build-dependencies]
 cc = "1.2.54"

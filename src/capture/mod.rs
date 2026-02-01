@@ -2,7 +2,7 @@ pub mod backend;
 pub mod plotter;
 
 use crate::GlobalState;
-use crate::capture::backend::{BackendType, CaptureBackend, CaptureBackendBuilder};
+use crate::capture::backend::{BackendType, CaptureBackend, CaptureBackendBuilder, InputInjector};
 use crate::capture::plotter::PlotterHandle;
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
@@ -58,6 +58,10 @@ use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
 
 #[derive(Debug, Clone, Args)]
 pub struct CaptureOpts {
+    /// The display to capture
+    #[arg(long)]
+    pub display: String,
+
     /// Capture backend to use
     #[arg(long, value_enum)]
     pub backend: BackendType,
@@ -208,7 +212,7 @@ impl Capture {
         conn: &Connection,
         wl_surface: &WlSurface,
         sizer: SharedSizer,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Box<dyn InputInjector>)> {
         let device_uuid = backend_builder.device_uuid();
 
         let library = VulkanLibrary::new().expect("no local Vulkan library/driver found");
@@ -388,7 +392,8 @@ impl Capture {
             },
         )?;
 
-        let backend = backend_builder.build(device.clone(), allocator.clone(), ph.clone())?;
+        let (backend, injector) =
+            backend_builder.build(device.clone(), allocator.clone(), ph.clone())?;
 
         let in_flight = (0..3)
             .map(|_| {
@@ -441,7 +446,7 @@ impl Capture {
             _surface: surface,
             start_time: Instant::now(),
         };
-        Ok(this)
+        Ok((this, injector))
     }
 
     pub fn run(&mut self) {
