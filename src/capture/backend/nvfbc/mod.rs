@@ -163,6 +163,7 @@ impl CaptureBackend for Backend {
                 wait,
                 obtain,
                 commit: None,
+                present: None,
                 cursor_visible: info.cursor_visible,
             },
             handle: Box::new(BufferHandle {

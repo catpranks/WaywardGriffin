@@ -126,12 +126,17 @@ pub struct FrameInfo {
     pub wait: Instant,
     pub obtain: Instant,
     pub commit: Option<Instant>,
+    pub present: Option<Instant>,
     pub cursor_visible: bool,
 }
 
 impl FrameInfo {
     pub fn mark_commit(&mut self) {
         self.commit = Some(Instant::now());
+    }
+
+    pub fn mark_present(&mut self) {
+        self.present = Some(Instant::now());
     }
 
     fn wait_ms(&self) -> f64 {
@@ -145,6 +150,12 @@ impl FrameInfo {
     fn commit_ms(&self) -> f64 {
         self.commit
             .map(|c| c.duration_since(self.start).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
+    }
+
+    fn present_ms(&self) -> f64 {
+        self.present
+            .map(|p| p.duration_since(self.start).as_secs_f64() * 1000.0)
             .unwrap_or(0.0)
     }
 }
@@ -179,24 +190,33 @@ impl App {
         }
     }
 
-    fn timings_avg(&self) -> (f64, f64, f64) {
+    fn timings_avg(&self) -> (f64, f64, f64, f64) {
         if self.timings.is_empty() {
-            return (0.0, 0.0, 0.0);
+            return (0.0, 0.0, 0.0, 0.0);
         }
-        let (wait, obtain, commit) = self.timings.iter().fold((0.0, 0.0, 0.0), |(w, o, c), t| {
-            (w + t.wait_ms(), o + t.obtain_ms(), c + t.commit_ms())
-        });
+        let (wait, obtain, commit, present) =
+            self.timings
+                .iter()
+                .fold((0.0, 0.0, 0.0, 0.0), |(w, o, c, p), t| {
+                    (
+                        w + t.wait_ms(),
+                        o + t.obtain_ms(),
+                        c + t.commit_ms(),
+                        p + t.present_ms(),
+                    )
+                });
         let len = self.timings.len() as f64;
-        (wait / len, obtain / len, commit / len)
+        (wait / len, obtain / len, commit / len, present / len)
     }
 
-    fn timings_commit_min_max(&self) -> (f64, f64) {
+    fn timings_present_min_max(&self) -> (f64, f64) {
         if self.timings.is_empty() {
             return (0.0, 0.0);
         }
         self.timings
             .iter()
-            .map(|t| t.commit_ms())
+            .filter(|t| t.present.is_some())
+            .map(|t| t.present_ms())
             .fold((f64::MAX, f64::MIN), |(min, max), v| {
                 (min.min(v), max.max(v))
             })
@@ -324,6 +344,12 @@ impl App {
             .enumerate()
             .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.commit_ms()))
             .collect();
+        let present_data: Vec<_> = self
+            .timings
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.present_ms()))
+            .collect();
 
         let datasets = vec![
             Dataset::default()
@@ -341,12 +367,22 @@ impl App {
                 .marker(symbols::Marker::Braille)
                 .style(Style::default().fg(Color::White))
                 .data(&commit_data),
+            Dataset::default()
+                .name("Present")
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::Yellow))
+                .data(&present_data),
         ];
 
         let max_timing = self
             .timings
             .iter()
-            .map(|t| t.wait_ms().max(t.obtain_ms()).max(t.commit_ms()))
+            .map(|t| {
+                t.wait_ms()
+                    .max(t.obtain_ms())
+                    .max(t.commit_ms())
+                    .max(t.present_ms())
+            })
             .fold(0.0, f64::max);
         let y_axis_bounds = [0.0, (max_timing * 1.2).max(16.67)];
 
@@ -380,8 +416,8 @@ impl App {
             );
         f.render_widget(chart, chunks[0]);
 
-        let (avg_wait, avg_obtain, avg_commit) = self.timings_avg();
-        let (min_commit, max_commit) = self.timings_commit_min_max();
+        let (avg_wait, avg_obtain, avg_commit, avg_present) = self.timings_avg();
+        let (min_present, max_present) = self.timings_present_min_max();
         let render_fps = self.timings_fps().unwrap_or(0.0);
 
         let capture_fps = if self.captures.len() < 2 {
@@ -416,7 +452,7 @@ impl App {
         let state_display = format!("[{}]", state_tags.join(" "));
 
         let status_text = format!(
-            "R{:.1} C{:.1} | S:{} M:{} {} | W:{:.1} O:{:.1} C:{:.1} ({:.1}-{:.1})",
+            "R{:.1} C{:.1} | S:{} M:{} {} | W:{:.2} O:{:.2} C:{:.2} P:{:.2} ({:.2}-{:.2})",
             render_fps,
             capture_fps,
             skip_count,
@@ -425,8 +461,9 @@ impl App {
             avg_wait,
             avg_obtain,
             avg_commit,
-            min_commit,
-            max_commit
+            avg_present,
+            min_present,
+            max_present
         );
         let status = Paragraph::new(status_text);
         f.render_widget(status, chunks[1]);

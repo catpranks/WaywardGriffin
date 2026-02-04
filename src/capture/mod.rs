@@ -3,13 +3,14 @@ pub mod plotter;
 
 use crate::GlobalState;
 use crate::capture::backend::{BackendType, CaptureBackend, CaptureBackendBuilder, InputInjector};
-use crate::capture::plotter::PlotterHandle;
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use clap::Args;
 use smallvec::smallvec;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
+use std::num::NonZero;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 use tracing::info;
@@ -175,6 +176,12 @@ impl CaptureHandle {
     }
 }
 
+struct PresentWaitRequest {
+    swapchain: Arc<Swapchain>,
+    present_id: NonZero<u64>,
+    info: FrameInfo,
+}
+
 pub struct Capture {
     pub handle: CaptureHandle,
     rx_cmd: mpsc::Receiver<CaptureCommand>,
@@ -185,6 +192,8 @@ pub struct Capture {
     wl_surface: WlSurface,
 
     frame_idx: usize,
+    present_counter: u64,
+    present_wait_tx: mpsc::Sender<PresentWaitRequest>,
 
     backend: Box<dyn CaptureBackend>,
 
@@ -237,6 +246,8 @@ impl Capture {
             ext_external_memory_dma_buf: true,
             khr_external_semaphore_fd: true,
             khr_timeline_semaphore: true,
+            khr_present_id: true,
+            khr_present_wait: true,
             ..DeviceExtensions::empty()
         };
 
@@ -289,6 +300,8 @@ impl Capture {
                 }],
                 enabled_features: DeviceFeatures {
                     timeline_semaphore: true,
+                    present_id: true,
+                    present_wait: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -425,6 +438,23 @@ impl Capture {
         let (tx_cmd, rx_cmd) = mpsc::channel();
         let handle = CaptureHandle { cmd: tx_cmd };
 
+        let (present_wait_tx, present_wait_rx) = mpsc::channel::<PresentWaitRequest>();
+        let wait_ph = ph.clone();
+        std::thread::spawn(move || {
+            for req in present_wait_rx {
+                match req.swapchain.wait_for_present(req.present_id, None) {
+                    Ok(_) => {
+                        let mut info = req.info;
+                        info.mark_present();
+                        wait_ph.render(info);
+                    }
+                    Err(e) => {
+                        wait_ph.log(format!("wait_for_present error: {e:?}"));
+                    }
+                }
+            }
+        });
+
         let this = Self {
             handle,
             rx_cmd,
@@ -433,6 +463,8 @@ impl Capture {
             sizer,
             wl_surface: wl_surface.clone(),
             frame_idx: 0,
+            present_counter: 0,
+            present_wait_tx,
             backend,
             in_flight,
             images: vec![],
@@ -764,6 +796,9 @@ impl Capture {
             .wait_dst_stage_mask(&[ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
             .signal_semaphores(&present_semaphore);
 
+        self.present_counter += 1;
+        let present_id = NonZero::new(self.present_counter).unwrap();
+
         let _pres = self.queue.with(|mut guard| unsafe {
             (self.device.fns().v1_0.queue_submit)(
                 self.queue.handle(),
@@ -776,10 +811,13 @@ impl Capture {
             guard
                 .present(&PresentInfo {
                     wait_semaphores: vec![SemaphorePresentInfo::new(ifl.present.clone())],
-                    swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
-                        self.swapchain.clone(),
-                        image_index,
-                    )],
+                    swapchain_infos: vec![SwapchainPresentInfo {
+                        present_id: Some(present_id),
+                        ..SwapchainPresentInfo::swapchain_image_index(
+                            self.swapchain.clone(),
+                            image_index,
+                        )
+                    }],
                     ..Default::default()
                 })?
                 .next()
@@ -791,7 +829,11 @@ impl Capture {
         self.backend.release(frame, Some(ifl.fence.clone()));
 
         info.mark_commit();
-        self.ph.render(info);
+        let _ = self.present_wait_tx.send(PresentWaitRequest {
+            swapchain: self.swapchain.clone(),
+            present_id,
+            info,
+        });
         self.frame_idx += 1;
         Ok(())
     }
