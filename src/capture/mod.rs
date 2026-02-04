@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod oneshot;
 pub mod plotter;
 
 use crate::GlobalState;

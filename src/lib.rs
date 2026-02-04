@@ -31,6 +31,10 @@ struct Opts {
     #[arg(long)]
     nocapture: bool,
 
+    /// Capture one frame and print to terminal via viuer
+    #[arg(long)]
+    oneshot: bool,
+
     #[command(flatten)]
     capture_opts: capture::CaptureOpts,
 }
@@ -47,6 +51,11 @@ pub fn run() -> Result<()> {
             std::env::remove_var("DISPLAY");
         },
     }
+
+    if opts.oneshot {
+        return capture::oneshot::run(&opts.capture_opts);
+    }
+
     let crate_name = env!("CARGO_PKG_NAME");
 
     let global_state = Arc::new(ArcSwap::from_pointee(GlobalStateInner {
