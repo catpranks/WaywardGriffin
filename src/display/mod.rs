@@ -1,6 +1,6 @@
 mod input;
 
-use crate::capture::backend::create_backend_builder;
+use crate::capture::source::create_backend_builder;
 use crate::capture::plotter::PlotterHandle;
 use crate::capture::{Capture, CaptureHandle};
 use crate::display::input::InputState;

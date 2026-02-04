@@ -1,5 +1,5 @@
 use super::CaptureOpts;
-use super::backend::create_backend_builder;
+use super::source::create_backend_builder;
 use super::plotter::PlotterHandle;
 use anyhow::{Context as _, Result};
 use std::sync::Arc;

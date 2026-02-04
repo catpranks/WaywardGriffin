@@ -1,9 +1,11 @@
-pub mod backend;
+pub mod input;
 pub mod oneshot;
 pub mod plotter;
+pub mod source;
 
 use crate::GlobalState;
-use crate::capture::backend::{BackendType, CaptureBackend, CaptureBackendBuilder, InputInjector};
+use crate::capture::input::InputInjector;
+use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder};
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};

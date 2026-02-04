@@ -14,9 +14,10 @@ Communication: `mpsc::Sender<CaptureCommand>` from display→capture. Lock-free 
 
 ## Key files
 
-- `capture/backend/mod.rs` - `CaptureBackend` and `InputInjector` traits
-- `capture/backend/nvfbc/` - NVFBC capture, CUDA→Vulkan DMA-BUF, buffer pool
-- `capture/backend/xinput.rs` - X11 XTest input injection
+- `capture/source/mod.rs` - `CaptureBackend` trait
+- `capture/source/nvfbc/` - NVFBC capture, CUDA→Vulkan DMA-BUF, buffer pool
+- `capture/input/mod.rs` - `InputInjector` trait
+- `capture/input/xinput.rs` - X11 XTest input injection
 - `sizer.rs` - Coordinate transforms between source/window/render space
 - `display/input.rs` - Shortcuts: Super+Escape (grab), Super+R (force relative), Super+C (capture toggle)
 

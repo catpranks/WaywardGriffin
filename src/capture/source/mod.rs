@@ -1,8 +1,8 @@
 pub mod nvfbc;
-pub mod xinput;
 
+use super::input::InputInjector;
+use super::plotter::{FrameInfo, PlotterHandle};
 use super::CaptureOpts;
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::Result;
 use clap::ValueEnum;
 use std::any::Any;
@@ -50,14 +50,4 @@ pub trait CaptureBackendBuilder: Send {
 pub trait CaptureBackend: Send {
     fn capture(&mut self) -> Result<Option<CapturedFrame>>;
     fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>);
-}
-
-pub trait InputInjector: Send {
-    fn mouse_delta(&mut self, x: f64, y: f64) -> Result<()>;
-    fn mouse_absolute(&mut self, x: i32, y: i32) -> Result<()>;
-    fn mouse_press(&mut self, button: u32) -> Result<()>;
-    fn mouse_release(&mut self, button: u32) -> Result<()>;
-    fn key_press(&mut self, keycode: u32) -> Result<()>;
-    fn key_release(&mut self, keycode: u32) -> Result<()>;
-    fn scroll(&mut self, h: i32, v: i32) -> Result<()>;
 }

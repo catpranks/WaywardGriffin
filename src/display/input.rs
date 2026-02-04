@@ -1,4 +1,4 @@
-use crate::capture::backend::InputInjector;
+use crate::capture::input::InputInjector;
 use copypasta::wayland_clipboard::{Clipboard as WaylandClipboard, Primary as WaylandPrimary};
 use copypasta::x11_clipboard::{
     Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,

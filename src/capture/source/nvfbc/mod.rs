@@ -1,8 +1,9 @@
 mod nvcapture;
 
 use self::nvcapture::NvCapture;
-use super::xinput::XInput;
-use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame, InputInjector};
+use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
+use crate::capture::input::xinput::XInput;
+use crate::capture::input::InputInjector;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
