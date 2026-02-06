@@ -1,9 +1,12 @@
-use super::{CaptureBackend, CaptureBackendBuilder};
+use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
 use crate::capture::input::InputInjector;
+use crate::capture::input::dummy::DummyInput;
 use crate::capture::plotter::PlotterHandle;
 use anyhow::{Context as _, Result, bail};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
@@ -16,10 +19,12 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use vulkano::device::Device;
 use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::sync::fence::Fence;
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1;
+use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
 use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1};
 
 struct State {
@@ -28,6 +33,16 @@ struct State {
     dmabuf_state: DmabufState,
     screencopy_manager: ZwlrScreencopyManagerV1,
     feedback: Option<DmabufFeedback>,
+    qh: QueueHandle<State>,
+    output: Option<WlOutput>,
+    pending_linux_dmabuf: Option<(u32, u32, u32)>,
+}
+
+impl State {
+    fn start_capture(&self) {
+        let output = self.output.as_ref().unwrap();
+        self.screencopy_manager.capture_output(1, output, &self.qh, ());
+    }
 }
 
 impl ProvidesRegistryState for State {
@@ -94,6 +109,41 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
     }
 }
 
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        frame: &ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                state.pending_linux_dmabuf = Some((format, width, height));
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
+                let (_format, _width, _height) = state.pending_linux_dmabuf.take().unwrap();
+                let _buffer: WlBuffer = todo!("create dmabuf wl_buffer");
+                // frame.copy(&buffer);
+            }
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+                frame.destroy();
+                state.start_capture();
+            }
+            zwlr_screencopy_frame_v1::Event::Failed => {
+                frame.destroy();
+                state.start_capture();
+            }
+            _ => {}
+        }
+    }
+}
+
 delegate_registry!(State);
 delegate_output!(State);
 delegate_dmabuf!(State);
@@ -124,9 +174,21 @@ impl Builder {
             dmabuf_state: DmabufState::new(&globals, &qh),
             screencopy_manager,
             feedback: None,
+            qh: qh.clone(),
+            output: None,
+            pending_linux_dmabuf: None,
         };
 
         event_queue.roundtrip(&mut state)?;
+
+        state.output = Some(
+            state
+                .output_state
+                .outputs()
+                .next()
+                .context("no outputs available")?
+                .clone(),
+        );
 
         state.dmabuf_state.get_default_feedback(&qh)?;
         event_queue.roundtrip(&mut state)?;
@@ -156,6 +218,36 @@ impl CaptureBackendBuilder for Builder {
         _ph: PlotterHandle,
         _display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
-        todo!("wlr-screencopy backend build")
+        std::thread::Builder::new()
+            .name("wlr-screencopy".into())
+            .spawn(move || event_loop_thread(self.conn, self.event_queue, self.state))?;
+
+        Ok((Box::new(Backend), Box::new(DummyInput::new())))
+    }
+}
+
+struct Backend;
+
+impl CaptureBackend for Backend {
+    fn capture(&mut self) -> Result<Option<CapturedFrame>> {
+        Ok(None)
+    }
+
+    fn release(&mut self, _frame: CapturedFrame, _fence: Option<Arc<Fence>>) {
+    }
+}
+
+fn event_loop_thread(conn: Connection, event_queue: EventQueue<State>, mut state: State) {
+    let mut event_loop: EventLoop<State> = EventLoop::try_new().unwrap();
+    let loop_handle = event_loop.handle();
+
+    WaylandSource::new(conn, event_queue)
+        .insert(loop_handle)
+        .unwrap();
+
+    state.start_capture();
+
+    loop {
+        event_loop.dispatch(None, &mut state).unwrap();
     }
 }
