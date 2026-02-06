@@ -1,7 +1,8 @@
 use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
+use crate::OwningWlBuffer;
 use crate::capture::input::InputInjector;
 use crate::capture::input::dummy::DummyInput;
-use crate::capture::plotter::PlotterHandle;
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -18,12 +19,12 @@ use smithay_client_toolkit::{
 };
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
 use vulkano::image::{ImageAspect, ImageCreateInfo, ImageTiling, ImageUsage};
-use vulkano::memory::allocator::{MemoryAllocator as _, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::memory::{
     DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, ExternalMemoryHandleTypes,
     MemoryAllocateInfo, ResourceMemory,
@@ -45,6 +46,10 @@ struct State {
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
     pending_linux_dmabuf: Option<(u32, u32, u32)>,
+    shared: Arc<Mutex<BufferPool>>,
+    device: Option<Arc<Device>>,
+    allocator: Option<Arc<StandardMemoryAllocator>>,
+    in_flight: Option<PooledBuffer>,
 }
 
 impl State {
@@ -137,15 +142,80 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 state.pending_linux_dmabuf = Some((format, width, height));
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
-                let (_format, _width, _height) = state.pending_linux_dmabuf.take().unwrap();
-                let _buffer: WlBuffer = todo!("create dmabuf wl_buffer");
-                // frame.copy(&buffer);
+                let (format, width, height) = state.pending_linux_dmabuf.take().unwrap();
+                let vk_format = fourcc_to_format(format).unwrap();
+
+                let mut buf = {
+                    let mut pool = state.shared.lock().unwrap();
+                    pool.pool.pop()
+                };
+
+                let reuse = buf.as_ref().is_some_and(|b| {
+                    let ext = b.image.extent();
+                    b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
+                });
+                if !reuse {
+                    if let Some(old) = &mut buf
+                        && let Some(fence) = old.fence.take()
+                    {
+                        fence.wait(None).unwrap();
+                    }
+                    buf = Some(
+                        PooledBuffer::new(
+                            state.device.as_ref().unwrap(),
+                            state.allocator.as_ref().unwrap().as_ref(),
+                            &state.dmabuf_state,
+                            &state.qh,
+                            format,
+                            width,
+                            height,
+                        )
+                        .unwrap(),
+                    );
+                }
+                let mut buf = buf.unwrap();
+
+                if let Some(fence) = buf.fence.take() {
+                    fence.wait(None).unwrap();
+                }
+
+                frame.copy(&buf.wl_buffer);
+                state.in_flight = Some(buf);
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+                let buf = state.in_flight.take().unwrap();
+                // TODO: proper timing (start at capture_output, wait at fence, obtain here)
+                // and plotter capture/capture_miss counters
+                let now = std::time::Instant::now();
+                let captured = CapturedFrame {
+                    image: buf.image,
+                    info: FrameInfo {
+                        start: now,
+                        wait: now,
+                        obtain: now,
+                        commit: None,
+                        present: None,
+                        cursor_visible: true,
+                    },
+                    handle: Box::new(BufferHandle {
+                        wl_buffer: buf.wl_buffer,
+                    }),
+                };
+                let mut pool = state.shared.lock().unwrap();
+                if let Some(old) = pool.ready.take() {
+                    let handle: BufferHandle = *old.handle.downcast().expect("invalid handle type");
+                    pool.pool.push(PooledBuffer {
+                        wl_buffer: handle.wl_buffer,
+                        image: old.image,
+                        fence: None,
+                    });
+                }
+                pool.ready = Some(captured);
                 frame.destroy();
                 state.start_capture();
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
+                // TODO: counter, return the pending buffer
                 frame.destroy();
                 state.start_capture();
             }
@@ -187,6 +257,13 @@ impl Builder {
             qh: qh.clone(),
             output: None,
             pending_linux_dmabuf: None,
+            shared: Arc::new(Mutex::new(BufferPool {
+                pool: Vec::new(),
+                ready: None,
+            })),
+            device: None,
+            allocator: None,
+            in_flight: None,
         };
 
         event_queue.roundtrip(&mut state)?;
@@ -223,21 +300,31 @@ impl CaptureBackendBuilder for Builder {
 
     fn build(
         self: Box<Self>,
-        _device: Arc<Device>,
-        _allocator: Arc<StandardMemoryAllocator>,
+        device: Arc<Device>,
+        allocator: Arc<StandardMemoryAllocator>,
         _ph: PlotterHandle,
         _display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
+        let Self {
+            conn,
+            event_queue,
+            mut state,
+        } = *self;
+
+        let shared = state.shared.clone();
+        state.device = Some(device);
+        state.allocator = Some(allocator);
+
         std::thread::Builder::new()
             .name("wlr-screencopy".into())
-            .spawn(move || event_loop_thread(self.conn, self.event_queue, self.state))?;
+            .spawn(move || event_loop_thread(conn, event_queue, state))?;
 
-        Ok((Box::new(Backend), Box::new(DummyInput::new())))
+        Ok((Box::new(Backend { shared }), Box::new(DummyInput::new())))
     }
 }
 
 struct PooledBuffer {
-    wl_buffer: WlBuffer,
+    wl_buffer: OwningWlBuffer,
     image: Arc<vulkano::image::Image>,
     fence: Option<Arc<Fence>>,
 }
@@ -245,7 +332,7 @@ struct PooledBuffer {
 impl PooledBuffer {
     fn new(
         device: &Arc<Device>,
-        allocator: &StandardMemoryAllocator,
+        allocator: &impl MemoryAllocator,
         dmabuf_state: &DmabufState,
         qh: &QueueHandle<State>,
         format: u32,
@@ -273,7 +360,7 @@ impl PooledBuffer {
                 allocation_size: req.layout.size(),
                 memory_type_index: allocator
                     .find_memory_type_index(req.memory_type_bits, MemoryTypeFilter::PREFER_DEVICE)
-                    .context("no suitable memory type")?,
+                    .context("No suitable memory type found for image")?,
                 dedicated_allocation: Some(DedicatedAllocation::Image(&raw_image)),
                 export_handle_types: ExternalMemoryHandleTypes::DMA_BUF,
                 ..Default::default()
@@ -300,7 +387,7 @@ impl PooledBuffer {
         );
 
         Ok(Self {
-            wl_buffer,
+            wl_buffer: OwningWlBuffer(wl_buffer),
             image,
             fence: None,
         })
@@ -315,30 +402,35 @@ fn fourcc_to_format(fourcc: u32) -> Result<Format> {
     }
 }
 
-impl Drop for PooledBuffer {
-    fn drop(&mut self) {
-        self.wl_buffer.destroy();
-    }
+struct BufferPool {
+    pool: Vec<PooledBuffer>,
+    ready: Option<CapturedFrame>,
 }
 
 struct BufferHandle {
-    wl_buffer: WlBuffer,
+    wl_buffer: OwningWlBuffer,
 }
 
-impl Drop for BufferHandle {
-    fn drop(&mut self) {
-        self.wl_buffer.destroy();
-    }
+struct Backend {
+    shared: Arc<Mutex<BufferPool>>,
 }
-
-struct Backend;
 
 impl CaptureBackend for Backend {
     fn capture(&mut self) -> Result<Option<CapturedFrame>> {
-        Ok(None)
+        let mut pool = self.shared.lock().unwrap();
+        Ok(pool.ready.take())
     }
 
-    fn release(&mut self, _frame: CapturedFrame, _fence: Option<Arc<Fence>>) {}
+    fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>) {
+        let handle: BufferHandle = *frame.handle.downcast().expect("invalid handle type");
+        let mut pool = self.shared.lock().unwrap();
+        assert!(pool.pool.len() < 4, "buffer pool bloated");
+        pool.pool.push(PooledBuffer {
+            wl_buffer: handle.wl_buffer,
+            image: frame.image,
+            fence,
+        });
+    }
 }
 
 fn event_loop_thread(conn: Connection, event_queue: EventQueue<State>, mut state: State) {
