@@ -87,7 +87,6 @@ impl NvCapture {
         Ok(NvCapture { handle })
     }
 
-    #[allow(dead_code)]
     pub fn release_thread(&self) -> Result<()> {
         let status = unsafe { nvcapture_release_thread(self.handle) };
         if status != NVFBC_SUCCESS {

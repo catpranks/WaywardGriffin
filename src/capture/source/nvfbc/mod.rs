@@ -45,6 +45,7 @@ impl Builder {
         ctx.set_flags(CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
         ctx.bind_to_thread()?;
         let capturer = NvCapture::new()?;
+        capturer.release_thread()?;
         Ok(Self { ctx, capturer })
     }
 }
