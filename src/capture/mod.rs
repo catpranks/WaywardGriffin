@@ -6,8 +6,8 @@ pub mod vulkan;
 
 use crate::GlobalState;
 use crate::capture::input::InputInjector;
-use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder};
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use clap::Args;

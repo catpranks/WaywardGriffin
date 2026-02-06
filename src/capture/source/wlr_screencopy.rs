@@ -146,10 +146,7 @@ impl Builder {
 impl CaptureBackendBuilder for Builder {
     fn device_id(&self) -> super::DeviceId {
         let dev = self.state.feedback.as_ref().unwrap().main_device();
-        super::DeviceId::DevMajorMinor(
-            nix::sys::stat::major(dev),
-            nix::sys::stat::minor(dev),
-        )
+        super::DeviceId::DevMajorMinor(nix::sys::stat::major(dev), nix::sys::stat::minor(dev))
     }
 
     fn build(

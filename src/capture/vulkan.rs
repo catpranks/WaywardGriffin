@@ -32,10 +32,8 @@ pub fn create_instance_and_select_device(
                 let props = p.properties();
                 let major = major as i64;
                 let minor = minor as i64;
-                (props.primary_major == Some(major)
-                    && props.primary_minor == Some(minor))
-                    || (props.render_major == Some(major)
-                        && props.render_minor == Some(minor))
+                (props.primary_major == Some(major) && props.primary_minor == Some(minor))
+                    || (props.render_major == Some(major) && props.render_minor == Some(minor))
             })
             .context("no physical device with matching major/minor")?,
     };

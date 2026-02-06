@@ -22,8 +22,7 @@ pub fn run(opts: &CaptureOpts) -> Result<()> {
     // Build backend (CUDA/NVFBC init happens here)
     let backend_builder = create_backend_builder(opts)?;
 
-    let (_instance, physical_device) =
-        create_instance_and_select_device(backend_builder.as_ref())?;
+    let (_instance, physical_device) = create_instance_and_select_device(backend_builder.as_ref())?;
 
     let queue_family_index = physical_device
         .queue_family_properties()

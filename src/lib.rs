@@ -4,8 +4,8 @@ mod capture;
 mod display;
 pub mod sizer;
 
-use crate::capture::source::BackendType;
 use crate::capture::plotter::{Plotter, PlotterHandle};
+use crate::capture::source::BackendType;
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::Result;
 use arc_swap::ArcSwap;

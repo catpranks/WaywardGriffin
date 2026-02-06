@@ -1,9 +1,9 @@
 pub mod nvfbc;
 pub mod wlr_screencopy;
 
+use super::CaptureOpts;
 use super::input::InputInjector;
 use super::plotter::{FrameInfo, PlotterHandle};
-use super::CaptureOpts;
 use anyhow::Result;
 use clap::ValueEnum;
 use std::any::Any;
