@@ -1,9 +1,9 @@
 use super::CaptureOpts;
-use super::source::create_backend_builder;
 use super::plotter::PlotterHandle;
+use super::source::create_backend_builder;
+use super::vulkan::create_instance_and_select_device;
 use anyhow::{Context as _, Result};
 use std::sync::Arc;
-use vulkano::VulkanLibrary;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
@@ -13,7 +13,6 @@ use vulkano::command_buffer::{
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::sync::GpuFuture as _;
 
@@ -22,32 +21,9 @@ pub fn run(opts: &CaptureOpts) -> Result<()> {
 
     // Build backend (CUDA/NVFBC init happens here)
     let backend_builder = create_backend_builder(opts)?;
-    let device_uuid = backend_builder.device_uuid();
 
-    // Headless Vulkan init
-    let library = VulkanLibrary::new().context("no Vulkan library")?;
-    let instance = Instance::new(
-        library,
-        InstanceCreateInfo {
-            enabled_extensions: InstanceExtensions {
-                khr_external_memory_capabilities: true,
-                ..InstanceExtensions::empty()
-            },
-            ..Default::default()
-        },
-    )?;
-
-    let physical_device = if let Some(uuid) = device_uuid {
-        instance
-            .enumerate_physical_devices()?
-            .find(|p| p.properties().device_uuid == Some(uuid))
-            .context("no physical device with matching UUID")?
-    } else {
-        instance
-            .enumerate_physical_devices()?
-            .next()
-            .context("no physical devices")?
-    };
+    let (_instance, physical_device) =
+        create_instance_and_select_device(backend_builder.as_ref())?;
 
     let queue_family_index = physical_device
         .queue_family_properties()

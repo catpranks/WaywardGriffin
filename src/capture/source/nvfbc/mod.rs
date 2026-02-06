@@ -52,8 +52,8 @@ impl Builder {
 }
 
 impl CaptureBackendBuilder for Builder {
-    fn device_uuid(&self) -> Option<[u8; 16]> {
-        self.ctx.uuid().ok().map(|u| bytemuck::cast(u.bytes))
+    fn device_id(&self) -> super::DeviceId {
+        super::DeviceId::Uuid(bytemuck::cast(self.ctx.uuid().unwrap().bytes))
     }
 
     fn build(

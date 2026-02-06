@@ -1,4 +1,5 @@
 pub mod nvfbc;
+pub mod wlr_screencopy;
 
 use super::input::InputInjector;
 use super::plotter::{FrameInfo, PlotterHandle};
@@ -23,7 +24,7 @@ pub enum BackendType {
 pub fn create_backend_builder(opts: &CaptureOpts) -> Result<Box<dyn CaptureBackendBuilder>> {
     match opts.backend {
         BackendType::Nvfbc => Ok(Box::new(nvfbc::Builder::new()?)),
-        BackendType::WlrScreencopy => todo!("wlr-screencopy backend"),
+        BackendType::WlrScreencopy => Ok(Box::new(wlr_screencopy::Builder::new(&opts.display)?)),
         BackendType::ExtImageCopy => todo!("ext-image-copy backend"),
         BackendType::Kms => todo!("kms backend"),
     }
@@ -35,8 +36,13 @@ pub struct CapturedFrame {
     pub handle: Box<dyn Any + Send>,
 }
 
+pub enum DeviceId {
+    Uuid([u8; 16]),
+    DevMajorMinor(u64, u64),
+}
+
 pub trait CaptureBackendBuilder: Send {
-    fn device_uuid(&self) -> Option<[u8; 16]>;
+    fn device_id(&self) -> DeviceId;
 
     fn build(
         self: Box<Self>,

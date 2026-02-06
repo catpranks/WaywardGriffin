@@ -2,6 +2,7 @@ pub mod input;
 pub mod oneshot;
 pub mod plotter;
 pub mod source;
+pub mod vulkan;
 
 use crate::GlobalState;
 use crate::capture::input::InputInjector;
@@ -32,7 +33,6 @@ use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage};
-use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -58,7 +58,7 @@ use vulkano::sync::semaphore::{Semaphore, SemaphoreCreateInfo};
 use vulkano::sync::{
     AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer,
 };
-use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
+use vulkano::{VulkanObject as _, single_pass_renderpass};
 
 #[derive(Debug, Clone, Args)]
 pub struct CaptureOpts {
@@ -226,21 +226,17 @@ impl Capture {
         sizer: SharedSizer,
         opts: &CaptureOpts,
     ) -> Result<(Self, Box<dyn InputInjector>)> {
-        let device_uuid = backend_builder.device_uuid();
+        let (instance, physical_device) =
+            vulkan::create_instance_and_select_device(backend_builder.as_ref())?;
 
-        let library = VulkanLibrary::new().expect("no local Vulkan library/driver found");
-        let required_extensions = InstanceExtensions {
-            khr_wayland_surface: true,
-            khr_external_memory_capabilities: true,
-            ..InstanceExtensions::empty()
+        let surface = unsafe {
+            Surface::from_wayland(
+                instance.clone(),
+                conn.backend().display_ptr() as _,
+                wl_surface.id().as_ptr() as _,
+                None,
+            )?
         };
-        let instance = Instance::new(
-            library,
-            InstanceCreateInfo {
-                enabled_extensions: required_extensions,
-                ..Default::default()
-            },
-        )?;
 
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
@@ -252,27 +248,6 @@ impl Capture {
             khr_present_id: true,
             khr_present_wait: true,
             ..DeviceExtensions::empty()
-        };
-
-        let surface = unsafe {
-            Surface::from_wayland(
-                instance.clone(),
-                conn.backend().display_ptr() as _,
-                wl_surface.id().as_ptr() as _,
-                None,
-            )?
-        };
-
-        let physical_device = if let Some(uuid) = device_uuid {
-            instance
-                .enumerate_physical_devices()?
-                .find(|p| p.properties().device_uuid == Some(uuid))
-                .context("No physical device found with matching UUID")?
-        } else {
-            instance
-                .enumerate_physical_devices()?
-                .next()
-                .context("No physical devices found")?
         };
 
         let queue_family_index = physical_device
