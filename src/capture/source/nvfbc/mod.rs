@@ -2,7 +2,7 @@ mod nvcapture;
 
 use self::nvcapture::NvCapture;
 use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
-use crate::capture::input::InputInjector;
+use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result};
@@ -60,7 +60,7 @@ impl CaptureBackendBuilder for Builder {
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
         display: &str,
-    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
+    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         // NVFBC reads the display from the DISPLAY env var; there's no API to pass it explicitly.
         // XInput gets it explicitly below.
         let injector = XInput::new(display)?;

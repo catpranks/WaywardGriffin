@@ -1,8 +1,6 @@
-use crate::capture::input::InputInjector;
+use crate::capture::input::InputBridge;
+use copypasta::ClipboardProvider as _;
 use copypasta::wayland_clipboard::{Clipboard as WaylandClipboard, Primary as WaylandPrimary};
-use copypasta::x11_clipboard::{
-    Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
-};
 use smithay_client_toolkit::compositor::Region;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
@@ -29,7 +27,7 @@ use smithay_client_toolkit::{
     delegate_keyboard, delegate_pointer, delegate_pointer_constraints, delegate_relative_pointer,
     delegate_seat, delegate_simple,
 };
-use tracing::{error, info};
+use tracing::info;
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
@@ -66,23 +64,9 @@ pub struct InputState {
     // Clipboards
     pub wl_primary: WaylandPrimary,
     pub wl_clipboard: WaylandClipboard,
-    pub x11_primary: X11ClipboardContext<X11Primary>,
-    pub x11_clipboard: X11ClipboardContext<X11Clipboard>,
 
-    // Input injection
-    pub injector: Box<dyn InputInjector>,
-}
-
-fn sync_clipboards<P1, P2>(p1: &mut P1, p2: &mut P2)
-where
-    P1: copypasta::ClipboardProvider,
-    P2: copypasta::ClipboardProvider,
-{
-    if let Ok(c) = p1.get_contents()
-        && let Err(e) = p2.set_contents(c)
-    {
-        error!("failed to set clipboard: {e}");
-    }
+    // Source bridge (input injection + clipboard)
+    pub bridge: Box<dyn InputBridge>,
 }
 
 impl App {
@@ -93,11 +77,19 @@ impl App {
         self.input.confined = confined;
 
         if self.input.confined {
-            sync_clipboards(&mut self.input.wl_primary, &mut self.input.x11_primary);
-            sync_clipboards(&mut self.input.wl_clipboard, &mut self.input.x11_clipboard);
+            if let Ok(c) = self.input.wl_primary.get_contents() {
+                self.input.bridge.set_primary(c);
+            }
+            if let Ok(c) = self.input.wl_clipboard.get_contents() {
+                self.input.bridge.set_clipboard(c);
+            }
         } else {
-            sync_clipboards(&mut self.input.x11_primary, &mut self.input.wl_primary);
-            sync_clipboards(&mut self.input.x11_clipboard, &mut self.input.wl_clipboard);
+            if let Some(c) = self.input.bridge.get_primary() {
+                let _ = self.input.wl_primary.set_contents(c);
+            }
+            if let Some(c) = self.input.bridge.get_clipboard() {
+                let _ = self.input.wl_clipboard.set_contents(c);
+            }
         }
 
         self.input_update_confine();
@@ -229,7 +221,7 @@ impl RelativePointerHandler for App {
         }
         let sizer = self.sizer.load();
         let (x, y) = sizer.window_to_source_delta(event.delta);
-        self.input.injector.mouse_delta(x, y).unwrap();
+        self.input.bridge.mouse_delta(x, y).unwrap();
     }
 }
 
@@ -268,7 +260,7 @@ impl PointerHandler for App {
                         && self.input.confined
                     {
                         self.input
-                            .injector
+                            .bridge
                             .mouse_absolute(sx as i32, sy as i32)
                             .unwrap();
                     }
@@ -278,7 +270,7 @@ impl PointerHandler for App {
                     // info!("Press {:x} @ {:?}", button, event.position);
                     // info!("button {button}");
                     if self.input.confined {
-                        self.input.injector.mouse_press(button).unwrap();
+                        self.input.bridge.mouse_press(button).unwrap();
                     }
                 }
                 Release { button, .. } => {
@@ -286,7 +278,7 @@ impl PointerHandler for App {
                     if button == BTN_LEFT && !self.input.confined {
                         self.set_confined(conn, true);
                     } else if self.input.confined {
-                        self.input.injector.mouse_release(button).unwrap();
+                        self.input.bridge.mouse_release(button).unwrap();
                     }
                 }
                 Axis {
@@ -297,7 +289,7 @@ impl PointerHandler for App {
                     // info!("Scroll H:{horizontal:?}, V:{vertical:?}");
                     if self.input.confined {
                         self.input
-                            .injector
+                            .bridge
                             .scroll(horizontal.value120, vertical.value120)
                             .unwrap();
                     }
@@ -355,7 +347,7 @@ impl KeyboardHandler for App {
             return;
         }
         if self.input.confined {
-            self.input.injector.key_press(event.raw_code).unwrap();
+            self.input.bridge.key_press(event.raw_code).unwrap();
         }
     }
 
@@ -400,7 +392,7 @@ impl KeyboardHandler for App {
             return;
         }
         if self.input.confined {
-            self.input.injector.key_release(event.raw_code).unwrap();
+            self.input.bridge.key_release(event.raw_code).unwrap();
         }
     }
     fn update_modifiers(

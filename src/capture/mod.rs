@@ -5,7 +5,7 @@ pub mod source;
 pub mod vulkan;
 
 use crate::GlobalState;
-use crate::capture::input::InputInjector;
+use crate::capture::input::InputBridge;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder};
 use crate::sizer::{SharedSizer, Sizer};
@@ -225,7 +225,7 @@ impl Capture {
         wl_surface: &WlSurface,
         sizer: SharedSizer,
         opts: &CaptureOpts,
-    ) -> Result<(Self, Box<dyn InputInjector>)> {
+    ) -> Result<(Self, Box<dyn InputBridge>)> {
         let (instance, physical_device) =
             vulkan::create_instance_and_select_device(backend_builder.as_ref())?;
 

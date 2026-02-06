@@ -1,6 +1,6 @@
 use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
 use crate::OwningWlBuffer;
-use crate::capture::input::InputInjector;
+use crate::capture::input::InputBridge;
 use crate::capture::input::dummy::DummyInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result, bail};
@@ -304,7 +304,7 @@ impl CaptureBackendBuilder for Builder {
         allocator: Arc<StandardMemoryAllocator>,
         _ph: PlotterHandle,
         _display: &str,
-    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
+    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         let Self {
             conn,
             event_queue,

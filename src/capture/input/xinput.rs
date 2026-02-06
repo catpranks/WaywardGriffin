@@ -1,5 +1,9 @@
-use super::InputInjector;
+use super::InputBridge;
 use anyhow::{Context as _, Result};
+use copypasta::x11_clipboard::{
+    Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
+};
+use copypasta::ClipboardProvider;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto;
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -12,6 +16,8 @@ pub struct XInput {
     scroll_v_accumulator: i32,
     mouse_x_accumulator: f64,
     mouse_y_accumulator: f64,
+    primary: X11ClipboardContext<X11Primary>,
+    clipboard: X11ClipboardContext<X11Clipboard>,
 }
 
 impl XInput {
@@ -23,6 +29,11 @@ impl XInput {
         let setup = conn.setup();
         let root = setup.roots[screen_num].root;
 
+        let primary = X11ClipboardContext::<X11Primary>::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create X11 primary clipboard: {e}"))?;
+        let clipboard = X11ClipboardContext::<X11Clipboard>::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create X11 clipboard: {e}"))?;
+
         Ok(Self {
             conn,
             root,
@@ -30,6 +41,8 @@ impl XInput {
             scroll_v_accumulator: 0,
             mouse_x_accumulator: 0.0,
             mouse_y_accumulator: 0.0,
+            primary,
+            clipboard,
         })
     }
 
@@ -45,7 +58,7 @@ impl XInput {
     }
 }
 
-impl InputInjector for XInput {
+impl InputBridge for XInput {
     fn mouse_delta(&mut self, x: f64, y: f64) -> Result<()> {
         self.mouse_x_accumulator += x;
         self.mouse_y_accumulator += y;
@@ -121,5 +134,21 @@ impl InputInjector for XInput {
 
         self.conn.flush()?;
         Ok(())
+    }
+
+    fn get_primary(&mut self) -> Option<String> {
+        self.primary.get_contents().ok()
+    }
+
+    fn set_primary(&mut self, contents: String) {
+        let _ = self.primary.set_contents(contents);
+    }
+
+    fn get_clipboard(&mut self) -> Option<String> {
+        self.clipboard.get_contents().ok()
+    }
+
+    fn set_clipboard(&mut self, contents: String) {
+        let _ = self.clipboard.set_contents(contents);
     }
 }

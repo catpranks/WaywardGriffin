@@ -8,9 +8,6 @@ use crate::sizer::{SharedSizer, Sizer};
 use crate::{GlobalState, Opts};
 use anyhow::{Context as _, Result, anyhow, bail};
 use copypasta::wayland_clipboard;
-use copypasta::x11_clipboard::{
-    Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
-};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -420,8 +417,6 @@ fn run_internal(
     let (wl_primary, wl_clipboard) = unsafe {
         wayland_clipboard::create_clipboards_from_external(conn.display().id().as_ptr() as *mut _)
     };
-    let x11_primary = X11ClipboardContext::<X11Primary>::new().unwrap();
-    let x11_clipboard = X11ClipboardContext::<X11Clipboard>::new().unwrap();
 
     let mut app = App {
         // Handles
@@ -469,9 +464,7 @@ fn run_internal(
             keyboard_focus: false,
             wl_primary,
             wl_clipboard,
-            x11_primary,
-            x11_clipboard,
-            injector,
+            bridge: injector,
         },
 
         // Window & Render State

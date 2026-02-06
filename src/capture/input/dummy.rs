@@ -1,4 +1,4 @@
-use super::InputInjector;
+use super::InputBridge;
 use anyhow::Result;
 
 #[allow(dead_code)]
@@ -11,7 +11,7 @@ impl DummyInput {
     }
 }
 
-impl InputInjector for DummyInput {
+impl InputBridge for DummyInput {
     fn mouse_delta(&mut self, _x: f64, _y: f64) -> Result<()> {
         Ok(())
     }

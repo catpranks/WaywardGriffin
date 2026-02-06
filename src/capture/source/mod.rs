@@ -2,7 +2,7 @@ pub mod nvfbc;
 pub mod wlr_screencopy;
 
 use super::CaptureOpts;
-use super::input::InputInjector;
+use super::input::InputBridge;
 use super::plotter::{FrameInfo, PlotterHandle};
 use anyhow::Result;
 use clap::ValueEnum;
@@ -50,7 +50,7 @@ pub trait CaptureBackendBuilder: Send {
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
         display: &str,
-    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)>;
+    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)>;
 }
 
 pub trait CaptureBackend: Send {
