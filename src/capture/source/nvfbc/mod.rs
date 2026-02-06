@@ -2,8 +2,8 @@ mod nvcapture;
 
 use self::nvcapture::NvCapture;
 use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
-use crate::capture::input::xinput::XInput;
 use crate::capture::input::InputInjector;
+use crate::capture::input::xinput::XInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
@@ -34,8 +34,6 @@ use vulkano::memory::{
 };
 use vulkano::sync::fence::Fence;
 
-const NUM_BUFFERS: usize = 3;
-
 pub struct Builder {
     ctx: Arc<CudaContext>,
     capturer: NvCapture,
@@ -65,13 +63,6 @@ impl CaptureBackendBuilder for Builder {
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputInjector>)> {
         // NVFBC reads the display from the DISPLAY env var; there's no API to pass it explicitly.
         // XInput gets it explicitly below.
-        let (_, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
-        self.capturer.release_thread()?;
-
-        let bufs = (0..NUM_BUFFERS)
-            .map(|_| PooledBuffer::new(device.clone(), &allocator, self.ctx.clone(), info.size))
-            .collect::<Result<VecDeque<_>>>()?;
-
         let injector = XInput::new(display)?;
 
         Ok((
@@ -80,7 +71,7 @@ impl CaptureBackendBuilder for Builder {
                 capturer: self.capturer,
                 device,
                 allocator,
-                bufs,
+                bufs: VecDeque::new(),
                 ph,
             }),
             Box::new(injector),
@@ -112,21 +103,25 @@ impl CaptureBackend for Backend {
             self.ph.capture_miss();
         }
 
-        let mut pooled = self.bufs.pop_front().unwrap();
-        let buf_extent = pooled.image.extent();
-        let buf_size = (buf_extent[0], buf_extent[1]);
-        if buf_size != info.size {
-            // Wait for GPU to finish with old buffer before dropping
-            if let Some(fence) = pooled.fence.take() {
+        let mut pooled = self.bufs.pop_front();
+        let reuse = pooled.as_ref().is_some_and(|p| {
+            let ext = p.image.extent();
+            (ext[0], ext[1]) == info.size
+        });
+        if !reuse {
+            if let Some(old) = &mut pooled
+                && let Some(fence) = old.fence.take()
+            {
                 fence.wait(None)?;
             }
-            pooled = PooledBuffer::new(
+            pooled = Some(PooledBuffer::new(
                 self.device.clone(),
                 &self.allocator,
                 self.ctx.clone(),
                 info.size,
-            )?;
+            )?);
         }
+        let mut pooled = pooled.unwrap();
 
         if let Some(fence) = pooled.fence.take() {
             fence.wait(None)?;
@@ -176,6 +171,7 @@ impl CaptureBackend for Backend {
 
     fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>) {
         let handle: BufferHandle = *frame.handle.downcast().expect("invalid handle type");
+        assert!(self.bufs.len() < 4, "buffer pool bloated");
         self.bufs.push_back(PooledBuffer {
             cumem: handle.cumem,
             image: frame.image,
