@@ -1,9 +1,9 @@
 use super::InputBridge;
 use anyhow::{Context as _, Result};
+use copypasta::ClipboardProvider;
 use copypasta::x11_clipboard::{
     Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
 };
-use copypasta::ClipboardProvider;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto;
 use x11rb::protocol::xtest::ConnectionExt as _;
