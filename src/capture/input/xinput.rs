@@ -1,5 +1,5 @@
 use super::InputBridge;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use copypasta::ClipboardProvider;
 use copypasta::x11_clipboard::{
     Clipboard as X11Clipboard, Primary as X11Primary, X11ClipboardContext,
@@ -30,9 +30,9 @@ impl XInput {
         let root = setup.roots[screen_num].root;
 
         let primary = X11ClipboardContext::<X11Primary>::new()
-            .map_err(|e| anyhow::anyhow!("Failed to create X11 primary clipboard: {e}"))?;
+            .map_err(|e| anyhow!("Failed to create X11 primary clipboard: {e}"))?;
         let clipboard = X11ClipboardContext::<X11Clipboard>::new()
-            .map_err(|e| anyhow::anyhow!("Failed to create X11 clipboard: {e}"))?;
+            .map_err(|e| anyhow!("Failed to create X11 clipboard: {e}"))?;
 
         Ok(Self {
             conn,

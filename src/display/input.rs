@@ -94,7 +94,8 @@ impl App {
 
         self.input_update_confine();
         self.input_update_shortcut_inhibitor();
-        self.dc.global_state
+        self.dc
+            .global_state
             .rcu(|s| s.with_confine(self.input.confined));
         self.input_update_cursor(conn);
     }
@@ -252,7 +253,8 @@ impl PointerHandler for App {
                 }
                 Motion { .. } => {
                     if let Some((sx, sy)) = self
-                        .dc.sizer
+                        .dc
+                        .sizer
                         .load()
                         .window_to_source((event.position.0 as u32, event.position.1 as u32))
                         && self.dc.global_state.load().cursor_visible
@@ -381,7 +383,8 @@ impl KeyboardHandler for App {
                 }
                 Keysym::r => {
                     self.input.force_relative = !self.input.force_relative;
-                    self.dc.global_state
+                    self.dc
+                        .global_state
                         .rcu(|s| s.with_force_relative(self.input.force_relative));
                 }
                 Keysym::c => {
