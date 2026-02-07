@@ -49,56 +49,57 @@ use std::time::Duration;
 use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{self, WpFractionalScaleV1};
 
-struct App {
-    // Handles
-    loop_handle: LoopHandle<'static, App>,
-    pub qh: QueueHandle<App>,
+#[derive(Clone)]
+pub struct DisplayCtx {
+    pub ph: PlotterHandle,
     pub global_state: GlobalState,
+    pub sizer: SharedSizer,
+    pub surface: WlSurface,
+    pub viewport: WpViewport,
+    pub compositor_state: CompositorState,
+    qh: QueueHandle<App>,
+}
+
+struct App {
+    loop_handle: LoopHandle<'static, App>,
+    dc: DisplayCtx,
+    ch: CaptureHandle,
 
     // Wayland State
     registry_state: RegistryState,
     output_state: OutputState,
-    compositor_state: CompositorState,
     dmabuf_state: DmabufState,
-    pub shm_state: Shm,
+    shm_state: Shm,
     _xdg_shell: XdgShell,
     wp_viewporter: SimpleGlobal<WpViewporter, 1>,
     wp_frac_mgr: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
-
-    // Wayland Objects
-    pub surface: WlSurface,
     _wp_frac: Option<WpFractionalScaleV1>,
 
-    // Application Logic
-    ch: CaptureHandle,
-    pub sizer: SharedSizer,
-
     // Input State
-    pub input: InputState,
+    input: InputState,
 
-    // Window & Render State
+    // Window State
     size: (u32, u32),
     scale120: u32,
     feedback: Option<DmabufFeedback>,
-
-    // Event Loop & Control Flow
-    res: Option<Result<()>>,
     first_configure: bool,
     pending_resize: Option<RegistrationToken>,
+    res: Option<Result<()>>,
 }
 
 impl App {
     fn handle_resize(&mut self) {
-        let sizer = self.sizer.load();
+        let sizer = self.dc.sizer.load();
         if !sizer.ready() || (sizer.window_size == self.size && sizer.scale120 == self.scale120) {
             return;
         }
-        self.sizer
+        self.dc
+            .sizer
             .rcu(|s| s.with_window_size(self.size, self.scale120));
 
-        let sizer = self.sizer.load();
+        let sizer = self.dc.sizer.load();
         let rect = sizer.window_sizing.content;
-        let region = Region::new(&self.compositor_state).expect("Failed to create region");
+        let region = Region::new(&self.dc.compositor_state).expect("Failed to create region");
         region.add(
             rect.x as i32,
             rect.y as i32,
@@ -154,7 +155,7 @@ impl WindowHandler for App {
             self.first_configure = false;
             self.handle_resize();
 
-            self.surface.frame(qh, self.surface.clone());
+            self.dc.surface.frame(qh, self.dc.surface.clone());
             self.ch.wake();
         } else {
             self.sched_resize();
@@ -190,7 +191,7 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _time: u32,
     ) {
-        self.surface.frame(qh, self.surface.clone());
+        self.dc.surface.frame(qh, self.dc.surface.clone());
         self.ch.wake();
     }
 
@@ -370,18 +371,18 @@ fn run_internal(
         wp_frac_mgr = Some(mgr);
     }
 
-    let backend_builder = create_backend_builder(&opts.capture_opts)?;
-    let (mut capture, injector) = Capture::new(
-        ph.clone(),
-        global_state.clone(),
-        backend_builder,
-        &conn,
-        &surface,
+    let dc = DisplayCtx {
+        ph,
+        global_state,
+        sizer,
+        surface: surface.clone(),
         viewport,
-        compositor_state.clone(),
-        sizer.clone(),
-        &opts.capture_opts,
-    )?;
+        compositor_state,
+        qh: qh.clone(),
+    };
+    let backend_builder = create_backend_builder(&opts.capture_opts)?;
+    let (mut capture, injector) =
+        Capture::new(dc.clone(), backend_builder, &conn, &opts.capture_opts)?;
     let ch = capture.handle.clone();
     std::thread::spawn(move || capture.run());
 
@@ -391,28 +392,19 @@ fn run_internal(
     };
 
     let mut app = App {
-        // Handles
         loop_handle: loop_handle.clone(),
-        qh: qh.clone(),
-        global_state: global_state.clone(),
+        dc,
+        ch,
 
         // Wayland State
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
-        compositor_state,
         dmabuf_state: DmabufState::new(&globals, &qh),
         shm_state,
         _xdg_shell: xdg_shell,
         wp_viewporter,
         wp_frac_mgr,
-
-        // Wayland Objects
-        surface: surface.clone(),
         _wp_frac: wp_frac,
-
-        // Application Logic
-        ch,
-        sizer,
 
         // Input State
         input: InputState {
@@ -438,15 +430,13 @@ fn run_internal(
             bridge: injector,
         },
 
-        // Window & Render State
+        // Window State
         size: (0, 0),
         scale120: 120,
         feedback: None,
-
-        // Event Loop & Control Flow
-        res: None,
         first_configure: true,
         pending_resize: None,
+        res: None,
     };
 
     // Discover seats

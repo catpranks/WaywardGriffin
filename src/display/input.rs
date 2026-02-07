@@ -94,7 +94,7 @@ impl App {
 
         self.input_update_confine();
         self.input_update_shortcut_inhibitor();
-        self.global_state
+        self.dc.global_state
             .rcu(|s| s.with_confine(self.input.confined));
         self.input_update_cursor(conn);
     }
@@ -110,7 +110,7 @@ impl App {
                         .shortcuts_inhibit_manager
                         .get()
                         .unwrap()
-                        .inhibit_shortcuts(&self.surface, &seat, &self.qh, ()),
+                        .inhibit_shortcuts(&self.dc.surface, &seat, &self.dc.qh, ()),
                 );
             }
         } else if let Some(inhibitor) = self.input.shortcuts_inhibitor.take() {
@@ -148,11 +148,11 @@ impl App {
                 self.input
                     .pointer_constraints_state
                     .confine_pointer(
-                        &self.surface,
+                        &self.dc.surface,
                         pointer.pointer(),
                         Some(region.wl_region()),
                         zwp_pointer_constraints_v1::Lifetime::Persistent,
-                        &self.qh,
+                        &self.dc.qh,
                     )
                     .unwrap(),
             );
@@ -213,13 +213,13 @@ impl RelativePointerHandler for App {
         event: RelativeMotionEvent,
     ) {
         // info!("relative {} {}", event.delta.0, event.delta.1);
-        if self.global_state.load().cursor_visible && !self.input.force_relative {
+        if self.dc.global_state.load().cursor_visible && !self.input.force_relative {
             return;
         }
         if !self.input.confined {
             return;
         }
-        let sizer = self.sizer.load();
+        let sizer = self.dc.sizer.load();
         let (x, y) = sizer.window_to_source_delta(event.delta);
         self.input.bridge.mouse_delta(x, y).unwrap();
     }
@@ -235,7 +235,7 @@ impl PointerHandler for App {
     ) {
         use PointerEventKind::*;
         for event in events {
-            if event.surface != self.surface {
+            if event.surface != self.dc.surface {
                 continue;
             }
             match event.kind {
@@ -252,10 +252,10 @@ impl PointerHandler for App {
                 }
                 Motion { .. } => {
                     if let Some((sx, sy)) = self
-                        .sizer
+                        .dc.sizer
                         .load()
                         .window_to_source((event.position.0 as u32, event.position.1 as u32))
-                        && self.global_state.load().cursor_visible
+                        && self.dc.global_state.load().cursor_visible
                         && !self.input.force_relative
                         && self.input.confined
                     {
@@ -310,7 +310,7 @@ impl KeyboardHandler for App {
         _: &[u32],
         _keysyms: &[Keysym],
     ) {
-        if self.surface != *surface {
+        if self.dc.surface != *surface {
             return;
         }
         // info!("Keyboard focus on window with pressed syms: {keysyms:?}");
@@ -324,7 +324,7 @@ impl KeyboardHandler for App {
         surface: &WlSurface,
         _: u32,
     ) {
-        if self.surface != *surface {
+        if self.dc.surface != *surface {
             info!("not my surface");
             return;
         }
@@ -381,11 +381,11 @@ impl KeyboardHandler for App {
                 }
                 Keysym::r => {
                     self.input.force_relative = !self.input.force_relative;
-                    self.global_state
+                    self.dc.global_state
                         .rcu(|s| s.with_force_relative(self.input.force_relative));
                 }
                 Keysym::c => {
-                    self.global_state.rcu(|s| s.with_capture(!s.capture));
+                    self.dc.global_state.rcu(|s| s.with_capture(!s.capture));
                 }
                 _ => {}
             }

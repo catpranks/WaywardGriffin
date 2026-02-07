@@ -4,18 +4,15 @@ pub mod plotter;
 pub mod source;
 pub mod vulkan;
 
-use crate::GlobalState;
 use crate::capture::input::InputBridge;
-use crate::capture::plotter::PlotterHandle;
 use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder};
-use crate::sizer::{SharedSizer, Sizer};
+use crate::display::DisplayCtx;
+use crate::sizer::Sizer;
 use anyhow::{Context as _, Result};
 use clap::Args;
 use smallvec::smallvec;
-use smithay_client_toolkit::compositor::{CompositorState, Region};
-use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
+use smithay_client_toolkit::compositor::Region;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
-use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 use tracing::info;
@@ -169,13 +166,7 @@ impl CaptureHandle {
 pub struct Capture {
     pub handle: CaptureHandle,
     rx: mpsc::Receiver<()>,
-    ph: PlotterHandle,
-    global_state: GlobalState,
-
-    sizer: SharedSizer,
-    wl_surface: WlSurface,
-    viewport: WpViewport,
-    compositor_state: CompositorState,
+    dc: DisplayCtx,
     last_committed_sizer: Option<Sizer>,
 
     frame_idx: usize,
@@ -199,16 +190,10 @@ pub struct Capture {
 }
 
 impl Capture {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ph: PlotterHandle,
-        global_state: GlobalState,
+        dctx: DisplayCtx,
         backend_builder: Box<dyn CaptureBackendBuilder>,
         conn: &Connection,
-        wl_surface: &WlSurface,
-        viewport: WpViewport,
-        compositor_state: CompositorState,
-        sizer: SharedSizer,
         opts: &CaptureOpts,
     ) -> Result<(Self, Box<dyn InputBridge>)> {
         let (instance, physical_device) =
@@ -218,7 +203,7 @@ impl Capture {
             Surface::from_wayland(
                 instance.clone(),
                 conn.backend().display_ptr() as _,
-                wl_surface.id().as_ptr() as _,
+                dctx.surface.id().as_ptr() as _,
                 None,
             )?
         };
@@ -365,8 +350,12 @@ impl Capture {
             },
         )?;
 
-        let (backend, injector) =
-            backend_builder.build(device.clone(), allocator.clone(), ph.clone(), &opts.display)?;
+        let (backend, injector) = backend_builder.build(
+            device.clone(),
+            allocator.clone(),
+            dctx.ph.clone(),
+            &opts.display,
+        )?;
 
         let in_flight = (0..3)
             .map(|_| {
@@ -400,12 +389,7 @@ impl Capture {
         let this = Self {
             handle,
             rx,
-            ph,
-            global_state,
-            sizer,
-            wl_surface: wl_surface.clone(),
-            viewport,
-            compositor_state,
+            dc: dctx,
             last_committed_sizer: None,
             frame_idx: 0,
             backend,
@@ -426,14 +410,14 @@ impl Capture {
     }
 
     pub fn run(&mut self) {
-        let ph = self.ph.clone();
+        let ph = self.dc.ph.clone();
         ph.fatal(self.run_internal().context("capture thread"));
     }
 
     fn run_internal(&mut self) -> Result<()> {
         while self.rx.recv().is_ok() {
             while self.rx.try_recv().is_ok() {}
-            let sizer = (**self.sizer.load()).clone();
+            let sizer = (**self.dc.sizer.load()).clone();
             let [sw, sh] = self.swapchain.image_extent();
             if (sw, sh) != sizer.render_size {
                 self.resize(&sizer)?;
@@ -474,18 +458,20 @@ impl Capture {
         self.last_committed_sizer = Some(sizer.clone());
         let (w_w, w_h) = sizer.window_size;
         let (r_w, r_h) = sizer.render_size;
-        self.viewport.set_source(0.0, 0.0, r_w as f64, r_h as f64);
-        self.viewport.set_destination(w_w as i32, w_h as i32);
+        self.dc
+            .viewport
+            .set_source(0.0, 0.0, r_w as f64, r_h as f64);
+        self.dc.viewport.set_destination(w_w as i32, w_h as i32);
         let rect = sizer.window_sizing.content;
-        let region = Region::new(&self.compositor_state).context("create region")?;
+        let region = Region::new(&self.dc.compositor_state).context("create region")?;
         region.add(
             rect.x as i32,
             rect.y as i32,
             rect.width as i32,
             rect.height as i32,
         );
-        self.wl_surface.set_opaque_region(Some(region.wl_region()));
-        self.wl_surface.set_input_region(Some(region.wl_region()));
+        self.dc.surface.set_opaque_region(Some(region.wl_region()));
+        self.dc.surface.set_input_region(Some(region.wl_region()));
         Ok(())
     }
 
@@ -571,23 +557,24 @@ impl Capture {
     }
 
     pub fn render(&mut self, sizer: &Sizer) -> Result<()> {
-        if !self.global_state.load().capture {
+        if !self.dc.global_state.load().capture {
             return self.force_render(sizer);
         }
         let Some(frame) = self.backend.capture()? else {
-            self.ph.skip();
-            self.wl_surface.commit();
+            self.dc.ph.skip();
+            self.dc.surface.commit();
             return Ok(());
         };
 
         // Update sizer/global_state from frame info
         let frame_size = frame.image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
-        if self.sizer.load().source_size != frame_size {
-            self.sizer.rcu(|s| s.with_source_size(frame_size));
+        if self.dc.sizer.load().source_size != frame_size {
+            self.dc.sizer.rcu(|s| s.with_source_size(frame_size));
         }
-        if self.global_state.load().cursor_visible != frame.info.cursor_visible {
-            self.global_state
+        if self.dc.global_state.load().cursor_visible != frame.info.cursor_visible {
+            self.dc
+                .global_state
                 .rcu(|s| s.with_cursor_visible(frame.info.cursor_visible));
         }
 
@@ -700,7 +687,7 @@ impl Capture {
             )?;
             let push_constants = BorderPushConstants {
                 time: self.start_time.elapsed().as_secs_f32(),
-                show_border: if self.global_state.load().confine {
+                show_border: if self.dc.global_state.load().confine {
                     0
                 } else {
                     1
@@ -794,7 +781,7 @@ impl Capture {
 
         info.mark_commit();
         info.mark_present();
-        self.ph.render(info);
+        self.dc.ph.render(info);
         self.frame_idx += 1;
         if is_suboptimal || present_suboptimal {
             info!("suboptimal, resizing");
