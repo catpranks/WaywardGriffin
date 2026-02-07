@@ -41,7 +41,3 @@ C code in `src/c/nvcapture.c` compiled via build.rs (cc crate).
 - No cross-vendor DMA-BUF: can't export Nvidia buffer to AMD iGPU directly
 - Wayland syncobj protocol incompatible with Vulkan timeline semaphores (spec bug)
 - NVFBC blocking capture timing is inconsistent (250-700us in windowed, oscillates in fullscreen)
-
-## Tips
-
-- Wayland compositor access for other users: `setfacl -m u:otheruser:rw $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`
