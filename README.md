@@ -52,6 +52,7 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
   There's a Vulkan [spec bug](https://github.com/KhronosGroup/Vulkan-Docs/issues/2473) about it.
 - NVFBC blocking capture is very inconsistent. In windowed mode, it randomly delivers a new frame after 250-700us, perhaps because the desktop environment's clock changes and emits a damage event.
   - In full screen mode, it oscillates between 95 and 115 Hz on a 120 Hz display.
+- NVIDIA Vulkan WSI for Wayland implements vkWaitForPresentKHR by polling the server in a tight loop
 
 ## code index
 
