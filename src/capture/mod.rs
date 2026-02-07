@@ -753,6 +753,10 @@ impl Capture {
             .wait_dst_stage_mask(&[ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
             .signal_semaphores(&present_semaphore);
 
+        let mut info = frame.info.clone();
+        info.mark_commit();
+        self.dc.request_feedback(info);
+
         let present_suboptimal = self.queue.with(|mut guard| unsafe {
             (self.device.fns().v1_0.queue_submit)(
                 self.queue.handle(),
@@ -776,12 +780,7 @@ impl Capture {
                 .context("present")
         })?;
 
-        let mut info = frame.info.clone();
         self.backend.release(frame, Some(ifl.fence.clone()));
-
-        info.mark_commit();
-        info.mark_present();
-        self.dc.ph.render(info);
         self.frame_idx += 1;
         if is_suboptimal || present_suboptimal {
             info!("suboptimal, resizing");

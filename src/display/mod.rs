@@ -1,6 +1,6 @@
 mod input;
 
-use crate::capture::plotter::PlotterHandle;
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::create_backend_builder;
 use crate::capture::{Capture, CaptureHandle};
 use crate::display::input::InputState;
@@ -14,6 +14,7 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
+use smithay_client_toolkit::reexports::client::backend::ObjectId;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
@@ -21,6 +22,9 @@ use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
+};
+use smithay_client_toolkit::reexports::protocols::wp::presentation_time::client::{
+    wp_presentation, wp_presentation_feedback,
 };
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::{
     self, WpViewport,
@@ -42,7 +46,8 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_dmabuf, delegate_output, delegate_registry, delegate_shm,
     delegate_simple, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // breaks rustfmt import sorting for some reason
@@ -57,7 +62,23 @@ pub struct DisplayCtx {
     pub surface: WlSurface,
     pub viewport: WpViewport,
     pub compositor_state: CompositorState,
+    presentation: wp_presentation::WpPresentation,
+    pending_feedback: Arc<Mutex<VecDeque<(ObjectId, FrameInfo)>>>,
     qh: QueueHandle<App>,
+}
+
+impl DisplayCtx {
+    pub fn request_feedback(&self, info: FrameInfo) {
+        let fb = self.presentation.feedback(&self.surface, &self.qh, ());
+        let mut deque = self.pending_feedback.lock().unwrap();
+        while let Some((_, front)) = deque.front()
+            && front.start.elapsed() > Duration::from_secs(1)
+        {
+            deque.pop_front();
+            self.ph.log("presentation feedback timed out");
+        }
+        deque.push_back((fb.id(), info));
+    }
 }
 
 struct App {
@@ -327,6 +348,50 @@ impl ShmHandler for App {
     }
 }
 
+impl Dispatch<wp_presentation::WpPresentation, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_presentation::WpPresentation,
+        _event: wp_presentation::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for App {
+    fn event(
+        state: &mut Self,
+        feedback: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::Presented { .. } => {
+                let mut deque = state.dc.pending_feedback.lock().unwrap();
+                if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
+                    let (_, mut info) = deque.remove(pos).unwrap();
+                    // TODO: use server timestamp
+                    info.mark_present();
+                    state.dc.ph.render(info);
+                }
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                let mut deque = state.dc.pending_feedback.lock().unwrap();
+                if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
+                    deque.remove(pos);
+                    // TODO: record a skip here?
+                    state.dc.ph.log("presentation feedback discarded");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 delegate_xdg_window!(App);
 delegate_xdg_shell!(App);
 delegate_compositor!(App);
@@ -371,6 +436,7 @@ fn run_internal(
         wp_frac_mgr = Some(mgr);
     }
 
+    let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, ())?;
     let dc = DisplayCtx {
         ph,
         global_state,
@@ -378,6 +444,8 @@ fn run_internal(
         surface: surface.clone(),
         viewport,
         compositor_state,
+        presentation,
+        pending_feedback: Arc::new(Mutex::new(VecDeque::new())),
         qh: qh.clone(),
     };
     let backend_builder = create_backend_builder(&opts.capture_opts)?;
