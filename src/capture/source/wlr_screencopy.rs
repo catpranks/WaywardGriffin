@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
-use vulkano::image::{ImageAspect, ImageCreateInfo, ImageTiling, ImageUsage};
+use vulkano::image::{Image, ImageAspect, ImageCreateInfo, ImageTiling, ImageUsage};
 use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::memory::{
     DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, ExternalMemoryHandleTypes,
@@ -325,7 +325,7 @@ impl CaptureBackendBuilder for Builder {
 
 struct PooledBuffer {
     wl_buffer: OwningWlBuffer,
-    image: Arc<vulkano::image::Image>,
+    image: Arc<Image>,
     fence: Option<Arc<Fence>>,
 }
 

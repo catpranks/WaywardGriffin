@@ -4,7 +4,7 @@ use crate::capture::plotter::PlotterHandle;
 use crate::capture::source::create_backend_builder;
 use crate::capture::{Capture, CaptureHandle};
 use crate::display::input::InputState;
-use crate::sizer::{SharedSizer, Sizer};
+use crate::sizer::SharedSizer;
 use crate::{GlobalState, Opts};
 use anyhow::{Context as _, Result, anyhow, bail};
 use copypasta::wayland_clipboard;
@@ -44,7 +44,6 @@ use smithay_client_toolkit::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
@@ -68,7 +67,6 @@ struct App {
 
     // Wayland Objects
     pub surface: WlSurface,
-    viewport: WpViewport,
     _wp_frac: Option<WpFractionalScaleV1>,
 
     // Application Logic
@@ -81,7 +79,6 @@ struct App {
     // Window & Render State
     size: (u32, u32),
     scale120: u32,
-    last_commited_sizer: Option<Sizer>,
     feedback: Option<DmabufFeedback>,
 
     // Event Loop & Control Flow
@@ -91,18 +88,6 @@ struct App {
 }
 
 impl App {
-    fn content_region(&self) -> Option<Region> {
-        let region = Region::new(&self.compositor_state).expect("Failed to create region");
-        let rect = self.last_commited_sizer.as_ref()?.window_sizing.content;
-        region.add(
-            rect.x as i32,
-            rect.y as i32,
-            rect.width as i32,
-            rect.height as i32,
-        );
-        Some(region)
-    }
-
     fn handle_resize(&mut self) {
         let sizer = self.sizer.load();
         if !sizer.ready() || (sizer.window_size == self.size && sizer.scale120 == self.scale120) {
@@ -110,6 +95,18 @@ impl App {
         }
         self.sizer
             .rcu(|s| s.with_window_size(self.size, self.scale120));
+
+        let sizer = self.sizer.load();
+        let rect = sizer.window_sizing.content;
+        let region = Region::new(&self.compositor_state).expect("Failed to create region");
+        region.add(
+            rect.x as i32,
+            rect.y as i32,
+            rect.width as i32,
+            rect.height as i32,
+        );
+        self.input.confinement_region = Some(region);
+        self.input_update_confine();
     }
 
     fn sched_resize(&mut self) {
@@ -126,29 +123,6 @@ impl App {
             })
             .unwrap();
         self.pending_resize = Some(pending);
-    }
-
-    fn draw_capture(&mut self) {
-        let sizer = (**self.sizer.load()).clone();
-        if self
-            .last_commited_sizer
-            .as_ref()
-            .is_none_or(|s| *s != sizer)
-        {
-            self.last_commited_sizer = Some(sizer.clone());
-            let (w_w, w_h) = sizer.window_size;
-            let (r_w, r_h) = sizer.render_size;
-            self.ch.resize(&sizer);
-            let region = self.content_region().unwrap();
-            self.viewport.set_source(0.0, 0.0, r_w as f64, r_h as f64);
-            self.viewport.set_destination(w_w as i32, w_h as i32);
-            self.surface.set_opaque_region(Some(region.wl_region()));
-            self.surface.set_input_region(Some(region.wl_region()));
-            self.input.confinement_region = Some(region);
-            self.input_update_confine();
-        }
-
-        self.ch.frame(&sizer);
     }
 }
 
@@ -181,9 +155,7 @@ impl WindowHandler for App {
             self.handle_resize();
 
             self.surface.frame(qh, self.surface.clone());
-            let sizer = (**self.sizer.load()).clone();
-            self.ch.force_render(&sizer);
-            info!("render forced");
+            self.ch.wake();
         } else {
             self.sched_resize();
         }
@@ -218,9 +190,8 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _time: u32,
     ) {
-        // info!("frame");
         self.surface.frame(qh, self.surface.clone());
-        self.draw_capture();
+        self.ch.wake();
     }
 
     fn surface_enter(
@@ -406,12 +377,13 @@ fn run_internal(
         backend_builder,
         &conn,
         &surface,
+        viewport,
+        compositor_state.clone(),
         sizer.clone(),
         &opts.capture_opts,
     )?;
     let ch = capture.handle.clone();
     std::thread::spawn(move || capture.run());
-    ch.resize(&sizer.load());
 
     // Initialize clipboards
     let (wl_primary, wl_clipboard) = unsafe {
@@ -436,7 +408,6 @@ fn run_internal(
 
         // Wayland Objects
         surface: surface.clone(),
-        viewport,
         _wp_frac: wp_frac,
 
         // Application Logic
@@ -470,7 +441,6 @@ fn run_internal(
         // Window & Render State
         size: (0, 0),
         scale120: 120,
-        last_commited_sizer: None,
         feedback: None,
 
         // Event Loop & Control Flow

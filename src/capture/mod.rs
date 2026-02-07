@@ -12,8 +12,10 @@ use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use clap::Args;
 use smallvec::smallvec;
+use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
+use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use std::num::NonZero;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
@@ -32,7 +34,7 @@ use vulkano::device::{
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage};
+use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -154,28 +156,14 @@ struct InFlight {
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
 }
 
-pub enum CaptureCommand {
-    Resize(Sizer),
-    Frame(Sizer),
-    ForceRender(Sizer),
-}
-
 #[derive(Clone)]
 pub struct CaptureHandle {
-    cmd: mpsc::Sender<CaptureCommand>,
+    tx: mpsc::Sender<()>,
 }
 
 impl CaptureHandle {
-    pub fn resize(&self, sizer: &Sizer) {
-        let _ = self.cmd.send(CaptureCommand::Resize(sizer.clone()));
-    }
-
-    pub fn frame(&self, sizer: &Sizer) {
-        let _ = self.cmd.send(CaptureCommand::Frame(sizer.clone()));
-    }
-
-    pub fn force_render(&self, sizer: &Sizer) {
-        let _ = self.cmd.send(CaptureCommand::ForceRender(sizer.clone()));
+    pub fn wake(&self) {
+        let _ = self.tx.send(());
     }
 }
 
@@ -187,12 +175,15 @@ struct PresentWaitRequest {
 
 pub struct Capture {
     pub handle: CaptureHandle,
-    rx_cmd: mpsc::Receiver<CaptureCommand>,
+    rx: mpsc::Receiver<()>,
     ph: PlotterHandle,
     global_state: GlobalState,
 
     sizer: SharedSizer,
     wl_surface: WlSurface,
+    viewport: WpViewport,
+    compositor_state: CompositorState,
+    last_committed_sizer: Option<Sizer>,
 
     frame_idx: usize,
     present_counter: u64,
@@ -217,12 +208,15 @@ pub struct Capture {
 }
 
 impl Capture {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ph: PlotterHandle,
         global_state: GlobalState,
         backend_builder: Box<dyn CaptureBackendBuilder>,
         conn: &Connection,
         wl_surface: &WlSurface,
+        viewport: WpViewport,
+        compositor_state: CompositorState,
         sizer: SharedSizer,
         opts: &CaptureOpts,
     ) -> Result<(Self, Box<dyn InputBridge>)> {
@@ -288,7 +282,7 @@ impl Capture {
 
         let queue = queues.next().unwrap();
 
-        let (swapchain, _images) = {
+        let (swapchain, swapchain_images) = {
             let surface_capabilities =
                 physical_device.surface_capabilities(&surface, Default::default())?;
             // let (image_format, _) = physical_device
@@ -413,8 +407,8 @@ impl Capture {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (tx_cmd, rx_cmd) = mpsc::channel();
-        let handle = CaptureHandle { cmd: tx_cmd };
+        let (tx, rx) = mpsc::channel();
+        let handle = CaptureHandle { tx };
 
         let (present_wait_tx, present_wait_rx) = mpsc::channel::<PresentWaitRequest>();
         let wait_ph = ph.clone();
@@ -435,17 +429,20 @@ impl Capture {
 
         let this = Self {
             handle,
-            rx_cmd,
+            rx,
             ph,
             global_state,
             sizer,
             wl_surface: wl_surface.clone(),
+            viewport,
+            compositor_state,
+            last_committed_sizer: None,
             frame_idx: 0,
             present_counter: 0,
             present_wait_tx,
             backend,
             in_flight,
-            images: vec![],
+            images: Self::build_framebuffers(&render_pass, swapchain_images)?,
             pipeline,
             sampler,
             render_pass,
@@ -466,13 +463,61 @@ impl Capture {
     }
 
     fn run_internal(&mut self) -> Result<()> {
-        while let Ok(cmd) = self.rx_cmd.recv() {
-            match cmd {
-                CaptureCommand::Resize(sizer) => self.resize(&sizer)?,
-                CaptureCommand::Frame(sizer) => self.render(&sizer)?,
-                CaptureCommand::ForceRender(sizer) => self.force_render(&sizer)?,
+        while self.rx.recv().is_ok() {
+            while self.rx.try_recv().is_ok() {}
+            let sizer = (**self.sizer.load()).clone();
+            let [sw, sh] = self.swapchain.image_extent();
+            if (sw, sh) != sizer.render_size {
+                self.resize(&sizer)?;
+            }
+            if self.frame_idx == 0 {
+                self.force_render(&sizer)?;
+            } else {
+                self.render(&sizer)?;
             }
         }
+        Ok(())
+    }
+
+    fn build_framebuffers(
+        render_pass: &Arc<RenderPass>,
+        images: Vec<Arc<Image>>,
+    ) -> Result<Vec<Arc<Framebuffer>>> {
+        images
+            .into_iter()
+            .map(|image| {
+                let view = ImageView::new_default(image)?;
+                let fb = Framebuffer::new(
+                    render_pass.clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![view],
+                        ..Default::default()
+                    },
+                )?;
+                Ok(fb)
+            })
+            .collect()
+    }
+
+    fn update_surface_state(&mut self, sizer: &Sizer) -> Result<()> {
+        if self.last_committed_sizer.as_ref() == Some(sizer) {
+            return Ok(());
+        }
+        self.last_committed_sizer = Some(sizer.clone());
+        let (w_w, w_h) = sizer.window_size;
+        let (r_w, r_h) = sizer.render_size;
+        self.viewport.set_source(0.0, 0.0, r_w as f64, r_h as f64);
+        self.viewport.set_destination(w_w as i32, w_h as i32);
+        let rect = sizer.window_sizing.content;
+        let region = Region::new(&self.compositor_state).context("create region")?;
+        region.add(
+            rect.x as i32,
+            rect.y as i32,
+            rect.width as i32,
+            rect.height as i32,
+        );
+        self.wl_surface.set_opaque_region(Some(region.wl_region()));
+        self.wl_surface.set_input_region(Some(region.wl_region()));
         Ok(())
     }
 
@@ -484,24 +529,13 @@ impl Capture {
         })?;
 
         self.swapchain = swapchain;
-        self.images = images
-            .into_iter()
-            .map(|image| {
-                let view = ImageView::new_default(image)?;
-                let fb = Framebuffer::new(
-                    self.render_pass.clone(),
-                    FramebufferCreateInfo {
-                        attachments: vec![view],
-                        ..Default::default()
-                    },
-                )?;
-                Ok(fb)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        self.images = Self::build_framebuffers(&self.render_pass, images)?;
         Ok(())
     }
 
     pub fn force_render(&mut self, sizer: &Sizer) -> Result<()> {
+        self.update_surface_state(sizer)?;
+
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
@@ -515,13 +549,6 @@ impl Capture {
                 ..Default::default()
             })
         }?;
-        if is_suboptimal {
-            info!("suboptimal, resizing");
-            self.resize(sizer)?;
-            self.wl_surface.commit();
-            return Ok(());
-        }
-
         unsafe { ifl.fence.reset() }?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -551,7 +578,7 @@ impl Capture {
             ..Default::default()
         };
 
-        let _pres = self.queue.with(|mut guard| unsafe {
+        let present_suboptimal = self.queue.with(|mut guard| unsafe {
             guard.submit(&[submit_info], Some(&ifl.fence.clone()))?;
             guard
                 .present(&PresentInfo {
@@ -568,6 +595,10 @@ impl Capture {
         })?;
 
         self.frame_idx += 1;
+        if is_suboptimal || present_suboptimal {
+            info!("suboptimal, resizing");
+            self.resize(sizer)?;
+        }
         Ok(())
     }
 
@@ -594,6 +625,8 @@ impl Capture {
 
         let source_image = frame.image.clone();
 
+        self.update_surface_state(sizer)?;
+
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
@@ -607,15 +640,6 @@ impl Capture {
                 ..Default::default()
             })
         }?;
-        if is_suboptimal {
-            info!("suboptimal, resizing");
-            self.backend.release(frame, None);
-            self.resize(sizer)?;
-            self.ph.skip();
-            self.wl_surface.commit();
-            return Ok(());
-        };
-
         unsafe { ifl.fence.reset() }?;
 
         let fb = self.images[image_index as usize].clone();
@@ -777,7 +801,7 @@ impl Capture {
         self.present_counter += 1;
         let present_id = NonZero::new(self.present_counter).unwrap();
 
-        let _pres = self.queue.with(|mut guard| unsafe {
+        let present_suboptimal = self.queue.with(|mut guard| unsafe {
             (self.device.fns().v1_0.queue_submit)(
                 self.queue.handle(),
                 1,
@@ -813,6 +837,10 @@ impl Capture {
             info,
         });
         self.frame_idx += 1;
+        if is_suboptimal || present_suboptimal {
+            info!("suboptimal, resizing");
+            self.resize(sizer)?;
+        }
         Ok(())
     }
 }
