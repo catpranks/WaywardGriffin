@@ -53,7 +53,9 @@ pub trait CaptureBackendBuilder: Send {
 }
 
 pub trait CaptureBackend: Send {
-    // TODO: capture should block and always return a frame (remove Option)
-    fn capture(&mut self) -> Result<Option<CapturedFrame>>;
+    fn capture(&mut self) -> Result<CapturedFrame>;
     fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>);
+    fn idle(&mut self) -> Result<()> {
+        Ok(())
+    }
 }

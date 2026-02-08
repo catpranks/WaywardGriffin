@@ -19,7 +19,8 @@ use smithay_client_toolkit::{
 };
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -46,10 +47,11 @@ struct State {
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
     pending_linux_dmabuf: Option<(u32, u32, u32)>,
-    shared: Arc<Mutex<BufferPool>>,
     device: Option<Arc<Device>>,
     allocator: Option<Arc<StandardMemoryAllocator>>,
     in_flight: Option<PooledBuffer>,
+    pool: Vec<PooledBuffer>,
+    ready: Option<CapturedFrame>,
 }
 
 impl State {
@@ -145,10 +147,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 let (format, width, height) = state.pending_linux_dmabuf.take().unwrap();
                 let vk_format = fourcc_to_format(format).unwrap();
 
-                let mut buf = {
-                    let mut pool = state.shared.lock().unwrap();
-                    pool.pool.pop()
-                };
+                let mut buf = state.pool.pop();
 
                 let reuse = buf.as_ref().is_some_and(|b| {
                     let ext = b.image.extent();
@@ -187,7 +186,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 // TODO: proper timing (start at capture_output, wait at fence, obtain here)
                 // and plotter capture/capture_miss counters
                 let now = std::time::Instant::now();
-                let captured = CapturedFrame {
+                state.ready = Some(CapturedFrame {
                     image: buf.image,
                     info: FrameInfo {
                         start: now,
@@ -201,22 +200,14 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     handle: Box::new(BufferHandle {
                         wl_buffer: buf.wl_buffer,
                     }),
-                };
-                let mut pool = state.shared.lock().unwrap();
-                if let Some(old) = pool.ready.take() {
-                    let handle: BufferHandle = *old.handle.downcast().expect("invalid handle type");
-                    pool.pool.push(PooledBuffer {
-                        wl_buffer: handle.wl_buffer,
-                        image: old.image,
-                        fence: None,
-                    });
-                }
-                pool.ready = Some(captured);
+                });
                 frame.destroy();
-                state.start_capture();
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
-                // TODO: counter, return the pending buffer
+                // Return the in-flight buffer to the pool
+                if let Some(buf) = state.in_flight.take() {
+                    state.pool.push(buf);
+                }
                 frame.destroy();
                 state.start_capture();
             }
@@ -258,13 +249,11 @@ impl Builder {
             qh: qh.clone(),
             output: None,
             pending_linux_dmabuf: None,
-            shared: Arc::new(Mutex::new(BufferPool {
-                pool: Vec::new(),
-                ready: None,
-            })),
             device: None,
             allocator: None,
             in_flight: None,
+            pool: Vec::new(),
+            ready: None,
         };
 
         event_queue.roundtrip(&mut state)?;
@@ -311,15 +300,18 @@ impl CaptureBackendBuilder for Builder {
             mut state,
         } = *self;
 
-        let shared = state.shared.clone();
         state.device = Some(device);
         state.allocator = Some(allocator);
 
-        std::thread::Builder::new()
-            .name("wlr-screencopy".into())
-            .spawn(move || event_loop_thread(conn, event_queue, state))?;
+        let event_loop: EventLoop<State> = EventLoop::try_new()?;
+        WaylandSource::new(conn, event_queue)
+            .insert(event_loop.handle())
+            .map_err(|e| anyhow::anyhow!("{}", e.error))?;
 
-        Ok((Box::new(Backend { shared }), Box::new(DummyInput::new())))
+        Ok((
+            Box::new(Backend { event_loop, state }),
+            Box::new(DummyInput::new()),
+        ))
     }
 }
 
@@ -402,48 +394,44 @@ fn fourcc_to_format(fourcc: u32) -> Result<Format> {
     }
 }
 
-struct BufferPool {
-    pool: Vec<PooledBuffer>,
-    ready: Option<CapturedFrame>,
-}
-
 struct BufferHandle {
     wl_buffer: OwningWlBuffer,
 }
 
 struct Backend {
-    shared: Arc<Mutex<BufferPool>>,
+    event_loop: EventLoop<'static, State>,
+    state: State,
 }
 
+// SAFETY: EventLoop is !Send due to internal Rc, but Backend is moved to the
+// capture thread once and used exclusively there. No concurrent access.
+unsafe impl Send for Backend {}
+
 impl CaptureBackend for Backend {
-    fn capture(&mut self) -> Result<Option<CapturedFrame>> {
-        let mut pool = self.shared.lock().unwrap();
-        Ok(pool.ready.take())
+    fn capture(&mut self) -> Result<CapturedFrame> {
+        self.state.start_capture();
+
+        loop {
+            self.event_loop.dispatch(None, &mut self.state)?;
+            if let Some(frame) = self.state.ready.take() {
+                return Ok(frame);
+            }
+        }
     }
 
     fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>) {
         let handle: BufferHandle = *frame.handle.downcast().expect("invalid handle type");
-        let mut pool = self.shared.lock().unwrap();
-        assert!(pool.pool.len() < 4, "buffer pool bloated");
-        pool.pool.push(PooledBuffer {
+        assert!(self.state.pool.len() < 4, "buffer pool bloated");
+        self.state.pool.push(PooledBuffer {
             wl_buffer: handle.wl_buffer,
             image: frame.image,
             fence,
         });
     }
-}
 
-fn event_loop_thread(conn: Connection, event_queue: EventQueue<State>, mut state: State) {
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().unwrap();
-    let loop_handle = event_loop.handle();
-
-    WaylandSource::new(conn, event_queue)
-        .insert(loop_handle)
-        .unwrap();
-
-    state.start_capture();
-
-    loop {
-        event_loop.dispatch(None, &mut state).unwrap();
+    fn idle(&mut self) -> Result<()> {
+        self.event_loop
+            .dispatch(Some(Duration::ZERO), &mut self.state)?;
+        Ok(())
     }
 }

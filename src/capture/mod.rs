@@ -14,6 +14,7 @@ use smallvec::smallvec;
 use smithay_client_toolkit::compositor::Region;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use std::time::Instant;
 use tracing::info;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -419,16 +420,21 @@ impl Capture {
 
         loop {
             if !self.dc.global_state.load().capture {
-                // Capture disabled: block on wakeup, show blank
-                self.rx.recv()?;
-                while self.rx.try_recv().is_ok() {}
-                let sizer = self.dc.sizer.load();
-                self.resize_if_needed(&sizer)?;
-                self.render_blank(&sizer)?;
+                match self.rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => {
+                        while self.rx.try_recv().is_ok() {}
+                        let sizer = self.dc.sizer.load();
+                        self.resize_if_needed(&sizer)?;
+                        self.render_blank(&sizer)?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+                self.backend.idle()?;
                 continue;
             }
 
-            let frame = self.backend.capture()?.unwrap();
+            let frame = self.backend.capture()?;
             self.dc.ph.capture();
             if self.dc.global_state.load().cursor_visible != frame.info.cursor_visible {
                 self.dc

@@ -55,7 +55,7 @@ pub fn run(opts: &CaptureOpts) -> Result<()> {
     // Build backend and capture one frame
     let (mut backend, _injector) =
         backend_builder.build(device.clone(), allocator.clone(), &opts.display)?;
-    let frame = backend.capture()?.context("no frame captured")?;
+    let frame = backend.capture()?;
 
     let extent = frame.image.extent();
     let width = extent[0];

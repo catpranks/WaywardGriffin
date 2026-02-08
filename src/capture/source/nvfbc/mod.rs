@@ -87,7 +87,7 @@ pub struct Backend {
 }
 
 impl CaptureBackend for Backend {
-    fn capture(&mut self) -> Result<Option<CapturedFrame>> {
+    fn capture(&mut self) -> Result<CapturedFrame> {
         self.ctx.bind_to_thread()?;
         let stream = std::ptr::null_mut();
         self.capturer.bind_thread()?;
@@ -160,7 +160,7 @@ impl CaptureBackend for Backend {
                 cumem: pooled.cumem,
             }),
         };
-        Ok(Some(frame))
+        Ok(frame)
     }
 
     fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>) {
