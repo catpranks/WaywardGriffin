@@ -4,7 +4,7 @@ use self::nvcapture::NvCapture;
 use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
 use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
-use crate::capture::plotter::FrameInfo;
+use crate::capture::plotter::{FrameInfo, clock_monotonic_ns};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
@@ -94,6 +94,7 @@ impl CaptureBackend for Backend {
 
         let start = Instant::now();
         let (dptr, info) = self.capturer.capture_frame(None)?;
+        let capture_mono_ns = clock_monotonic_ns();
 
         let mut pooled = self.bufs.pop_front();
         let reuse = pooled.as_ref().is_some_and(|p| {
@@ -151,6 +152,7 @@ impl CaptureBackend for Backend {
                 wait,
                 obtain,
                 commit: None,
+                capture_mono_ns,
                 present: None,
                 cursor_visible: info.cursor_visible,
             },

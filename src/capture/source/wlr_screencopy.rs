@@ -194,6 +194,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                         wait: now,
                         obtain: now,
                         commit: None,
+                        capture_mono_ns: 0,
                         present: None,
                         cursor_visible: true,
                     },

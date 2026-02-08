@@ -1,6 +1,6 @@
 mod input;
 
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::plotter::{FrameInfo, PlotterHandle, clock_monotonic_ns};
 use crate::capture::source::create_backend_builder;
 use crate::capture::{Capture, CaptureHandle};
 use crate::display::input::InputState;
@@ -353,11 +353,14 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for App {
     fn event(
         _state: &mut Self,
         _proxy: &wp_presentation::WpPresentation,
-        _event: wp_presentation::Event,
+        event: wp_presentation::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            info!("clock_id: {clk_id}");
+        }
     }
 }
 
@@ -372,11 +375,11 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for App {
     ) {
         match event {
             wp_presentation_feedback::Event::Presented { .. } => {
+                let now = clock_monotonic_ns();
                 let mut deque = state.dc.pending_feedback.lock().unwrap();
                 if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
                     let (_, mut info) = deque.remove(pos).unwrap();
-                    // TODO: use server timestamp
-                    info.mark_present();
+                    info.set_present(now);
                     state.dc.ph.render(info);
                 }
             }

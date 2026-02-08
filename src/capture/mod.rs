@@ -350,11 +350,8 @@ impl Capture {
             },
         )?;
 
-        let (backend, injector) = backend_builder.build(
-            device.clone(),
-            allocator.clone(),
-            &opts.display,
-        )?;
+        let (backend, injector) =
+            backend_builder.build(device.clone(), allocator.clone(), &opts.display)?;
 
         let in_flight = (0..3)
             .map(|_| {
