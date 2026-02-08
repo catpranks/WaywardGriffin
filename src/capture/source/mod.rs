@@ -3,7 +3,7 @@ pub mod wlr_screencopy;
 
 use super::CaptureOpts;
 use super::input::InputBridge;
-use super::plotter::{FrameInfo, PlotterHandle};
+use super::plotter::FrameInfo;
 use anyhow::Result;
 use clap::ValueEnum;
 use std::any::Any;
@@ -48,12 +48,12 @@ pub trait CaptureBackendBuilder: Send {
         self: Box<Self>,
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
-        ph: PlotterHandle,
         display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)>;
 }
 
 pub trait CaptureBackend: Send {
+    // TODO: capture should block and always return a frame (remove Option)
     fn capture(&mut self) -> Result<Option<CapturedFrame>>;
     fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>);
 }

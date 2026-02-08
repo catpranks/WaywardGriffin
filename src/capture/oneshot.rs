@@ -1,5 +1,4 @@
 use super::CaptureOpts;
-use super::plotter::PlotterHandle;
 use super::source::create_backend_builder;
 use super::vulkan::create_instance_and_select_device;
 use anyhow::{Context as _, Result};
@@ -17,8 +16,6 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, Standar
 use vulkano::sync::GpuFuture as _;
 
 pub fn run(opts: &CaptureOpts) -> Result<()> {
-    let ph = PlotterHandle::dummy();
-
     // Build backend (CUDA/NVFBC init happens here)
     let backend_builder = create_backend_builder(opts)?;
 
@@ -57,7 +54,7 @@ pub fn run(opts: &CaptureOpts) -> Result<()> {
 
     // Build backend and capture one frame
     let (mut backend, _injector) =
-        backend_builder.build(device.clone(), allocator.clone(), ph, &opts.display)?;
+        backend_builder.build(device.clone(), allocator.clone(), &opts.display)?;
     let frame = backend.capture()?.context("no frame captured")?;
 
     let extent = frame.image.extent();

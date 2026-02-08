@@ -49,6 +49,7 @@ use smithay_client_toolkit::{
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing::info;
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
@@ -75,7 +76,7 @@ impl DisplayCtx {
             && front.start.elapsed() > Duration::from_secs(1)
         {
             deque.pop_front();
-            self.ph.log("presentation feedback timed out");
+            info!("presentation feedback timed out");
         }
         deque.push_back((fb.id(), info));
     }
@@ -383,8 +384,7 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for App {
                 let mut deque = state.dc.pending_feedback.lock().unwrap();
                 if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
                     deque.remove(pos);
-                    // TODO: record a skip here?
-                    state.dc.ph.log("presentation feedback discarded");
+                    state.dc.ph.skip();
                 }
             }
             _ => {}

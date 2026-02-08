@@ -26,11 +26,6 @@ enum PlotEvent {
 pub struct PlotterHandle(mpsc::SyncSender<PlotEvent>);
 
 impl PlotterHandle {
-    pub fn dummy() -> Self {
-        let (tx, _rx) = mpsc::sync_channel(16);
-        Self(tx)
-    }
-
     pub fn log(&self, msg: impl Into<String>) {
         let _ = self.0.try_send(PlotEvent::Log(msg.into()));
     }

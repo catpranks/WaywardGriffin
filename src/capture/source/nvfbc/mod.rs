@@ -4,7 +4,7 @@ use self::nvcapture::NvCapture;
 use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
 use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::plotter::FrameInfo;
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::IntoRawFd as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -59,7 +59,6 @@ impl CaptureBackendBuilder for Builder {
         self: Box<Self>,
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
-        ph: PlotterHandle,
         display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         // NVFBC reads the display from the DISPLAY env var; there's no API to pass it explicitly.
@@ -73,7 +72,6 @@ impl CaptureBackendBuilder for Builder {
                 device,
                 allocator,
                 bufs: VecDeque::new(),
-                ph,
             }),
             Box::new(injector),
         ))
@@ -86,7 +84,6 @@ pub struct Backend {
     device: Arc<Device>,
     allocator: Arc<StandardMemoryAllocator>,
     bufs: VecDeque<PooledBuffer>,
-    ph: PlotterHandle,
 }
 
 impl CaptureBackend for Backend {
@@ -96,13 +93,7 @@ impl CaptureBackend for Backend {
         self.capturer.bind_thread()?;
 
         let start = Instant::now();
-        let (dptr, info) = self.capturer.capture_frame(Some(Duration::default()))?;
-
-        if info.is_new_frame {
-            self.ph.capture();
-        } else {
-            self.ph.capture_miss();
-        }
+        let (dptr, info) = self.capturer.capture_frame(None)?;
 
         let mut pooled = self.bufs.pop_front();
         let reuse = pooled.as_ref().is_some_and(|p| {

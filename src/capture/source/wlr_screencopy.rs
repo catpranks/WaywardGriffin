@@ -2,7 +2,7 @@ use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
 use crate::OwningWlBuffer;
 use crate::capture::input::InputBridge;
 use crate::capture::input::dummy::DummyInput;
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::plotter::FrameInfo;
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -302,7 +302,6 @@ impl CaptureBackendBuilder for Builder {
         self: Box<Self>,
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
-        _ph: PlotterHandle,
         _display: &str,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         let Self {

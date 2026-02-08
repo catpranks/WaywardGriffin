@@ -5,7 +5,7 @@ pub mod source;
 pub mod vulkan;
 
 use crate::capture::input::InputBridge;
-use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder};
+use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder, CapturedFrame};
 use crate::display::DisplayCtx;
 use crate::sizer::Sizer;
 use anyhow::{Context as _, Result};
@@ -353,7 +353,6 @@ impl Capture {
         let (backend, injector) = backend_builder.build(
             device.clone(),
             allocator.clone(),
-            dctx.ph.clone(),
             &opts.display,
         )?;
 
@@ -415,20 +414,45 @@ impl Capture {
     }
 
     fn run_internal(&mut self) -> Result<()> {
-        while self.rx.recv().is_ok() {
-            while self.rx.try_recv().is_ok() {}
-            let sizer = (**self.dc.sizer.load()).clone();
-            let [sw, sh] = self.swapchain.image_extent();
-            if (sw, sh) != sizer.render_size {
-                self.resize(&sizer)?;
+        // First frame: wait for wakeup, force-render a blank screen
+        self.rx.recv()?;
+        let sizer = self.dc.sizer.load();
+        self.resize_if_needed(&sizer)?;
+        self.render_blank(&sizer)?;
+
+        loop {
+            if !self.dc.global_state.load().capture {
+                // Capture disabled: block on wakeup, show blank
+                self.rx.recv()?;
+                while self.rx.try_recv().is_ok() {}
+                let sizer = self.dc.sizer.load();
+                self.resize_if_needed(&sizer)?;
+                self.render_blank(&sizer)?;
+                continue;
             }
-            if self.frame_idx == 0 {
-                self.force_render(&sizer)?;
+
+            let frame = self.backend.capture()?.unwrap();
+            self.dc.ph.capture();
+            if self.dc.global_state.load().cursor_visible != frame.info.cursor_visible {
+                self.dc
+                    .global_state
+                    .rcu(|s| s.with_cursor_visible(frame.info.cursor_visible));
+            }
+
+            let mut has_wakeup = false;
+            while self.rx.try_recv().is_ok() {
+                has_wakeup = true;
+            }
+
+            if has_wakeup {
+                let sizer = self.dc.sizer.load();
+                self.resize_if_needed(&sizer)?;
+                self.render_frame(frame, &sizer)?;
             } else {
-                self.render(&sizer)?;
+                self.dc.ph.capture_miss();
+                self.backend.release(frame, None);
             }
         }
-        Ok(())
     }
 
     fn build_framebuffers(
@@ -475,6 +499,14 @@ impl Capture {
         Ok(())
     }
 
+    fn resize_if_needed(&mut self, sizer: &Sizer) -> Result<()> {
+        let [sw, sh] = self.swapchain.image_extent();
+        if (sw, sh) != sizer.render_size {
+            self.resize(sizer)?;
+        }
+        Ok(())
+    }
+
     pub fn resize(&mut self, sizer: &Sizer) -> Result<()> {
         let (r_w, r_h) = sizer.render_size;
         let (swapchain, images) = self.swapchain.recreate(SwapchainCreateInfo {
@@ -487,7 +519,7 @@ impl Capture {
         Ok(())
     }
 
-    pub fn force_render(&mut self, sizer: &Sizer) -> Result<()> {
+    pub fn render_blank(&mut self, sizer: &Sizer) -> Result<()> {
         self.update_surface_state(sizer)?;
 
         let ifli = self.frame_idx % self.in_flight.len();
@@ -556,26 +588,11 @@ impl Capture {
         Ok(())
     }
 
-    pub fn render(&mut self, sizer: &Sizer) -> Result<()> {
-        if !self.dc.global_state.load().capture {
-            return self.force_render(sizer);
-        }
-        let Some(frame) = self.backend.capture()? else {
-            self.dc.ph.skip();
-            self.dc.surface.commit();
-            return Ok(());
-        };
-
-        // Update sizer/global_state from frame info
+    fn render_frame(&mut self, frame: CapturedFrame, sizer: &Sizer) -> Result<()> {
         let frame_size = frame.image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
         if self.dc.sizer.load().source_size != frame_size {
             self.dc.sizer.rcu(|s| s.with_source_size(frame_size));
-        }
-        if self.dc.global_state.load().cursor_visible != frame.info.cursor_visible {
-            self.dc
-                .global_state
-                .rcu(|s| s.with_cursor_visible(frame.info.cursor_visible));
         }
 
         let source_image = frame.image.clone();
