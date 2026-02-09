@@ -97,6 +97,7 @@ fn run(
         global_state,
         device,
         allocator,
+        backend: _,
     } = env;
     ctx.bind_to_thread()?;
     capturer.bind_thread()?;

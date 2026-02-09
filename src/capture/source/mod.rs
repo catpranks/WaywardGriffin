@@ -1,5 +1,5 @@
 mod nvfbc;
-mod screencopy;
+mod wayland;
 
 use super::CaptureOpts;
 use super::SwapchainRenderer;
@@ -19,7 +19,7 @@ use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::swapchain::Surface;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendType {
     Nvfbc,
     Screencopy,
@@ -38,6 +38,7 @@ pub struct CaptureEnv {
     pub global_state: GlobalState,
     pub device: Arc<Device>,
     pub allocator: Arc<StandardMemoryAllocator>,
+    pub backend: BackendType,
 }
 
 pub struct SpawnResult {
@@ -58,8 +59,9 @@ pub fn setup_and_spawn(
 ) -> Result<SpawnResult> {
     let backend: Box<dyn CaptureBackend> = match opts.backend {
         BackendType::Nvfbc => Box::new(nvfbc::Backend::new(&opts.display)?),
-        BackendType::Screencopy => Box::new(screencopy::Backend::new(&opts.display)?),
-        BackendType::ImageCopy => todo!("image-copy backend"),
+        BackendType::Screencopy | BackendType::ImageCopy => {
+            Box::new(wayland::Backend::new(&opts.display)?)
+        }
         BackendType::Kms => todo!("kms backend"),
     };
 
@@ -157,6 +159,7 @@ pub fn setup_and_spawn(
         global_state,
         device,
         allocator,
+        backend: opts.backend,
     };
     backend.spawn(env)
 }

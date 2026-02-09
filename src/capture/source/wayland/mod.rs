@@ -1,4 +1,6 @@
-use super::{CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
+mod screencopy;
+
+use super::{BackendType, CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
 use crate::GlobalState;
 use crate::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
@@ -14,7 +16,7 @@ use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{
     delegate_dmabuf, delegate_output, delegate_registry, registry_handlers,
@@ -37,8 +39,7 @@ use vulkano::sync::fence::Fence;
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1};
-use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
-use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1};
+use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
 pub struct Backend {
     display: String,
@@ -86,9 +87,12 @@ impl CaptureBackend for Backend {
         let (calloop_tx, calloop_rx) = calloop_channel::channel();
         std::thread::spawn({
             let display = self.display;
+            let backend = env.backend;
             let ph = env.ph.clone();
             move || {
-                ph.fatal(run(env, &display, calloop_rx).context("capture thread (screencopy)"));
+                ph.fatal(
+                    run(env, &display, calloop_rx).context(format!("capture thread ({backend:?})")),
+                );
             }
         });
         Ok(SpawnResult {
@@ -164,7 +168,7 @@ struct State {
     registry_state: RegistryState,
     output_state: OutputState,
     dmabuf_state: DmabufState,
-    screencopy_manager: ZwlrScreencopyManagerV1,
+    screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
 
@@ -206,12 +210,9 @@ enum CaptureMode {
 
 impl State {
     fn issue_capture(&mut self) {
-        self.frame_state = Some(FrameState::Requested {
-            start: Instant::now(),
-        });
-        let output = self.output.as_ref().unwrap();
-        self.screencopy_manager
-            .capture_output(/* overlay_cursor */ 1, output, &self.qh, ());
+        if self.screencopy_manager.is_some() {
+            self.screencopy_issue_capture();
+        }
     }
 
     fn is_capturing(&self) -> bool {
@@ -274,52 +275,6 @@ impl State {
         } else if let CaptureMode::FrameBuffered(pending) = mode {
             self.pool.push(pending.buf);
         }
-    }
-
-    fn handle_buffer_done(&mut self, frame: &ZwlrScreencopyFrameV1) -> Result<()> {
-        let Some(FrameState::Described {
-            start,
-            format,
-            width,
-            height,
-        }) = self.frame_state.take()
-        else {
-            bail!("BufferDone without prior LinuxDmabuf");
-        };
-        let vk_format = fourcc_to_format(format)?;
-
-        let mut buf = self.pool.pop();
-
-        let reuse = buf.as_ref().is_some_and(|b| {
-            let ext = b.image.extent();
-            b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
-        });
-        if !reuse {
-            if let Some(old) = &mut buf
-                && let Some(fence) = old.fence.take()
-            {
-                fence.wait(None)?;
-            }
-            buf = Some(Buffer::new(
-                self.device.clone(),
-                self.allocator.as_ref(),
-                &self.dmabuf_state,
-                &self.qh,
-                format,
-                width,
-                height,
-            )?);
-        }
-        let mut buf = buf.unwrap();
-
-        if let Some(fence) = buf.fence.take() {
-            fence.wait(None)?;
-        }
-        let wait = Instant::now();
-
-        frame.copy(&buf.wl_buffer);
-        self.frame_state = Some(FrameState::Copying { buf, start, wait });
-        Ok(())
     }
 
     fn handle_wakeup(&mut self) {
@@ -409,88 +364,6 @@ impl DmabufHandler for State {
     fn released(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _buffer: &WlBuffer) {}
 }
 
-impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &ZwlrScreencopyManagerV1,
-        _event: zwlr_screencopy_manager_v1::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
-    fn event(
-        state: &mut Self,
-        frame: &ZwlrScreencopyFrameV1,
-        event: zwlr_screencopy_frame_v1::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwlr_screencopy_frame_v1::Event::LinuxDmabuf {
-                format,
-                width,
-                height,
-            } => {
-                let start = match state.frame_state {
-                    Some(FrameState::Requested { start } | FrameState::Described { start, .. }) => {
-                        start
-                    }
-                    _ => return,
-                };
-                state.frame_state = Some(FrameState::Described {
-                    start,
-                    format,
-                    width,
-                    height,
-                });
-            }
-            zwlr_screencopy_frame_v1::Event::BufferDone => {
-                if let Err(e) = state.handle_buffer_done(frame) {
-                    state.done = Some(Err(e));
-                }
-            }
-            zwlr_screencopy_frame_v1::Event::Ready {
-                tv_sec_hi,
-                tv_sec_lo,
-                tv_nsec,
-            } => {
-                let Some(FrameState::Copying { buf, start, wait }) = state.frame_state.take()
-                else {
-                    assert!(state.done.is_some());
-                    return;
-                };
-                let obtain = Instant::now();
-                let capture_mono_ns =
-                    ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64) * 1_000_000_000 + tv_nsec as u64;
-                let info = FrameInfo {
-                    start,
-                    wait,
-                    obtain,
-                    commit: None,
-                    capture_mono_ns,
-                    present: None,
-                    cursor_visible: false,
-                };
-                frame.destroy();
-                state.handle_ready(info, buf);
-            }
-            zwlr_screencopy_frame_v1::Event::Failed => {
-                if let Some(FrameState::Copying { buf, .. }) = state.frame_state.take() {
-                    state.pool.push(buf);
-                }
-                frame.destroy();
-                state.handle_failed();
-            }
-            _ => {}
-        }
-    }
-}
-
 delegate_registry!(State);
 delegate_output!(State);
 delegate_dmabuf!(State);
@@ -502,7 +375,9 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         global_state,
         device,
         allocator,
+        backend,
     } = env;
+    let use_screencopy = backend == BackendType::Screencopy;
     let stream = UnixStream::connect(display)
         .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
     let conn = Connection::from_socket(stream)
@@ -511,9 +386,15 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
     let qh = event_queue.handle();
 
-    let screencopy_manager: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 3..=3, ())
-        .context("zwlr_screencopy_manager_v1 v3 not available")?;
+    let screencopy_manager: Option<ZwlrScreencopyManagerV1> = if use_screencopy {
+        Some(
+            globals
+                .bind(&qh, 3..=3, ())
+                .context("zwlr_screencopy_manager_v1 v3 not available")?,
+        )
+    } else {
+        None
+    };
 
     let mut state = State {
         renderer,
