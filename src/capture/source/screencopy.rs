@@ -171,10 +171,7 @@ struct State {
     in_flight: Option<PooledBuffer>,
     pool: Vec<PooledBuffer>,
 
-    pending_frame: Option<PendingFrame>,
-    display_wants_frame: bool,
-    capture_in_flight: bool,
-    was_capturing: bool,
+    mode: CaptureMode,
     done: bool,
 }
 
@@ -183,15 +180,25 @@ struct PendingFrame {
     buf: PooledBuffer,
 }
 
+enum Phase {
+    Balanced,
+    DisplayWaiting,
+    FrameBuffered(PendingFrame),
+}
+
+enum CaptureMode {
+    Idle,
+    Active {
+        phase: Phase,
+        capture_in_flight: bool,
+    },
+}
+
 impl State {
-    fn start_capture(&mut self) {
-        if self.capture_in_flight {
-            return;
-        }
+    fn issue_capture(&self) {
         let output = self.output.as_ref().unwrap();
         self.screencopy_manager
             .capture_output(1, output, &self.qh, ());
-        self.capture_in_flight = true;
     }
 
     fn is_capturing(&self) -> bool {
@@ -199,10 +206,15 @@ impl State {
     }
 
     fn handle_ready(&mut self, info: FrameInfo, mut buf: PooledBuffer) {
-        self.capture_in_flight = false;
-
         if !self.is_capturing() {
             self.pool.push(buf);
+            if let CaptureMode::Active {
+                phase: Phase::FrameBuffered(pending),
+                ..
+            } = std::mem::replace(&mut self.mode, CaptureMode::Idle)
+            {
+                self.pool.push(pending.buf);
+            }
             return;
         }
 
@@ -213,76 +225,121 @@ impl State {
                 .rcu(|s| s.with_cursor_visible(info.cursor_visible));
         }
 
-        if self.display_wants_frame {
-            self.display_wants_frame = false;
-            match self.renderer.render(buf.image.clone(), info) {
-                Ok(fence) => {
-                    buf.fence = Some(fence);
-                    self.pool.push(buf);
+        let CaptureMode::Active { phase, .. } =
+            std::mem::replace(&mut self.mode, CaptureMode::Idle)
+        else {
+            unreachable!("handle_ready called while Idle");
+        };
+
+        let new_phase = match phase {
+            Phase::DisplayWaiting => {
+                match self.renderer.render(buf.image.clone(), info) {
+                    Ok(fence) => {
+                        buf.fence = Some(fence);
+                        self.pool.push(buf);
+                    }
+                    Err(e) => {
+                        self.pool.push(buf);
+                        tracing::error!("render failed: {e:#}");
+                    }
                 }
-                Err(e) => {
-                    self.pool.push(buf);
-                    tracing::error!("render failed: {e:#}");
-                }
+                Phase::Balanced
             }
-            self.start_capture();
-        } else {
-            if let Some(old) = self.pending_frame.take() {
+            Phase::Balanced => Phase::FrameBuffered(PendingFrame { info, buf }),
+            Phase::FrameBuffered(old) => {
                 self.ph.capture_miss();
                 self.pool.push(old.buf);
+                Phase::FrameBuffered(PendingFrame { info, buf })
             }
-            self.pending_frame = Some(PendingFrame { info, buf });
-            self.start_capture();
-        }
+        };
+
+        self.issue_capture();
+        self.mode = CaptureMode::Active {
+            phase: new_phase,
+            capture_in_flight: true,
+        };
     }
 
     fn handle_failed(&mut self) {
-        self.capture_in_flight = false;
+        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
 
-        if self.is_capturing() {
-            self.start_capture();
+        match (mode, self.is_capturing()) {
+            (CaptureMode::Active { phase, .. }, true) => {
+                self.issue_capture();
+                self.mode = CaptureMode::Active {
+                    phase,
+                    capture_in_flight: true,
+                };
+            }
+            (CaptureMode::Active { phase, .. }, false) => {
+                if let Phase::FrameBuffered(pending) = phase {
+                    self.pool.push(pending.buf);
+                }
+            }
+            (CaptureMode::Idle, _) => unreachable!("handle_failed called while Idle"),
         }
     }
 
     fn handle_wakeup(&mut self) {
-        if !self.is_capturing() {
+        let capturing = self.is_capturing();
+        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
+
+        if !capturing {
+            if let CaptureMode::Active {
+                phase: Phase::FrameBuffered(pending),
+                ..
+            } = mode
+            {
+                self.pool.push(pending.buf);
+            }
             if let Err(e) = self.renderer.blank() {
                 tracing::error!("blank failed: {e:#}");
-            }
-
-            if self.was_capturing {
-                self.was_capturing = false;
-                if let Some(old) = self.pending_frame.take() {
-                    self.pool.push(old.buf);
-                }
             }
             return;
         }
 
-        if !self.was_capturing {
-            self.was_capturing = true;
-            self.start_capture();
-        }
-
-        if let Some(mut pending) = self.pending_frame.take() {
-            match self
-                .renderer
-                .render(pending.buf.image.clone(), pending.info)
-            {
-                Ok(fence) => {
-                    pending.buf.fence = Some(fence);
-                    self.pool.push(pending.buf);
-                }
-                Err(e) => {
-                    self.pool.push(pending.buf);
-                    tracing::error!("render failed: {e:#}");
-                }
+        match mode {
+            CaptureMode::Idle => {
+                self.issue_capture();
+                self.mode = CaptureMode::Active {
+                    phase: Phase::DisplayWaiting,
+                    capture_in_flight: true,
+                };
             }
-            if !self.capture_in_flight {
-                self.start_capture();
-            }
-        } else {
-            self.display_wants_frame = true;
+            CaptureMode::Active {
+                phase,
+                mut capture_in_flight,
+            } => match phase {
+                Phase::FrameBuffered(mut pending) => {
+                    match self
+                        .renderer
+                        .render(pending.buf.image.clone(), pending.info)
+                    {
+                        Ok(fence) => {
+                            pending.buf.fence = Some(fence);
+                            self.pool.push(pending.buf);
+                        }
+                        Err(e) => {
+                            self.pool.push(pending.buf);
+                            tracing::error!("render failed: {e:#}");
+                        }
+                    }
+                    if !capture_in_flight {
+                        self.issue_capture();
+                        capture_in_flight = true;
+                    }
+                    self.mode = CaptureMode::Active {
+                        phase: Phase::Balanced,
+                        capture_in_flight,
+                    };
+                }
+                Phase::Balanced | Phase::DisplayWaiting => {
+                    self.mode = CaptureMode::Active {
+                        phase: Phase::DisplayWaiting,
+                        capture_in_flight,
+                    };
+                }
+            },
         }
     }
 }
@@ -475,10 +532,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         in_flight: None,
         pool: Vec::new(),
 
-        pending_frame: None,
-        display_wants_frame: false,
-        capture_in_flight: false,
-        was_capturing: false,
+        mode: CaptureMode::Idle,
         done: false,
     };
 
