@@ -87,7 +87,7 @@ impl CaptureBackend for Backend {
             let display = self.display;
             let ph = env.ph.clone();
             move || {
-                ph.fatal(run(env, &display, calloop_rx).context("capture thread (wlr_screencopy)"));
+                ph.fatal(run(env, &display, calloop_rx).context("capture thread (screencopy)"));
             }
         });
         Ok(SpawnResult {

@@ -1,5 +1,5 @@
 mod nvfbc;
-mod wlr_screencopy;
+mod screencopy;
 
 use super::CaptureOpts;
 use super::SwapchainRenderer;
@@ -22,8 +22,8 @@ use vulkano::swapchain::Surface;
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum BackendType {
     Nvfbc,
-    WlrScreencopy,
-    ExtImageCopy,
+    Screencopy,
+    ImageCopy,
     Kms,
 }
 
@@ -58,8 +58,8 @@ pub fn setup_and_spawn(
 ) -> Result<SpawnResult> {
     let backend: Box<dyn CaptureBackend> = match opts.backend {
         BackendType::Nvfbc => Box::new(nvfbc::Backend::new(&opts.display)?),
-        BackendType::WlrScreencopy => Box::new(wlr_screencopy::Backend::new(&opts.display)?),
-        BackendType::ExtImageCopy => todo!("ext-image-copy backend"),
+        BackendType::Screencopy => Box::new(screencopy::Backend::new(&opts.display)?),
+        BackendType::ImageCopy => todo!("image-copy backend"),
         BackendType::Kms => todo!("kms backend"),
     };
 

@@ -8,7 +8,7 @@ Local display proxy: captures X11 via NVFBC, presents to Wayland window, forward
 |--------|-------|------|
 | Main | `lib.rs:run()` | Runs plotter TUI |
 | Display | `display/mod.rs:run()` | Wayland window, surface, compositor events, input handling |
-| Capture | `capture/source/nvfbc::run()` or `wlr_screencopy::run()` | Backend-specific capture loop + SwapchainRenderer for Vulkan present |
+| Capture | `capture/source/nvfbc::run()` or `screencopy::run()` | Backend-specific capture loop + SwapchainRenderer for Vulkan present |
 
 Communication: `mpsc::Sender<()>` wakeup from display→capture. Lock-free `ArcSwap<GlobalStateInner>` for shared state.
 
@@ -17,7 +17,7 @@ Communication: `mpsc::Sender<()>` wakeup from display→capture. Lock-free `ArcS
 - `capture/mod.rs` - `SwapchainRenderer` (Vulkan pipeline, render, present)
 - `capture/source/mod.rs` - `setup_and_spawn`, `DeviceId`, `BackendType`
 - `capture/source/nvfbc/` - NVFBC capture, CUDA→Vulkan DMA-BUF, buffer pool
-- `capture/source/wlr_screencopy.rs` - wlr_screencopy capture, calloop-driven
+- `capture/source/screencopy.rs` - screencopy capture, calloop-driven
 - `capture/input/mod.rs` - `InputBridge` trait (input injection + clipboard)
 - `capture/input/xinput.rs` - X11 XTest input + clipboard via x11-clipboard
 - `sizer.rs` - Coordinate transforms between source/window/render space
