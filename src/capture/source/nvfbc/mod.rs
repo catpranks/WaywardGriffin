@@ -1,8 +1,7 @@
 mod nvcapture;
 
 use self::nvcapture::NvCapture;
-use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
-use crate::capture::input::InputBridge;
+use super::{CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
 use crate::capture::input::xinput::XInput;
 use crate::capture::plotter::{FrameInfo, clock_monotonic_ns};
 use anyhow::{Context as _, Result};
@@ -22,81 +21,112 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::IntoRawFd as _;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
 use vulkano::image::{Image, ImageCreateInfo, ImageTiling, ImageUsage};
-use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter};
 use vulkano::memory::{
     DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, ExternalMemoryHandleTypes,
     MemoryAllocateInfo, ResourceMemory,
 };
 use vulkano::sync::fence::Fence;
 
-pub struct Builder {
-    ctx: Arc<CudaContext>,
-    capturer: NvCapture,
-}
-
-impl Builder {
-    pub fn new() -> Result<Self> {
-        let ctx = CudaContext::new(0)?;
-        ctx.set_flags(CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
-        ctx.bind_to_thread()?;
-        let capturer = NvCapture::new()?;
-        capturer.release_thread()?;
-        Ok(Self { ctx, capturer })
-    }
-}
-
-impl CaptureBackendBuilder for Builder {
-    fn device_id(&self) -> super::DeviceId {
-        super::DeviceId::Uuid(bytemuck::cast(self.ctx.uuid().unwrap().bytes))
-    }
-
-    fn build(
-        self: Box<Self>,
-        device: Arc<Device>,
-        allocator: Arc<StandardMemoryAllocator>,
-        display: &str,
-    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
-        // NVFBC reads the display from the DISPLAY env var; there's no API to pass it explicitly.
-        // XInput gets it explicitly below.
-        let injector = XInput::new(display)?;
-
-        Ok((
-            Box::new(Backend {
-                ctx: self.ctx,
-                capturer: self.capturer,
-                device,
-                allocator,
-                bufs: VecDeque::new(),
-            }),
-            Box::new(injector),
-        ))
-    }
-}
-
 pub struct Backend {
     ctx: Arc<CudaContext>,
     capturer: NvCapture,
-    device: Arc<Device>,
-    allocator: Arc<StandardMemoryAllocator>,
-    bufs: VecDeque<PooledBuffer>,
+    display: String,
+}
+
+impl Backend {
+    pub fn new(display: &str) -> Result<Self> {
+        let ctx = CudaContext::new(0)?;
+        ctx.set_flags(CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
+        let capturer = NvCapture::new()?;
+        capturer.release_thread()?;
+        Ok(Self {
+            ctx,
+            capturer,
+            display: display.to_owned(),
+        })
+    }
 }
 
 impl CaptureBackend for Backend {
-    fn capture(&mut self) -> Result<CapturedFrame> {
-        self.ctx.bind_to_thread()?;
-        let stream = std::ptr::null_mut();
-        self.capturer.bind_thread()?;
+    fn device_id(&self) -> DeviceId {
+        DeviceId::Uuid(bytemuck::cast(self.ctx.uuid().unwrap().bytes))
+    }
+
+    fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
+        let injector = Box::new(XInput::new(&self.display)?);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn({
+            let ph = env.ph.clone();
+            move || {
+                ph.fatal(run(self.ctx, self.capturer, env, rx).context("capture thread (nvfbc)"));
+            }
+        });
+        Ok(SpawnResult {
+            injector,
+            wake: Box::new(move || {
+                let _ = tx.send(());
+            }),
+        })
+    }
+}
+
+fn drain(rx: &mpsc::Receiver<()>) -> bool {
+    let mut got = false;
+    while rx.try_recv().is_ok() {
+        got = true;
+    }
+    got
+}
+
+fn run(
+    ctx: Arc<CudaContext>,
+    capturer: NvCapture,
+    env: CaptureEnv,
+    rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    let CaptureEnv {
+        mut renderer,
+        ph,
+        global_state,
+        device,
+        allocator,
+    } = env;
+    ctx.bind_to_thread()?;
+    capturer.bind_thread()?;
+    let mut bufs: VecDeque<PooledBuffer> = VecDeque::new();
+
+    // First frame: wait for wakeup, render blank
+    rx.recv()?;
+    renderer.blank()?;
+
+    loop {
+        if !global_state.load().capture {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) => {
+                    drain(&rx);
+                    renderer.blank()?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            continue;
+        }
+
+        let stream_ptr = std::ptr::null_mut();
+        capturer.bind_thread()?;
 
         let start = Instant::now();
-        let (dptr, info) = self.capturer.capture_frame(None)?;
+        let (dptr, info) = capturer.capture_frame(None)?;
         let capture_mono_ns = clock_monotonic_ns();
 
-        let mut pooled = self.bufs.pop_front();
+        let mut pooled = bufs.pop_front();
         let reuse = pooled.as_ref().is_some_and(|p| {
             let ext = p.image.extent();
             (ext[0], ext[1]) == info.size
@@ -108,9 +138,9 @@ impl CaptureBackend for Backend {
                 fence.wait(None)?;
             }
             pooled = Some(PooledBuffer::new(
-                self.device.clone(),
-                &self.allocator,
-                self.ctx.clone(),
+                device.clone(),
+                &allocator,
+                ctx.clone(),
                 info.size,
             )?);
         }
@@ -141,41 +171,36 @@ impl CaptureBackend for Backend {
             WidthInBytes: pitch,
             Height: height as usize,
         };
-        unsafe { cuMemcpy2DAsync_v2(&copy as _, stream) }.result()?;
-        unsafe { stream::synchronize(stream) }?;
+        unsafe { cuMemcpy2DAsync_v2(&copy as _, stream_ptr) }.result()?;
+        unsafe { stream::synchronize(stream_ptr) }?;
         let obtain = Instant::now();
 
-        let frame = CapturedFrame {
-            image: pooled.image,
-            info: FrameInfo {
-                start,
-                wait,
-                obtain,
-                commit: None,
-                capture_mono_ns,
-                present: None,
-                cursor_visible: info.cursor_visible,
-            },
-            handle: Box::new(BufferHandle {
-                cumem: pooled.cumem,
-            }),
+        ph.capture();
+
+        let frame_info = FrameInfo {
+            start,
+            wait,
+            obtain,
+            commit: None,
+            capture_mono_ns,
+            present: None,
+            cursor_visible: info.cursor_visible,
         };
-        Ok(frame)
-    }
 
-    fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>) {
-        let handle: BufferHandle = *frame.handle.downcast().expect("invalid handle type");
-        assert!(self.bufs.len() < 4, "buffer pool bloated");
-        self.bufs.push_back(PooledBuffer {
-            cumem: handle.cumem,
-            image: frame.image,
-            fence,
-        });
-    }
-}
+        if global_state.load().cursor_visible != info.cursor_visible {
+            global_state.rcu(|s| s.with_cursor_visible(info.cursor_visible));
+        }
 
-struct BufferHandle {
-    cumem: CudaArray,
+        if drain(&rx) {
+            let fence = renderer.render(pooled.image.clone(), frame_info)?;
+            pooled.fence = Some(fence);
+        } else {
+            ph.capture_miss();
+        }
+
+        assert!(bufs.len() < 4, "buffer pool bloated");
+        bufs.push_back(pooled);
+    }
 }
 
 struct CudaArray {

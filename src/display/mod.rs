@@ -1,12 +1,11 @@
 mod input;
 
 use crate::capture::plotter::{FrameInfo, PlotterHandle, clock_monotonic_ns};
-use crate::capture::source::create_backend_builder;
-use crate::capture::{Capture, CaptureHandle};
+use crate::capture::source;
 use crate::display::input::InputState;
 use crate::sizer::SharedSizer;
 use crate::{GlobalState, Opts};
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use copypasta::wayland_clipboard;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -85,7 +84,7 @@ impl DisplayCtx {
 struct App {
     loop_handle: LoopHandle<'static, App>,
     dc: DisplayCtx,
-    ch: CaptureHandle,
+    ch: Box<dyn Fn() + Send>,
 
     // Wayland State
     registry_state: RegistryState,
@@ -178,7 +177,7 @@ impl WindowHandler for App {
             self.handle_resize();
 
             self.dc.surface.frame(qh, self.dc.surface.clone());
-            self.ch.wake();
+            (self.ch)();
         } else {
             self.sched_resize();
         }
@@ -214,7 +213,7 @@ impl CompositorHandler for App {
         _time: u32,
     ) {
         self.dc.surface.frame(qh, self.dc.surface.clone());
-        self.ch.wake();
+        (self.ch)();
     }
 
     fn surface_enter(
@@ -405,7 +404,7 @@ delegate_shm!(App);
 delegate_simple!(App, WpFractionalScaleManagerV1, 1);
 delegate_simple!(App, WpViewporter, 1);
 
-fn run_internal(
+pub fn run(
     opts: Opts,
     global_state: GlobalState,
     ph: PlotterHandle,
@@ -451,11 +450,8 @@ fn run_internal(
         pending_feedback: Arc::new(Mutex::new(VecDeque::new())),
         qh: qh.clone(),
     };
-    let backend_builder = create_backend_builder(&opts.capture_opts)?;
-    let (mut capture, injector) =
-        Capture::new(dc.clone(), backend_builder, &conn, &opts.capture_opts)?;
-    let ch = capture.handle.clone();
-    std::thread::spawn(move || capture.run());
+    let source::SpawnResult { injector, wake: ch } =
+        source::setup_and_spawn(&opts.capture_opts, dc.clone(), &conn)?;
 
     // Initialize clipboards
     let (wl_primary, wl_clipboard) = unsafe {
@@ -533,8 +529,4 @@ fn run_internal(
             return res;
         }
     }
-}
-
-pub fn run(opts: Opts, global_state: GlobalState, ph: PlotterHandle, sizer: SharedSizer) {
-    ph.fatal(run_internal(opts, global_state, ph.clone(), sizer).context("display thread"));
 }

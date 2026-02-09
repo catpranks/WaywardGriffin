@@ -1,20 +1,16 @@
 pub mod input;
-pub mod oneshot;
 pub mod plotter;
 pub mod source;
-pub mod vulkan;
 
-use crate::capture::input::InputBridge;
-use crate::capture::source::{BackendType, CaptureBackend, CaptureBackendBuilder, CapturedFrame};
+use crate::capture::plotter::FrameInfo;
 use crate::display::DisplayCtx;
 use crate::sizer::Sizer;
 use anyhow::{Context as _, Result};
 use clap::Args;
 use smallvec::smallvec;
 use smithay_client_toolkit::compositor::Region;
-use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use source::BackendType;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -25,14 +21,11 @@ use vulkano::command_buffer::{
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::{
-    Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
-};
+use vulkano::device::{Device, Queue};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage};
-use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
@@ -88,9 +81,6 @@ mod vs {
             layout(location = 0) out vec2 tex_coords;
 
             void main() {
-                // A fullscreen triangle without buffers.
-                // The coordinates are hard-coded to cover the entire screen.
-                // Mapping gl_VertexIndex to triangle coordinates
                 float x = float((gl_VertexIndex & 1) << 2) - 1.0;
                 float y = float((gl_VertexIndex & 2) << 1) - 1.0;
 
@@ -129,7 +119,6 @@ mod fs {
                     float border_width_px = 15.0 + sine_val * 10.0;
                     float alpha = (5.0 + sine_val * 150.0) / 255.0;
 
-                    // Convert to pixel coords
                     float px = tex_coords.x * pc.content_width;
                     float py = tex_coords.y * pc.content_height;
 
@@ -153,26 +142,12 @@ struct InFlight {
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
 }
 
-#[derive(Clone)]
-pub struct CaptureHandle {
-    tx: mpsc::Sender<()>,
-}
-
-impl CaptureHandle {
-    pub fn wake(&self) {
-        let _ = self.tx.send(());
-    }
-}
-
-pub struct Capture {
-    pub handle: CaptureHandle,
-    rx: mpsc::Receiver<()>,
+pub struct SwapchainRenderer {
     dc: DisplayCtx,
     last_committed_sizer: Option<Sizer>,
+    needs_recreate: bool,
 
     frame_idx: usize,
-
-    backend: Box<dyn CaptureBackend>,
 
     in_flight: Vec<InFlight>,
     images: Vec<Arc<Framebuffer>>,
@@ -190,76 +165,18 @@ pub struct Capture {
     start_time: Instant,
 }
 
-impl Capture {
+impl SwapchainRenderer {
     pub fn new(
-        dctx: DisplayCtx,
-        backend_builder: Box<dyn CaptureBackendBuilder>,
-        conn: &Connection,
-        opts: &CaptureOpts,
-    ) -> Result<(Self, Box<dyn InputBridge>)> {
-        let (instance, physical_device) =
-            vulkan::create_instance_and_select_device(backend_builder.as_ref())?;
-
-        let surface = unsafe {
-            Surface::from_wayland(
-                instance.clone(),
-                conn.backend().display_ptr() as _,
-                dctx.surface.id().as_ptr() as _,
-                None,
-            )?
-        };
-
-        let device_extensions = DeviceExtensions {
-            khr_swapchain: true,
-            khr_external_memory: true,
-            khr_external_memory_fd: true,
-            ext_external_memory_dma_buf: true,
-            khr_external_semaphore_fd: true,
-            khr_timeline_semaphore: true,
-            ..DeviceExtensions::empty()
-        };
-
-        let queue_family_index = physical_device
-            .queue_family_properties()
-            .iter()
-            .enumerate()
-            .position(|(i, q)| {
-                q.queue_flags.intersects(QueueFlags::GRAPHICS)
-                    && physical_device
-                        .surface_support(i as u32, &surface)
-                        .unwrap_or(false)
-            })
-            .map(|i| i as u32)
-            .context("No graphics queue family found on the device")?;
-        // eprintln!(
-        //     "Using device: {} (type: {:?})",
-        //     physical_device.properties().device_name,
-        //     physical_device.properties().device_type
-        // );
-
-        let (device, mut queues) = Device::new(
-            physical_device.clone(),
-            DeviceCreateInfo {
-                enabled_extensions: device_extensions,
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
-                enabled_features: DeviceFeatures {
-                    timeline_semaphore: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )?;
-
-        let queue = queues.next().unwrap();
+        dc: DisplayCtx,
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        surface: Arc<Surface>,
+    ) -> Result<Self> {
+        let physical_device = device.physical_device();
 
         let (swapchain, swapchain_images) = {
             let surface_capabilities =
                 physical_device.surface_capabilities(&surface, Default::default())?;
-            // let (image_format, _) = physical_device
-            //     .surface_formats(&surface, Default::default())?[0];
 
             Swapchain::new(
                 device.clone(),
@@ -332,7 +249,6 @@ impl Capture {
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )?;
-        let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
             Default::default(),
@@ -350,9 +266,6 @@ impl Capture {
                 ..Default::default()
             },
         )?;
-
-        let (backend, injector) =
-            backend_builder.build(device.clone(), allocator.clone(), &opts.display)?;
 
         let in_flight = (0..3)
             .map(|_| {
@@ -380,18 +293,13 @@ impl Capture {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (tx, rx) = mpsc::channel();
-        let handle = CaptureHandle { tx };
-
-        let this = Self {
-            handle,
-            rx,
-            dc: dctx,
+        Ok(Self {
+            dc,
             last_committed_sizer: None,
+            needs_recreate: false,
             frame_idx: 0,
-            backend,
             in_flight,
-            images: Self::build_framebuffers(&render_pass, swapchain_images)?,
+            images: Self::build_framebuffers(render_pass.clone(), swapchain_images)?,
             pipeline,
             sampler,
             render_pass,
@@ -402,64 +310,11 @@ impl Capture {
             device,
             _surface: surface,
             start_time: Instant::now(),
-        };
-        Ok((this, injector))
-    }
-
-    pub fn run(&mut self) {
-        let ph = self.dc.ph.clone();
-        ph.fatal(self.run_internal().context("capture thread"));
-    }
-
-    fn run_internal(&mut self) -> Result<()> {
-        // First frame: wait for wakeup, force-render a blank screen
-        self.rx.recv()?;
-        let sizer = self.dc.sizer.load();
-        self.resize_if_needed(&sizer)?;
-        self.render_blank(&sizer)?;
-
-        loop {
-            if !self.dc.global_state.load().capture {
-                match self.rx.recv_timeout(Duration::from_secs(1)) {
-                    Ok(()) => {
-                        while self.rx.try_recv().is_ok() {}
-                        let sizer = self.dc.sizer.load();
-                        self.resize_if_needed(&sizer)?;
-                        self.render_blank(&sizer)?;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                }
-                self.backend.idle()?;
-                continue;
-            }
-
-            let frame = self.backend.capture()?;
-            self.dc.ph.capture();
-            if self.dc.global_state.load().cursor_visible != frame.info.cursor_visible {
-                self.dc
-                    .global_state
-                    .rcu(|s| s.with_cursor_visible(frame.info.cursor_visible));
-            }
-
-            let mut has_wakeup = false;
-            while self.rx.try_recv().is_ok() {
-                has_wakeup = true;
-            }
-
-            if has_wakeup {
-                let sizer = self.dc.sizer.load();
-                self.resize_if_needed(&sizer)?;
-                self.render_frame(frame, &sizer)?;
-            } else {
-                self.dc.ph.capture_miss();
-                self.backend.release(frame, None);
-            }
-        }
+        })
     }
 
     fn build_framebuffers(
-        render_pass: &Arc<RenderPass>,
+        render_pass: Arc<RenderPass>,
         images: Vec<Arc<Image>>,
     ) -> Result<Vec<Arc<Framebuffer>>> {
         images
@@ -478,52 +333,45 @@ impl Capture {
             .collect()
     }
 
-    fn update_surface_state(&mut self, sizer: &Sizer) -> Result<()> {
-        if self.last_committed_sizer.as_ref() == Some(sizer) {
-            return Ok(());
-        }
-        self.last_committed_sizer = Some(sizer.clone());
-        let (w_w, w_h) = sizer.window_size;
-        let (r_w, r_h) = sizer.render_size;
-        self.dc
-            .viewport
-            .set_source(0.0, 0.0, r_w as f64, r_h as f64);
-        self.dc.viewport.set_destination(w_w as i32, w_h as i32);
-        let rect = sizer.window_sizing.content;
-        let region = Region::new(&self.dc.compositor_state).context("create region")?;
-        region.add(
-            rect.x as i32,
-            rect.y as i32,
-            rect.width as i32,
-            rect.height as i32,
-        );
-        self.dc.surface.set_opaque_region(Some(region.wl_region()));
-        self.dc.surface.set_input_region(Some(region.wl_region()));
-        Ok(())
-    }
-
-    fn resize_if_needed(&mut self, sizer: &Sizer) -> Result<()> {
+    fn configure(&mut self, sizer: &Sizer) -> Result<()> {
         let [sw, sh] = self.swapchain.image_extent();
-        if (sw, sh) != sizer.render_size {
-            self.resize(sizer)?;
+        if self.needs_recreate || (sw, sh) != sizer.render_size {
+            self.needs_recreate = false;
+            let (r_w, r_h) = sizer.render_size;
+            let (swapchain, images) = self.swapchain.recreate(SwapchainCreateInfo {
+                image_extent: [r_w, r_h],
+                ..self.swapchain.create_info()
+            })?;
+            self.swapchain = swapchain;
+            self.images = Self::build_framebuffers(self.render_pass.clone(), images)?;
         }
+
+        if self.last_committed_sizer.as_ref() != Some(sizer) {
+            self.last_committed_sizer = Some(sizer.clone());
+            let (w_w, w_h) = sizer.window_size;
+            let (r_w, r_h) = sizer.render_size;
+            self.dc
+                .viewport
+                .set_source(0.0, 0.0, r_w as f64, r_h as f64);
+            self.dc.viewport.set_destination(w_w as i32, w_h as i32);
+            let rect = sizer.window_sizing.content;
+            let region = Region::new(&self.dc.compositor_state).context("create region")?;
+            region.add(
+                rect.x as i32,
+                rect.y as i32,
+                rect.width as i32,
+                rect.height as i32,
+            );
+            self.dc.surface.set_opaque_region(Some(region.wl_region()));
+            self.dc.surface.set_input_region(Some(region.wl_region()));
+        }
+
         Ok(())
     }
 
-    pub fn resize(&mut self, sizer: &Sizer) -> Result<()> {
-        let (r_w, r_h) = sizer.render_size;
-        let (swapchain, images) = self.swapchain.recreate(SwapchainCreateInfo {
-            image_extent: [r_w, r_h],
-            ..self.swapchain.create_info()
-        })?;
-
-        self.swapchain = swapchain;
-        self.images = Self::build_framebuffers(&self.render_pass, images)?;
-        Ok(())
-    }
-
-    pub fn render_blank(&mut self, sizer: &Sizer) -> Result<()> {
-        self.update_surface_state(sizer)?;
+    pub fn blank(&mut self) -> Result<()> {
+        let sizer = self.dc.sizer.load();
+        self.configure(&sizer)?;
 
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
@@ -585,22 +433,21 @@ impl Capture {
 
         self.frame_idx += 1;
         if is_suboptimal || present_suboptimal {
-            info!("suboptimal, resizing");
-            self.resize(sizer)?;
+            info!("suboptimal");
+            self.needs_recreate = true;
         }
         Ok(())
     }
 
-    fn render_frame(&mut self, frame: CapturedFrame, sizer: &Sizer) -> Result<()> {
-        let frame_size = frame.image.extent();
+    pub fn render(&mut self, image: Arc<Image>, mut info: FrameInfo) -> Result<Arc<Fence>> {
+        let frame_size = image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
         if self.dc.sizer.load().source_size != frame_size {
             self.dc.sizer.rcu(|s| s.with_source_size(frame_size));
         }
 
-        let source_image = frame.image.clone();
-
-        self.update_surface_state(sizer)?;
+        let sizer = self.dc.sizer.load();
+        self.configure(&sizer)?;
 
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
@@ -648,7 +495,7 @@ impl Capture {
                         mip_levels: 0..1,
                         array_layers: 0..1,
                     },
-                    ..ImageMemoryBarrier::image(source_image.clone())
+                    ..ImageMemoryBarrier::image(image.clone())
                 }],
                 ..Default::default()
             })?;
@@ -695,10 +542,7 @@ impl Capture {
                     self.pipeline.layout().set_layouts()[0].clone(),
                     [
                         WriteDescriptorSet::sampler(0, self.sampler.clone()),
-                        WriteDescriptorSet::image_view(
-                            1,
-                            ImageView::new_default(source_image.clone())?,
-                        ),
+                        WriteDescriptorSet::image_view(1, ImageView::new_default(image.clone())?),
                     ],
                     [],
                 )?
@@ -716,7 +560,6 @@ impl Capture {
                 content_height: content.height as f32,
             };
             cmd.push_constants(self.pipeline.layout(), 0, &push_constants)?;
-            // Full-screen triangle via gl_VertexIndex in the VS
             cmd.draw(3, 1, 0, 0)?;
             cmd.end_render_pass(&Default::default())?;
             cmd.pipeline_barrier(&DependencyInfo {
@@ -752,7 +595,7 @@ impl Capture {
                         mip_levels: 0..1,
                         array_layers: 0..1,
                     },
-                    ..ImageMemoryBarrier::image(source_image.clone())
+                    ..ImageMemoryBarrier::image(image)
                 }],
                 ..Default::default()
             })?;
@@ -761,10 +604,8 @@ impl Capture {
 
         let command_buffer_handle = vec![command_buffer.handle()];
 
-        // Keep alive
         ifl.last_command_buffer = Some(command_buffer as Arc<dyn Send + Sync>);
 
-        // Build submit info
         let render_semaphore = [ifl.acquire.handle()];
         let present_semaphore = [ifl.present.handle()];
         let submit_info = ash::vk::SubmitInfo::default()
@@ -773,7 +614,6 @@ impl Capture {
             .wait_dst_stage_mask(&[ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
             .signal_semaphores(&present_semaphore);
 
-        let mut info = frame.info.clone();
         info.mark_commit();
         self.dc.request_feedback(info);
 
@@ -800,12 +640,12 @@ impl Capture {
                 .context("present")
         })?;
 
-        self.backend.release(frame, Some(ifl.fence.clone()));
+        let fence = ifl.fence.clone();
         self.frame_idx += 1;
         if is_suboptimal || present_suboptimal {
-            info!("suboptimal, resizing");
-            self.resize(sizer)?;
+            info!("suboptimal");
+            self.needs_recreate = true;
         }
-        Ok(())
+        Ok(fence)
     }
 }

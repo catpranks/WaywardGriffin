@@ -1,18 +1,20 @@
-use super::{CaptureBackend, CaptureBackendBuilder, CapturedFrame};
+use super::{CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
+use crate::GlobalState;
 use crate::OwningWlBuffer;
-use crate::capture::input::InputBridge;
+use crate::capture::SwapchainRenderer;
 use crate::capture::input::dummy::DummyInput;
-use crate::capture::plotter::FrameInfo;
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel, Channel};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, EventQueue, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{
     delegate_dmabuf, delegate_output, delegate_registry, registry_handlers,
@@ -20,7 +22,6 @@ use smithay_client_toolkit::{
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::time::Duration;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -38,27 +39,251 @@ use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client:
 use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1};
 use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1};
 
+pub struct Backend {
+    display: String,
+    feedback: DmabufFeedback,
+}
+
+impl Backend {
+    pub fn new(display: &str) -> Result<Self> {
+        let stream = UnixStream::connect(display)
+            .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
+        let conn = Connection::from_socket(stream)
+            .context("Failed to create Wayland connection from socket")?;
+
+        let (globals, mut event_queue) = registry_queue_init::<PreInitState>(&conn)?;
+        let qh = event_queue.handle();
+
+        let mut state = PreInitState {
+            registry_state: RegistryState::new(&globals),
+            dmabuf_state: DmabufState::new(&globals, &qh),
+            feedback: None,
+        };
+
+        state.dmabuf_state.get_default_feedback(&qh)?;
+        event_queue.roundtrip(&mut state)?;
+
+        let feedback = state
+            .feedback
+            .context("Compositor did not provide dmabuf feedback")?;
+
+        Ok(Self {
+            display: display.to_owned(),
+            feedback,
+        })
+    }
+}
+
+impl CaptureBackend for Backend {
+    fn device_id(&self) -> DeviceId {
+        let dev = self.feedback.main_device();
+        DeviceId::DevMajorMinor(nix::sys::stat::major(dev), nix::sys::stat::minor(dev))
+    }
+
+    fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
+        let injector = Box::new(DummyInput::new());
+        let (calloop_tx, calloop_rx) = calloop_channel::channel();
+        std::thread::spawn({
+            let display = self.display;
+            let ph = env.ph.clone();
+            move || {
+                ph.fatal(run(env, &display, calloop_rx).context("capture thread (wlr_screencopy)"));
+            }
+        });
+        Ok(SpawnResult {
+            injector,
+            wake: Box::new(move || {
+                let _ = calloop_tx.send(());
+            }),
+        })
+    }
+}
+
+// Minimal state for device_id pre-init
+struct PreInitState {
+    registry_state: RegistryState,
+    dmabuf_state: DmabufState,
+    feedback: Option<DmabufFeedback>,
+}
+
+impl ProvidesRegistryState for PreInitState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![];
+}
+
+impl DmabufHandler for PreInitState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_feedback(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _proxy: &ZwpLinuxDmabufFeedbackV1,
+        feedback: DmabufFeedback,
+    ) {
+        self.feedback = Some(feedback);
+    }
+
+    fn created(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _params: &ZwpLinuxBufferParamsV1,
+        _buffer: WlBuffer,
+    ) {
+    }
+
+    fn failed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _params: &ZwpLinuxBufferParamsV1,
+    ) {
+    }
+
+    fn released(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _buffer: &WlBuffer) {}
+}
+
+delegate_registry!(PreInitState);
+delegate_dmabuf!(PreInitState);
+
+// Main backend state for the calloop event loop
+
 struct State {
+    renderer: SwapchainRenderer,
+    ph: PlotterHandle,
+    global_state: GlobalState,
+    device: Arc<Device>,
+    allocator: Arc<StandardMemoryAllocator>,
+
     registry_state: RegistryState,
     output_state: OutputState,
     dmabuf_state: DmabufState,
     screencopy_manager: ZwlrScreencopyManagerV1,
-    feedback: Option<DmabufFeedback>,
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
+
     pending_linux_dmabuf: Option<(u32, u32, u32)>,
-    device: Option<Arc<Device>>,
-    allocator: Option<Arc<StandardMemoryAllocator>>,
     in_flight: Option<PooledBuffer>,
     pool: Vec<PooledBuffer>,
-    ready: Option<CapturedFrame>,
+
+    pending_frame: Option<PendingFrame>,
+    display_wants_frame: bool,
+    capture_in_flight: bool,
+    was_capturing: bool,
+    done: bool,
+}
+
+struct PendingFrame {
+    info: FrameInfo,
+    buf: PooledBuffer,
 }
 
 impl State {
-    fn start_capture(&self) {
+    fn start_capture(&mut self) {
+        if self.capture_in_flight {
+            return;
+        }
         let output = self.output.as_ref().unwrap();
         self.screencopy_manager
             .capture_output(1, output, &self.qh, ());
+        self.capture_in_flight = true;
+    }
+
+    fn is_capturing(&self) -> bool {
+        self.global_state.load().capture
+    }
+
+    fn handle_ready(&mut self, info: FrameInfo, mut buf: PooledBuffer) {
+        self.capture_in_flight = false;
+
+        if !self.is_capturing() {
+            self.pool.push(buf);
+            return;
+        }
+
+        self.ph.capture();
+
+        if self.global_state.load().cursor_visible != info.cursor_visible {
+            self.global_state
+                .rcu(|s| s.with_cursor_visible(info.cursor_visible));
+        }
+
+        if self.display_wants_frame {
+            self.display_wants_frame = false;
+            match self.renderer.render(buf.image.clone(), info) {
+                Ok(fence) => {
+                    buf.fence = Some(fence);
+                    self.pool.push(buf);
+                }
+                Err(e) => {
+                    self.pool.push(buf);
+                    tracing::error!("render failed: {e:#}");
+                }
+            }
+            self.start_capture();
+        } else {
+            if let Some(old) = self.pending_frame.take() {
+                self.ph.capture_miss();
+                self.pool.push(old.buf);
+            }
+            self.pending_frame = Some(PendingFrame { info, buf });
+            self.start_capture();
+        }
+    }
+
+    fn handle_failed(&mut self) {
+        self.capture_in_flight = false;
+
+        if self.is_capturing() {
+            self.start_capture();
+        }
+    }
+
+    fn handle_wakeup(&mut self) {
+        if !self.is_capturing() {
+            if let Err(e) = self.renderer.blank() {
+                tracing::error!("blank failed: {e:#}");
+            }
+
+            if self.was_capturing {
+                self.was_capturing = false;
+                if let Some(old) = self.pending_frame.take() {
+                    self.pool.push(old.buf);
+                }
+            }
+            return;
+        }
+
+        if !self.was_capturing {
+            self.was_capturing = true;
+            self.start_capture();
+        }
+
+        if let Some(mut pending) = self.pending_frame.take() {
+            match self
+                .renderer
+                .render(pending.buf.image.clone(), pending.info)
+            {
+                Ok(fence) => {
+                    pending.buf.fence = Some(fence);
+                    self.pool.push(pending.buf);
+                }
+                Err(e) => {
+                    self.pool.push(pending.buf);
+                    tracing::error!("render failed: {e:#}");
+                }
+            }
+            if !self.capture_in_flight {
+                self.start_capture();
+            }
+        } else {
+            self.display_wants_frame = true;
+        }
     }
 }
 
@@ -89,9 +314,8 @@ impl DmabufHandler for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _proxy: &ZwpLinuxDmabufFeedbackV1,
-        feedback: DmabufFeedback,
+        _feedback: DmabufFeedback,
     ) {
-        self.feedback = Some(feedback);
     }
 
     fn created(
@@ -161,8 +385,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     }
                     buf = Some(
                         PooledBuffer::new(
-                            state.device.as_ref().unwrap(),
-                            state.allocator.as_ref().unwrap().as_ref(),
+                            state.device.clone(),
+                            state.allocator.as_ref(),
                             &state.dmabuf_state,
                             &state.qh,
                             format,
@@ -184,32 +408,25 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 let buf = state.in_flight.take().unwrap();
                 // TODO: proper timing (start at capture_output, wait at fence, obtain here)
-                // and plotter capture/capture_miss counters
                 let now = std::time::Instant::now();
-                state.ready = Some(CapturedFrame {
-                    image: buf.image,
-                    info: FrameInfo {
-                        start: now,
-                        wait: now,
-                        obtain: now,
-                        commit: None,
-                        capture_mono_ns: 0,
-                        present: None,
-                        cursor_visible: true,
-                    },
-                    handle: Box::new(BufferHandle {
-                        wl_buffer: buf.wl_buffer,
-                    }),
-                });
+                let info = FrameInfo {
+                    start: now,
+                    wait: now,
+                    obtain: now,
+                    commit: None,
+                    capture_mono_ns: 0,
+                    present: None,
+                    cursor_visible: true,
+                };
                 frame.destroy();
+                state.handle_ready(info, buf);
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
-                // Return the in-flight buffer to the pool
                 if let Some(buf) = state.in_flight.take() {
                     state.pool.push(buf);
                 }
                 frame.destroy();
-                state.start_capture();
+                state.handle_failed();
             }
             _ => {}
         }
@@ -220,98 +437,81 @@ delegate_registry!(State);
 delegate_output!(State);
 delegate_dmabuf!(State);
 
-pub struct Builder {
-    conn: Connection,
-    event_queue: EventQueue<State>,
-    state: State,
-}
+fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
+    let CaptureEnv {
+        renderer,
+        ph,
+        global_state,
+        device,
+        allocator,
+    } = env;
+    let stream = UnixStream::connect(display)
+        .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
+    let conn = Connection::from_socket(stream)
+        .context("Failed to create Wayland connection from socket")?;
 
-impl Builder {
-    pub fn new(display: &str) -> Result<Self> {
-        let stream = UnixStream::connect(display)
-            .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
-        let conn = Connection::from_socket(stream)
-            .context("Failed to create Wayland connection from socket")?;
+    let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
+    let qh = event_queue.handle();
 
-        let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
-        let qh = event_queue.handle();
+    let screencopy_manager: ZwlrScreencopyManagerV1 = globals
+        .bind(&qh, 3..=3, ())
+        .context("zwlr_screencopy_manager_v1 v3 not available")?;
 
-        let screencopy_manager: ZwlrScreencopyManagerV1 = globals
-            .bind(&qh, 3..=3, ())
-            .context("zwlr_screencopy_manager_v1 v3 not available")?;
+    let mut state = State {
+        renderer,
+        ph,
+        global_state,
+        device,
+        allocator,
 
-        let mut state = State {
-            registry_state: RegistryState::new(&globals),
-            output_state: OutputState::new(&globals, &qh),
-            dmabuf_state: DmabufState::new(&globals, &qh),
-            screencopy_manager,
-            feedback: None,
-            qh: qh.clone(),
-            output: None,
-            pending_linux_dmabuf: None,
-            device: None,
-            allocator: None,
-            in_flight: None,
-            pool: Vec::new(),
-            ready: None,
-        };
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
+        dmabuf_state: DmabufState::new(&globals, &qh),
+        screencopy_manager,
+        qh: qh.clone(),
+        output: None,
 
-        event_queue.roundtrip(&mut state)?;
+        pending_linux_dmabuf: None,
+        in_flight: None,
+        pool: Vec::new(),
 
-        state.output = Some(
-            state
-                .output_state
-                .outputs()
-                .next()
-                .context("no outputs available")?
-                .clone(),
-        );
+        pending_frame: None,
+        display_wants_frame: false,
+        capture_in_flight: false,
+        was_capturing: false,
+        done: false,
+    };
 
-        state.dmabuf_state.get_default_feedback(&qh)?;
-        event_queue.roundtrip(&mut state)?;
+    event_queue.roundtrip(&mut state)?;
 
-        if state.feedback.is_none() {
-            bail!("Compositor did not provide dmabuf feedback");
-        }
+    state.output = Some(
+        state
+            .output_state
+            .outputs()
+            .next()
+            .context("no outputs available")?
+            .clone(),
+    );
 
-        Ok(Self {
-            conn,
-            event_queue,
-            state,
+    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+
+    WaylandSource::new(conn, event_queue)
+        .insert(event_loop.handle())
+        .map_err(|e| anyhow::anyhow!("{}", e.error))?;
+
+    event_loop
+        .handle()
+        .insert_source(calloop_rx, |event, _, state| match event {
+            calloop_channel::Event::Msg(()) => state.handle_wakeup(),
+            calloop_channel::Event::Closed => state.done = true,
         })
-    }
-}
+        .map_err(|e| anyhow::anyhow!("{}", e.error))?;
 
-impl CaptureBackendBuilder for Builder {
-    fn device_id(&self) -> super::DeviceId {
-        let dev = self.state.feedback.as_ref().unwrap().main_device();
-        super::DeviceId::DevMajorMinor(nix::sys::stat::major(dev), nix::sys::stat::minor(dev))
-    }
-
-    fn build(
-        self: Box<Self>,
-        device: Arc<Device>,
-        allocator: Arc<StandardMemoryAllocator>,
-        _display: &str,
-    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
-        let Self {
-            conn,
-            event_queue,
-            mut state,
-        } = *self;
-
-        state.device = Some(device);
-        state.allocator = Some(allocator);
-
-        let event_loop: EventLoop<State> = EventLoop::try_new()?;
-        WaylandSource::new(conn, event_queue)
-            .insert(event_loop.handle())
-            .map_err(|e| anyhow::anyhow!("{}", e.error))?;
-
-        Ok((
-            Box::new(Backend { event_loop, state }),
-            Box::new(DummyInput::new()),
-        ))
+    loop {
+        event_loop.dispatch(None, &mut state)?;
+        if state.done {
+            return Ok(());
+        }
     }
 }
 
@@ -323,7 +523,7 @@ struct PooledBuffer {
 
 impl PooledBuffer {
     fn new(
-        device: &Arc<Device>,
+        device: Arc<Device>,
         allocator: &impl MemoryAllocator,
         dmabuf_state: &DmabufState,
         qh: &QueueHandle<State>,
@@ -347,7 +547,7 @@ impl PooledBuffer {
 
         let req = raw_image.memory_requirements()[0];
         let alloc = DeviceMemory::allocate(
-            device.clone(),
+            device,
             MemoryAllocateInfo {
                 allocation_size: req.layout.size(),
                 memory_type_index: allocator
@@ -391,47 +591,5 @@ fn fourcc_to_format(fourcc: u32) -> Result<Format> {
         DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => Ok(Format::B8G8R8A8_SRGB),
         DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Ok(Format::R8G8B8A8_SRGB),
         other => bail!("unsupported fourcc: {other:?}"),
-    }
-}
-
-struct BufferHandle {
-    wl_buffer: OwningWlBuffer,
-}
-
-struct Backend {
-    event_loop: EventLoop<'static, State>,
-    state: State,
-}
-
-// SAFETY: EventLoop is !Send due to internal Rc, but Backend is moved to the
-// capture thread once and used exclusively there. No concurrent access.
-unsafe impl Send for Backend {}
-
-impl CaptureBackend for Backend {
-    fn capture(&mut self) -> Result<CapturedFrame> {
-        self.state.start_capture();
-
-        loop {
-            self.event_loop.dispatch(None, &mut self.state)?;
-            if let Some(frame) = self.state.ready.take() {
-                return Ok(frame);
-            }
-        }
-    }
-
-    fn release(&mut self, frame: CapturedFrame, fence: Option<Arc<Fence>>) {
-        let handle: BufferHandle = *frame.handle.downcast().expect("invalid handle type");
-        assert!(self.state.pool.len() < 4, "buffer pool bloated");
-        self.state.pool.push(PooledBuffer {
-            wl_buffer: handle.wl_buffer,
-            image: frame.image,
-            fence,
-        });
-    }
-
-    fn idle(&mut self) -> Result<()> {
-        self.event_loop
-            .dispatch(Some(Duration::ZERO), &mut self.state)?;
-        Ok(())
     }
 }

@@ -7,7 +7,7 @@ pub mod sizer;
 use crate::capture::plotter::{Plotter, PlotterHandle};
 use crate::capture::source::BackendType;
 use crate::sizer::{SharedSizer, Sizer};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
@@ -31,10 +31,6 @@ struct Opts {
     #[arg(long)]
     nocapture: bool,
 
-    /// Capture one frame and print to terminal via viuer
-    #[arg(long)]
-    oneshot: bool,
-
     #[command(flatten)]
     capture_opts: capture::CaptureOpts,
 }
@@ -50,10 +46,6 @@ pub fn run() -> Result<()> {
         _ => unsafe {
             std::env::remove_var("DISPLAY");
         },
-    }
-
-    if opts.oneshot {
-        return capture::oneshot::run(&opts.capture_opts);
     }
 
     let crate_name = env!("CARGO_PKG_NAME");
@@ -84,7 +76,9 @@ pub fn run() -> Result<()> {
     let ph = plotter.handle();
     let opts2 = opts.clone();
     let sizer2 = sizer.clone();
-    std::thread::spawn(move || display::run(opts2, global_state, ph, sizer2));
+    std::thread::spawn(move || {
+        ph.fatal(display::run(opts2, global_state, ph.clone(), sizer2).context("display thread"));
+    });
     plotter.run(opts.tdelay)
 }
 
