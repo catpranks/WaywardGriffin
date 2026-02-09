@@ -3,29 +3,29 @@ use cudarc::driver::sys::CUdeviceptr;
 use std::os::raw::c_int;
 use std::time::Duration;
 
-pub enum NvCaptureHandle {}
+enum NvCaptureHandle {}
 
-pub type NvFbcStatus = c_int;
-pub type NvFbcBool = c_int;
+type NvFbcStatus = c_int;
+type NvFbcBool = c_int;
 
 // From NvFBC.h
-pub const NVFBC_SUCCESS: NvFbcStatus = 0;
-pub const NVFBC_TRUE: NvFbcBool = 1;
+const NVFBC_SUCCESS: NvFbcStatus = 0;
+const NVFBC_TRUE: NvFbcBool = 1;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct RawFrameGrabInfo {
-    pub dw_width: u32,
-    pub dw_height: u32,
-    pub dw_byte_size: u32,
-    pub dw_current_frame: u32,
-    pub b_is_new_frame: NvFbcBool,
-    pub ul_timestamp_us: u64,
-    pub dw_missed_frames: u32,
-    pub b_required_post_processing: NvFbcBool,
-    pub b_direct_capture: NvFbcBool,
-    pub b_cursor_visible: NvFbcBool,
-    pub b_cursor_composited: NvFbcBool,
+    dw_width: u32,
+    dw_height: u32,
+    dw_byte_size: u32,
+    dw_current_frame: u32,
+    b_is_new_frame: NvFbcBool,
+    ul_timestamp_us: u64,
+    dw_missed_frames: u32,
+    b_required_post_processing: NvFbcBool,
+    b_direct_capture: NvFbcBool,
+    b_cursor_visible: NvFbcBool,
+    b_cursor_composited: NvFbcBool,
 }
 
 #[allow(dead_code)]
@@ -33,14 +33,14 @@ struct RawFrameGrabInfo {
 pub struct NvfbcFrameInfo {
     pub size: (u32, u32),
     pub byte_size: u32,
-    pub current_frame: u32,
-    pub is_new_frame: bool,
-    pub timestamp_us: u64,
-    pub missed_frames: u32,
-    pub required_post_processing: bool,
-    pub direct_capture: bool,
+    current_frame: u32,
+    is_new_frame: bool,
+    timestamp_us: u64,
+    missed_frames: u32,
+    required_post_processing: bool,
+    direct_capture: bool,
     pub cursor_visible: bool,
-    pub cursor_composited: bool,
+    cursor_composited: bool,
 }
 
 impl From<RawFrameGrabInfo> for NvfbcFrameInfo {

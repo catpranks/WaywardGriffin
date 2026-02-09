@@ -70,7 +70,7 @@ pub struct InputState {
 }
 
 impl App {
-    pub fn set_confined(&mut self, conn: &Connection, confined: bool) {
+    fn set_confined(&mut self, conn: &Connection, confined: bool) {
         if self.input.confined == confined {
             return;
         }

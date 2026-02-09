@@ -1,5 +1,5 @@
-pub mod nvfbc;
-pub mod wlr_screencopy;
+mod nvfbc;
+mod wlr_screencopy;
 
 use super::CaptureOpts;
 use super::SwapchainRenderer;
