@@ -3,7 +3,7 @@ use crate::GlobalState;
 use crate::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::dummy::DummyInput;
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::plotter::{FrameInfo, PlotterHandle, clock_monotonic_ns};
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -22,6 +22,7 @@ use smithay_client_toolkit::{
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::time::Instant;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -167,12 +168,28 @@ struct State {
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
 
-    pending_linux_dmabuf: Option<(u32, u32, u32)>,
-    in_flight: Option<Buffer>,
+    frame_state: Option<FrameState>,
     pool: Vec<Buffer>,
 
     mode: CaptureMode,
     done: Option<Result<()>>,
+}
+
+enum FrameState {
+    Requested {
+        start: Instant,
+    },
+    Described {
+        start: Instant,
+        format: u32,
+        width: u32,
+        height: u32,
+    },
+    Copying {
+        buf: Buffer,
+        start: Instant,
+        wait: Instant,
+    },
 }
 
 struct PendingFrame {
@@ -188,7 +205,10 @@ enum CaptureMode {
 }
 
 impl State {
-    fn issue_capture(&self) {
+    fn issue_capture(&mut self) {
+        self.frame_state = Some(FrameState::Requested {
+            start: Instant::now(),
+        });
         let output = self.output.as_ref().unwrap();
         self.screencopy_manager
             .capture_output(1, output, &self.qh, ());
@@ -257,10 +277,15 @@ impl State {
     }
 
     fn handle_buffer_done(&mut self, frame: &ZwlrScreencopyFrameV1) -> Result<()> {
-        let (format, width, height) = self
-            .pending_linux_dmabuf
-            .take()
-            .context("no LinuxDmabuf event before BufferDone")?;
+        let Some(FrameState::Described {
+            start,
+            format,
+            width,
+            height,
+        }) = self.frame_state.take()
+        else {
+            bail!("BufferDone without prior LinuxDmabuf");
+        };
         let vk_format = fourcc_to_format(format)?;
 
         let mut buf = self.pool.pop();
@@ -290,9 +315,10 @@ impl State {
         if let Some(fence) = buf.fence.take() {
             fence.wait(None)?;
         }
+        let wait = Instant::now();
 
         frame.copy(&buf.wl_buffer);
-        self.in_flight = Some(buf);
+        self.frame_state = Some(FrameState::Copying { buf, start, wait });
         Ok(())
     }
 
@@ -410,7 +436,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 width,
                 height,
             } => {
-                state.pending_linux_dmabuf = Some((format, width, height));
+                let start = match state.frame_state {
+                    Some(FrameState::Requested { start } | FrameState::Described { start, .. }) => {
+                        start
+                    }
+                    _ => return,
+                };
+                state.frame_state = Some(FrameState::Described {
+                    start,
+                    format,
+                    width,
+                    height,
+                });
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
                 if let Err(e) = state.handle_buffer_done(frame) {
@@ -418,18 +455,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 }
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                let Some(buf) = state.in_flight.take() else {
+                let Some(FrameState::Copying { buf, start, wait }) = state.frame_state.take()
+                else {
                     assert!(state.done.is_some());
                     return;
                 };
-                // TODO: proper timing (start at capture_output, wait at fence, obtain here)
-                let now = std::time::Instant::now();
+                let obtain = Instant::now();
                 let info = FrameInfo {
-                    start: now,
-                    wait: now,
-                    obtain: now,
+                    start,
+                    wait,
+                    obtain,
                     commit: None,
-                    capture_mono_ns: 0,
+                    capture_mono_ns: clock_monotonic_ns(),
                     present: None,
                     cursor_visible: true,
                 };
@@ -437,7 +474,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 state.handle_ready(info, buf);
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
-                if let Some(buf) = state.in_flight.take() {
+                if let Some(FrameState::Copying { buf, .. }) = state.frame_state.take() {
                     state.pool.push(buf);
                 }
                 frame.destroy();
@@ -486,8 +523,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         qh: qh.clone(),
         output: None,
 
-        pending_linux_dmabuf: None,
-        in_flight: None,
+        frame_state: None,
         pool: Vec::new(),
 
         mode: CaptureMode::Idle,
