@@ -173,7 +173,7 @@ struct State {
     pool: Vec<Buffer>,
 
     mode: CaptureMode,
-    done: bool,
+    done: Option<Result<()>>,
 }
 
 struct PendingFrame {
@@ -183,7 +183,7 @@ struct PendingFrame {
 
 enum CaptureMode {
     Idle,
-    Capturing,
+    AwaitingFrame,
     DisplayWaiting,
     FrameBuffered(PendingFrame),
 }
@@ -219,20 +219,19 @@ impl State {
 
         let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
         self.mode = match mode {
-            CaptureMode::DisplayWaiting => {
-                match self.renderer.render(buf.image.clone(), info) {
-                    Ok(fence) => {
-                        buf.fence = Some(fence);
-                        self.pool.push(buf);
-                    }
-                    Err(e) => {
-                        self.pool.push(buf);
-                        error!("render failed: {e:#}");
-                    }
+            CaptureMode::DisplayWaiting => match self.renderer.render(buf.image.clone(), info) {
+                Ok(fence) => {
+                    buf.fence = Some(fence);
+                    self.pool.push(buf);
+                    CaptureMode::AwaitingFrame
                 }
-                CaptureMode::Capturing
-            }
-            CaptureMode::Capturing => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
+                Err(e) => {
+                    self.pool.push(buf);
+                    error!("render failed: {e:#}");
+                    CaptureMode::DisplayWaiting
+                }
+            },
+            CaptureMode::AwaitingFrame => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
             CaptureMode::FrameBuffered(old) => {
                 self.ph.capture_miss();
                 self.pool.push(old.buf);
@@ -258,6 +257,46 @@ impl State {
         }
     }
 
+    fn handle_buffer_done(&mut self, frame: &ZwlrScreencopyFrameV1) -> Result<()> {
+        let (format, width, height) = self
+            .pending_linux_dmabuf
+            .take()
+            .context("no LinuxDmabuf event before BufferDone")?;
+        let vk_format = fourcc_to_format(format)?;
+
+        let mut buf = self.pool.pop();
+
+        let reuse = buf.as_ref().is_some_and(|b| {
+            let ext = b.image.extent();
+            b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
+        });
+        if !reuse {
+            if let Some(old) = &mut buf
+                && let Some(fence) = old.fence.take()
+            {
+                fence.wait(None)?;
+            }
+            buf = Some(Buffer::new(
+                self.device.clone(),
+                self.allocator.as_ref(),
+                &self.dmabuf_state,
+                &self.qh,
+                format,
+                width,
+                height,
+            )?);
+        }
+        let mut buf = buf.unwrap();
+
+        if let Some(fence) = buf.fence.take() {
+            fence.wait(None)?;
+        }
+
+        frame.copy(&buf.wl_buffer);
+        self.in_flight = Some(buf);
+        Ok(())
+    }
+
     fn handle_wakeup(&mut self) {
         if !self.is_capturing() {
             if let Err(e) = self.renderer.blank() {
@@ -279,15 +318,17 @@ impl State {
                 {
                     Ok(fence) => {
                         pending.buf.fence = Some(fence);
+                        self.pool.push(pending.buf);
+                        CaptureMode::AwaitingFrame
                     }
                     Err(e) => {
                         error!("render failed: {e:#}");
+                        self.pool.push(pending.buf);
+                        CaptureMode::DisplayWaiting
                     }
                 }
-                self.pool.push(pending.buf);
-                CaptureMode::Capturing
             }
-            CaptureMode::Capturing | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
+            CaptureMode::AwaitingFrame | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
         };
     }
 }
@@ -373,42 +414,9 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 state.pending_linux_dmabuf = Some((format, width, height));
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
-                let (format, width, height) = state.pending_linux_dmabuf.take().unwrap();
-                let vk_format = fourcc_to_format(format).unwrap();
-
-                let mut buf = state.pool.pop();
-
-                let reuse = buf.as_ref().is_some_and(|b| {
-                    let ext = b.image.extent();
-                    b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
-                });
-                if !reuse {
-                    if let Some(old) = &mut buf
-                        && let Some(fence) = old.fence.take()
-                    {
-                        fence.wait(None).unwrap();
-                    }
-                    buf = Some(
-                        Buffer::new(
-                            state.device.clone(),
-                            state.allocator.as_ref(),
-                            &state.dmabuf_state,
-                            &state.qh,
-                            format,
-                            width,
-                            height,
-                        )
-                        .unwrap(),
-                    );
+                if let Err(e) = state.handle_buffer_done(frame) {
+                    state.done = Some(Err(e));
                 }
-                let mut buf = buf.unwrap();
-
-                if let Some(fence) = buf.fence.take() {
-                    fence.wait(None).unwrap();
-                }
-
-                frame.copy(&buf.wl_buffer);
-                state.in_flight = Some(buf);
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 let buf = state.in_flight.take().unwrap();
@@ -481,7 +489,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         pool: Vec::new(),
 
         mode: CaptureMode::Idle,
-        done: false,
+        done: None,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -505,14 +513,14 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         .handle()
         .insert_source(calloop_rx, |event, _, state| match event {
             calloop_channel::Event::Msg(()) => state.handle_wakeup(),
-            calloop_channel::Event::Closed => state.done = true,
+            calloop_channel::Event::Closed => state.done = Some(Ok(())),
         })
         .map_err(|e| anyhow::anyhow!("{}", e.error))?;
 
     loop {
         event_loop.dispatch(None, &mut state)?;
-        if state.done {
-            return Ok(());
+        if let Some(result) = state.done.take() {
+            return result;
         }
     }
 }
