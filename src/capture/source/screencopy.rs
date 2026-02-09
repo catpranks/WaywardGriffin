@@ -3,7 +3,7 @@ use crate::GlobalState;
 use crate::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::dummy::DummyInput;
-use crate::capture::plotter::{FrameInfo, PlotterHandle, clock_monotonic_ns};
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -454,19 +454,26 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     state.done = Some(Err(e));
                 }
             }
-            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+            zwlr_screencopy_frame_v1::Event::Ready {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+            } => {
                 let Some(FrameState::Copying { buf, start, wait }) = state.frame_state.take()
                 else {
                     assert!(state.done.is_some());
                     return;
                 };
                 let obtain = Instant::now();
+                let capture_mono_ns = ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64)
+                    * 1_000_000_000
+                    + tv_nsec as u64;
                 let info = FrameInfo {
                     start,
                     wait,
                     obtain,
                     commit: None,
-                    capture_mono_ns: clock_monotonic_ns(),
+                    capture_mono_ns,
                     present: None,
                     cursor_visible: true,
                 };
