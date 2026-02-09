@@ -22,7 +22,6 @@ use smithay_client_toolkit::{
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use tracing::error;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -183,7 +182,7 @@ struct PendingFrame {
 
 enum CaptureMode {
     Idle,
-    AwaitingFrame,
+    Capturing,
     DisplayWaiting,
     FrameBuffered(PendingFrame),
 }
@@ -223,15 +222,15 @@ impl State {
                 Ok(fence) => {
                     buf.fence = Some(fence);
                     self.pool.push(buf);
-                    CaptureMode::AwaitingFrame
+                    CaptureMode::Capturing
                 }
                 Err(e) => {
                     self.pool.push(buf);
-                    error!("render failed: {e:#}");
-                    CaptureMode::DisplayWaiting
+                    self.done = Some(Err(e.context("render failed")));
+                    CaptureMode::Idle
                 }
             },
-            CaptureMode::AwaitingFrame => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
+            CaptureMode::Capturing => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
             CaptureMode::FrameBuffered(old) => {
                 self.ph.capture_miss();
                 self.pool.push(old.buf);
@@ -300,7 +299,7 @@ impl State {
     fn handle_wakeup(&mut self) {
         if !self.is_capturing() {
             if let Err(e) = self.renderer.blank() {
-                error!("blank failed: {e:#}");
+                self.done = Some(Err(e.context("render blank failed")));
             }
             return;
         }
@@ -319,16 +318,16 @@ impl State {
                     Ok(fence) => {
                         pending.buf.fence = Some(fence);
                         self.pool.push(pending.buf);
-                        CaptureMode::AwaitingFrame
+                        CaptureMode::Capturing
                     }
                     Err(e) => {
-                        error!("render failed: {e:#}");
                         self.pool.push(pending.buf);
-                        CaptureMode::DisplayWaiting
+                        self.done = Some(Err(e.context("render failed")));
+                        CaptureMode::Idle
                     }
                 }
             }
-            CaptureMode::AwaitingFrame | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
+            CaptureMode::Capturing | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
         };
     }
 }
@@ -419,7 +418,10 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 }
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                let buf = state.in_flight.take().unwrap();
+                let Some(buf) = state.in_flight.take() else {
+                    assert!(state.done.is_some());
+                    return;
+                };
                 // TODO: proper timing (start at capture_output, wait at fence, obtain here)
                 let now = std::time::Instant::now();
                 let info = FrameInfo {
