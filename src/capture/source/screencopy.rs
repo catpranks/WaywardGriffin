@@ -211,7 +211,7 @@ impl State {
         });
         let output = self.output.as_ref().unwrap();
         self.screencopy_manager
-            .capture_output(1, output, &self.qh, ());
+            .capture_output(/* overlay_cursor */ 1, output, &self.qh, ());
     }
 
     fn is_capturing(&self) -> bool {
@@ -465,9 +465,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     return;
                 };
                 let obtain = Instant::now();
-                let capture_mono_ns = ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64)
-                    * 1_000_000_000
-                    + tv_nsec as u64;
+                let capture_mono_ns =
+                    ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64) * 1_000_000_000 + tv_nsec as u64;
                 let info = FrameInfo {
                     start,
                     wait,
@@ -475,7 +474,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     commit: None,
                     capture_mono_ns,
                     present: None,
-                    cursor_visible: true,
+                    cursor_visible: false,
                 };
                 frame.destroy();
                 state.handle_ready(info, buf);
