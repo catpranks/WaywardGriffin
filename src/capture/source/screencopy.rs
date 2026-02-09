@@ -168,8 +168,8 @@ struct State {
     output: Option<WlOutput>,
 
     pending_linux_dmabuf: Option<(u32, u32, u32)>,
-    in_flight: Option<PooledBuffer>,
-    pool: Vec<PooledBuffer>,
+    in_flight: Option<Buffer>,
+    pool: Vec<Buffer>,
 
     mode: CaptureMode,
     done: bool,
@@ -177,7 +177,7 @@ struct State {
 
 struct PendingFrame {
     info: FrameInfo,
-    buf: PooledBuffer,
+    buf: Buffer,
 }
 
 enum Phase {
@@ -205,7 +205,7 @@ impl State {
         self.global_state.load().capture
     }
 
-    fn handle_ready(&mut self, info: FrameInfo, mut buf: PooledBuffer) {
+    fn handle_ready(&mut self, info: FrameInfo, mut buf: Buffer) {
         if !self.is_capturing() {
             self.pool.push(buf);
             if let CaptureMode::Active {
@@ -441,7 +441,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                         fence.wait(None).unwrap();
                     }
                     buf = Some(
-                        PooledBuffer::new(
+                        Buffer::new(
                             state.device.clone(),
                             state.allocator.as_ref(),
                             &state.dmabuf_state,
@@ -569,13 +569,13 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     }
 }
 
-struct PooledBuffer {
+struct Buffer {
     wl_buffer: OwningWlBuffer,
     image: Arc<Image>,
     fence: Option<Arc<Fence>>,
 }
 
-impl PooledBuffer {
+impl Buffer {
     fn new(
         device: Arc<Device>,
         allocator: &impl MemoryAllocator,

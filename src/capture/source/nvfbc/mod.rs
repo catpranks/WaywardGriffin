@@ -100,7 +100,7 @@ fn run(
     } = env;
     ctx.bind_to_thread()?;
     capturer.bind_thread()?;
-    let mut bufs: VecDeque<PooledBuffer> = VecDeque::new();
+    let mut bufs: VecDeque<Buffer> = VecDeque::new();
 
     // First frame: wait for wakeup, render blank
     rx.recv()?;
@@ -137,7 +137,7 @@ fn run(
             {
                 fence.wait(None)?;
             }
-            pooled = Some(PooledBuffer::new(
+            pooled = Some(Buffer::new(
                 device.clone(),
                 &allocator,
                 ctx.clone(),
@@ -258,13 +258,13 @@ impl Drop for CudaArray {
 unsafe impl Send for CudaArray {}
 unsafe impl Sync for CudaArray {}
 
-struct PooledBuffer {
+struct Buffer {
     cumem: CudaArray,
     image: Arc<Image>,
     fence: Option<Arc<Fence>>,
 }
 
-impl PooledBuffer {
+impl Buffer {
     fn new(
         device: Arc<Device>,
         allocator: &impl MemoryAllocator,
