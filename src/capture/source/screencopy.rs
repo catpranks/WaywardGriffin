@@ -22,6 +22,7 @@ use smithay_client_toolkit::{
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use tracing::error;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -180,18 +181,11 @@ struct PendingFrame {
     buf: Buffer,
 }
 
-enum Phase {
-    Balanced,
-    DisplayWaiting,
-    FrameBuffered(PendingFrame),
-}
-
 enum CaptureMode {
     Idle,
-    Active {
-        phase: Phase,
-        capture_in_flight: bool,
-    },
+    Capturing,
+    DisplayWaiting,
+    FrameBuffered(PendingFrame),
 }
 
 impl State {
@@ -208,10 +202,8 @@ impl State {
     fn handle_ready(&mut self, info: FrameInfo, mut buf: Buffer) {
         if !self.is_capturing() {
             self.pool.push(buf);
-            if let CaptureMode::Active {
-                phase: Phase::FrameBuffered(pending),
-                ..
-            } = std::mem::replace(&mut self.mode, CaptureMode::Idle)
+            if let CaptureMode::FrameBuffered(pending) =
+                std::mem::replace(&mut self.mode, CaptureMode::Idle)
             {
                 self.pool.push(pending.buf);
             }
@@ -225,14 +217,9 @@ impl State {
                 .rcu(|s| s.with_cursor_visible(info.cursor_visible));
         }
 
-        let CaptureMode::Active { phase, .. } =
-            std::mem::replace(&mut self.mode, CaptureMode::Idle)
-        else {
-            unreachable!("handle_ready called while Idle");
-        };
-
-        let new_phase = match phase {
-            Phase::DisplayWaiting => {
+        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
+        self.mode = match mode {
+            CaptureMode::DisplayWaiting => {
                 match self.renderer.render(buf.image.clone(), info) {
                     Ok(fence) => {
                         buf.fence = Some(fence);
@@ -240,107 +227,68 @@ impl State {
                     }
                     Err(e) => {
                         self.pool.push(buf);
-                        tracing::error!("render failed: {e:#}");
+                        error!("render failed: {e:#}");
                     }
                 }
-                Phase::Balanced
+                CaptureMode::Capturing
             }
-            Phase::Balanced => Phase::FrameBuffered(PendingFrame { info, buf }),
-            Phase::FrameBuffered(old) => {
+            CaptureMode::Capturing => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
+            CaptureMode::FrameBuffered(old) => {
                 self.ph.capture_miss();
                 self.pool.push(old.buf);
-                Phase::FrameBuffered(PendingFrame { info, buf })
+                CaptureMode::FrameBuffered(PendingFrame { info, buf })
             }
+            CaptureMode::Idle => unreachable!("handle_ready called while Idle"),
         };
-
         self.issue_capture();
-        self.mode = CaptureMode::Active {
-            phase: new_phase,
-            capture_in_flight: true,
-        };
     }
 
     fn handle_failed(&mut self) {
         let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
 
-        match (mode, self.is_capturing()) {
-            (CaptureMode::Active { phase, .. }, true) => {
-                self.issue_capture();
-                self.mode = CaptureMode::Active {
-                    phase,
-                    capture_in_flight: true,
-                };
-            }
-            (CaptureMode::Active { phase, .. }, false) => {
-                if let Phase::FrameBuffered(pending) = phase {
-                    self.pool.push(pending.buf);
-                }
-            }
-            (CaptureMode::Idle, _) => unreachable!("handle_failed called while Idle"),
+        if matches!(mode, CaptureMode::Idle) {
+            unreachable!("handle_failed called while Idle");
+        }
+
+        if self.is_capturing() {
+            self.issue_capture();
+            self.mode = mode;
+        } else if let CaptureMode::FrameBuffered(pending) = mode {
+            self.pool.push(pending.buf);
         }
     }
 
     fn handle_wakeup(&mut self) {
-        let capturing = self.is_capturing();
-        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
-
-        if !capturing {
-            if let CaptureMode::Active {
-                phase: Phase::FrameBuffered(pending),
-                ..
-            } = mode
-            {
-                self.pool.push(pending.buf);
-            }
+        if !self.is_capturing() {
             if let Err(e) = self.renderer.blank() {
-                tracing::error!("blank failed: {e:#}");
+                error!("blank failed: {e:#}");
             }
             return;
         }
 
-        match mode {
+        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
+        self.mode = match mode {
             CaptureMode::Idle => {
                 self.issue_capture();
-                self.mode = CaptureMode::Active {
-                    phase: Phase::DisplayWaiting,
-                    capture_in_flight: true,
-                };
+                CaptureMode::DisplayWaiting
             }
-            CaptureMode::Active {
-                phase,
-                mut capture_in_flight,
-            } => match phase {
-                Phase::FrameBuffered(mut pending) => {
-                    match self
-                        .renderer
-                        .render(pending.buf.image.clone(), pending.info)
-                    {
-                        Ok(fence) => {
-                            pending.buf.fence = Some(fence);
-                            self.pool.push(pending.buf);
-                        }
-                        Err(e) => {
-                            self.pool.push(pending.buf);
-                            tracing::error!("render failed: {e:#}");
-                        }
+            CaptureMode::FrameBuffered(mut pending) => {
+                match self
+                    .renderer
+                    .render(pending.buf.image.clone(), pending.info)
+                {
+                    Ok(fence) => {
+                        pending.buf.fence = Some(fence);
                     }
-                    if !capture_in_flight {
-                        self.issue_capture();
-                        capture_in_flight = true;
+                    Err(e) => {
+                        error!("render failed: {e:#}");
                     }
-                    self.mode = CaptureMode::Active {
-                        phase: Phase::Balanced,
-                        capture_in_flight,
-                    };
                 }
-                Phase::Balanced | Phase::DisplayWaiting => {
-                    self.mode = CaptureMode::Active {
-                        phase: Phase::DisplayWaiting,
-                        capture_in_flight,
-                    };
-                }
-            },
-        }
+                self.pool.push(pending.buf);
+                CaptureMode::Capturing
+            }
+            CaptureMode::Capturing | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
+        };
     }
 }
 
