@@ -2,10 +2,14 @@ use super::InputBridge;
 use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result};
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::{self, WlSeat};
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle, WEnum};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsFd;
+use tracing::{error, info, warn};
 
 use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
@@ -33,11 +37,14 @@ impl WaylandInput {
 
         let vkbd = vk_mgr.create_virtual_keyboard(&seat, &qh, ());
         let vptr = vp_mgr.create_virtual_pointer(Some(&seat), &qh, ());
+        let keyboard = seat.get_keyboard(&qh, ());
 
         let mut state = State {
             registry_state: RegistryState::new(&globals),
-            _vkbd: vkbd,
+            vkbd,
             _vptr: vptr,
+            _keyboard: keyboard,
+            last_keymap: None,
         };
 
         event_queue.roundtrip(&mut state)?;
@@ -50,7 +57,7 @@ impl WaylandInput {
                     match event_queue.blocking_dispatch(&mut state) {
                         Ok(_) => {}
                         Err(e) => {
-                            tracing::error!("wayland input: {e}");
+                            error!("wayland input: {e}");
                             break;
                         }
                     }
@@ -93,8 +100,10 @@ impl InputBridge for WaylandInput {
 
 struct State {
     registry_state: RegistryState,
-    _vkbd: ZwpVirtualKeyboardV1,
+    vkbd: ZwpVirtualKeyboardV1,
     _vptr: ZwlrVirtualPointerV1,
+    _keyboard: WlKeyboard,
+    last_keymap: Option<Vec<u8>>,
 }
 
 impl ProvidesRegistryState for State {
@@ -115,6 +124,36 @@ impl Dispatch<WlSeat, ()> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Keymap { format, fd, size } = event
+            && let WEnum::Value(wl_keyboard::KeymapFormat::XkbV1) = format
+        {
+            let file = std::fs::File::from(fd);
+            let mut buf = vec![0u8; size as usize];
+            if let Err(e) = file.read_exact_at(&mut buf, 0) {
+                warn!("failed to read keymap fd: {e}");
+                return;
+            }
+            if state.last_keymap.as_deref() == Some(&buf[..]) {
+                return;
+            }
+            info!("forwarding keymap ({size} bytes) to virtual keyboard");
+            state
+                .vkbd
+                .keymap(wl_keyboard::KeymapFormat::XkbV1 as u32, file.as_fd(), size);
+            state.last_keymap = Some(buf);
+        }
     }
 }
 
