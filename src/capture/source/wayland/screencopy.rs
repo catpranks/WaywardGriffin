@@ -52,7 +52,7 @@ impl State {
                 &self.dmabuf_state,
                 &self.qh,
                 format,
-                vec![],
+                vec![0],
                 width,
                 height,
             )?);
