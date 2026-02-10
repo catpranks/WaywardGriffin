@@ -81,16 +81,20 @@ impl CaptureBackend for Backend {
     fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
         let injector = Box::new(WaylandInput::new(&self.display)?);
         let (calloop_tx, calloop_rx) = calloop_channel::channel();
-        std::thread::spawn({
-            let display = self.display;
-            let backend = env.backend;
-            let ph = env.ph.clone();
-            move || {
-                ph.fatal(
-                    run(env, &display, calloop_rx).context(format!("capture thread ({backend:?})")),
-                );
-            }
-        });
+        std::thread::Builder::new()
+            .name("capture-wayland".into())
+            .spawn({
+                let display = self.display;
+                let backend = env.backend;
+                let ph = env.ph.clone();
+                move || {
+                    ph.fatal(
+                        run(env, &display, calloop_rx)
+                            .context(format!("capture thread ({backend:?})")),
+                    );
+                }
+            })
+            .unwrap();
         Ok(SpawnResult {
             injector,
             wake: Box::new(move || {

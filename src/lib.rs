@@ -76,9 +76,14 @@ pub fn run() -> Result<()> {
     let ph = plotter.handle();
     let opts2 = opts.clone();
     let sizer2 = sizer.clone();
-    std::thread::spawn(move || {
-        ph.fatal(display::run(opts2, global_state, ph.clone(), sizer2).context("display thread"));
-    });
+    std::thread::Builder::new()
+        .name("display".into())
+        .spawn(move || {
+            ph.fatal(
+                display::run(opts2, global_state, ph.clone(), sizer2).context("display thread"),
+            );
+        })
+        .unwrap();
     plotter.run(opts.tdelay)
 }
 

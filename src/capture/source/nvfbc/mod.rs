@@ -62,12 +62,17 @@ impl CaptureBackend for Backend {
     fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
         let injector = Box::new(XInput::new(&self.display)?);
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn({
-            let ph = env.ph.clone();
-            move || {
-                ph.fatal(run(self.ctx, self.capturer, env, rx).context("capture thread (nvfbc)"));
-            }
-        });
+        std::thread::Builder::new()
+            .name("capture-nvfbc".into())
+            .spawn({
+                let ph = env.ph.clone();
+                move || {
+                    ph.fatal(
+                        run(self.ctx, self.capturer, env, rx).context("capture thread (nvfbc)"),
+                    );
+                }
+            })
+            .unwrap();
         Ok(SpawnResult {
             injector,
             wake: Box::new(move || {
