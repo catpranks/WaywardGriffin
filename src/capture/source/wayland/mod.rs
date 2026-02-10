@@ -27,6 +27,7 @@ use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::info;
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
@@ -487,16 +488,24 @@ struct Buffer {
 }
 
 impl Buffer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: Arc<Device>,
         allocator: &impl MemoryAllocator,
         dmabuf_state: &DmabufState,
         qh: &QueueHandle<State>,
         format: u32,
+        modifiers: Vec<u64>,
         width: u32,
         height: u32,
     ) -> Result<Self> {
         let vk_format = fourcc_to_format(format)?;
+
+        let tiling = if modifiers.is_empty() {
+            ImageTiling::Linear
+        } else {
+            ImageTiling::DrmFormatModifier
+        };
 
         let raw_image = RawImage::new(
             device.clone(),
@@ -505,10 +514,23 @@ impl Buffer {
                 extent: [width, height, 1],
                 usage: ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
                 external_memory_handle_types: ExternalMemoryHandleTypes::DMA_BUF,
-                tiling: ImageTiling::Linear,
+                tiling,
+                drm_format_modifiers: modifiers,
                 ..Default::default()
             },
         )?;
+
+        let (modifier, layout_aspect) =
+            if let Some((modifier, _planes)) = raw_image.drm_format_modifier() {
+                info!(
+                    "buffer: {:?} modifier {:#x}",
+                    DrmFourcc::try_from(format).ok(),
+                    modifier,
+                );
+                (modifier, ImageAspect::MemoryPlane0)
+            } else {
+                (0, ImageAspect::Color)
+            };
 
         let req = raw_image.memory_requirements()[0];
         let alloc = DeviceMemory::allocate(
@@ -525,7 +547,7 @@ impl Buffer {
         )?;
 
         let fd = alloc.export_fd(ExternalMemoryHandleType::DmaBuf)?;
-        let layout = raw_image.subresource_layout(ImageAspect::Color, 0, 0)?;
+        let layout = raw_image.subresource_layout(layout_aspect, 0, 0)?;
 
         let image = Arc::new(
             raw_image
@@ -534,7 +556,13 @@ impl Buffer {
         );
 
         let params = dmabuf_state.create_params(qh)?;
-        params.add(fd.as_fd(), 0, 0, layout.row_pitch as u32, 0);
+        params.add(
+            fd.as_fd(),
+            0,
+            layout.offset as u32,
+            layout.row_pitch as u32,
+            modifier,
+        );
         let (wl_buffer, _params) = params.create_immed(
             width as i32,
             height as i32,

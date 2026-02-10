@@ -1,6 +1,7 @@
-use super::{Buffer, CaptureMode, FrameState, State, fourcc_to_format};
+use super::{Buffer, CaptureMode, FrameState, State};
 use crate::capture::plotter::FrameInfo;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
+use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle, WEnum};
 use std::time::Instant;
 use tracing::info;
@@ -62,13 +63,35 @@ impl State {
         }
         let width = c.width;
         let height = c.height;
+
+        // Prefer ABGR/XBGR; fall back to ARGB/XRGB (wlroots adds those as fallbacks).
+        let entry = c
+            .formats
+            .iter()
+            .find(|e| {
+                matches!(
+                    DrmFourcc::try_from(e.format),
+                    Ok(DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888)
+                )
+            })
+            .or_else(|| {
+                c.formats.iter().find(|e| {
+                    matches!(
+                        DrmFourcc::try_from(e.format),
+                        Ok(DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888)
+                    )
+                })
+            })
+            .context("no usable format in imagecopy caps")?;
+        let fourcc = entry.format;
+        let modifiers = entry.modifiers.clone();
+
         let start = Instant::now();
 
         let mut buf = self.pool.pop();
-        let vk_format = fourcc_to_format(format)?;
         let reuse = buf.as_ref().is_some_and(|b| {
             let ext = b.image.extent();
-            b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
+            (ext[0], ext[1]) == (width, height)
         });
         if !reuse {
             if let Some(old) = &mut buf
@@ -81,7 +104,8 @@ impl State {
                 self.allocator.as_ref(),
                 &self.dmabuf_state,
                 &self.qh,
-                format,
+                fourcc,
+                modifiers,
                 width,
                 height,
             )?);
@@ -92,6 +116,7 @@ impl State {
         }
         let wait = Instant::now();
 
+        let ic = self.image_copy.as_ref().unwrap();
         let frame = ic.session.create_frame(&self.qh, ());
         frame.attach_buffer(&buf.wl_buffer);
         frame.damage_buffer(0, 0, width as i32, height as i32);

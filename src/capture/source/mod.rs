@@ -113,6 +113,7 @@ pub fn setup_and_spawn(
         ext_external_memory_dma_buf: true,
         khr_external_semaphore_fd: true,
         khr_timeline_semaphore: true,
+        ext_image_drm_format_modifier: true,
         ..DeviceExtensions::empty()
     };
 
