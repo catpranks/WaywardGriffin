@@ -1,3 +1,4 @@
+mod image_copy;
 mod screencopy;
 
 use super::{BackendType, CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
@@ -6,8 +7,10 @@ use crate::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::dummy::DummyInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use anyhow::ensure;
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
+use image_copy::ImageCopyState;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
@@ -40,6 +43,8 @@ use vulkano::sync::fence::Fence;
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1};
 use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
+use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1};
+use smithay_client_toolkit::reexports::protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
 
 pub struct Backend {
     display: String,
@@ -169,6 +174,7 @@ struct State {
     output_state: OutputState,
     dmabuf_state: DmabufState,
     screencopy_manager: Option<ZwlrScreencopyManagerV1>,
+    image_copy: Option<ImageCopyState>,
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
 
@@ -212,6 +218,8 @@ impl State {
     fn issue_capture(&mut self) {
         if self.screencopy_manager.is_some() {
             self.screencopy_issue_capture();
+        } else if self.image_copy.is_some() {
+            self.image_copy_issue_capture();
         }
     }
 
@@ -407,6 +415,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         output_state: OutputState::new(&globals, &qh),
         dmabuf_state: DmabufState::new(&globals, &qh),
         screencopy_manager,
+        image_copy: None,
         qh: qh.clone(),
         output: None,
 
@@ -419,14 +428,49 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
 
     event_queue.roundtrip(&mut state)?;
 
-    state.output = Some(
-        state
-            .output_state
-            .outputs()
-            .next()
-            .context("no outputs available")?
-            .clone(),
-    );
+    let output = state
+        .output_state
+        .outputs()
+        .next()
+        .context("no outputs available")?
+        .clone();
+    state.output = Some(output.clone());
+
+    if !use_screencopy {
+        let capture_manager: ExtImageCopyCaptureManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .context("ext_image_copy_capture_manager_v1 not available")?;
+        let source_manager: ExtOutputImageCaptureSourceManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .context("ext_output_image_capture_source_manager_v1 not available")?;
+        let source = source_manager.create_source(&output, &qh, ());
+        let session = capture_manager.create_session(
+            &source,
+            ext_image_copy_capture_manager_v1::Options::PaintCursors,
+            &qh,
+            (),
+        );
+        state.image_copy = Some(ImageCopyState {
+            session,
+            _source: source,
+            width: 0,
+            height: 0,
+            format: 0,
+            capture_mono_ns: 0,
+        });
+        // Roundtrip to collect session constraints (buffer_size, dmabuf_format, done)
+        event_queue.roundtrip(&mut state)?;
+
+        let ic = state.image_copy.as_ref().unwrap();
+        ensure!(
+            ic.width > 0 && ic.height > 0,
+            "image-copy session did not provide buffer_size"
+        );
+        ensure!(
+            ic.format != 0,
+            "image-copy session did not provide a usable dmabuf format"
+        );
+    }
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
 

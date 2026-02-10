@@ -41,5 +41,8 @@ C code in `src/c/nvcapture.c` compiled via build.rs (cc crate).
 
 - Capture and display are independent: capture backend connects to the *source* (X11, Wayland compositor to capture from, etc.), display thread connects to the *destination* compositor. These are separate connections, possibly to entirely different systems. Don't conflate them.
 - No cross-vendor DMA-BUF: can't export Nvidia buffer to AMD iGPU directly
-- Wayland syncobj protocol incompatible with Vulkan timeline semaphores (spec bug)
-- NVFBC blocking capture timing is inconsistent (250-700us in windowed, oscillates in fullscreen)
+
+# Tasks
+
+- [ ] Modifiers parsing negotiation for ext-image-copy
+- [ ] Safety render on timeout even without wakeup

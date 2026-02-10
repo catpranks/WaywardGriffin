@@ -23,7 +23,7 @@ use vulkano::swapchain::Surface;
 pub enum BackendType {
     Nvfbc,
     Screencopy,
-    ImageCopy,
+    Imagecopy,
     Kms,
 }
 
@@ -59,7 +59,7 @@ pub fn setup_and_spawn(
 ) -> Result<SpawnResult> {
     let backend: Box<dyn CaptureBackend> = match opts.backend {
         BackendType::Nvfbc => Box::new(nvfbc::Backend::new(&opts.display)?),
-        BackendType::Screencopy | BackendType::ImageCopy => {
+        BackendType::Screencopy | BackendType::Imagecopy => {
             Box::new(wayland::Backend::new(&opts.display)?)
         }
         BackendType::Kms => todo!("kms backend"),
