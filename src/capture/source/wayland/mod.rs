@@ -453,10 +453,6 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
             (),
         );
         state.image_copy = Some(ImageCopyState::new(session, source));
-
-        // Flush session caps (BufferSize, DmabufFormat, Done) before entering the event loop,
-        // otherwise the first wakeup may try to capture before formats are known.
-        event_queue.roundtrip(&mut state)?;
     }
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
@@ -472,6 +468,8 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
             calloop_channel::Event::Closed => state.done = Some(Ok(())),
         })
         .map_err(|e| anyhow::anyhow!("{}", e.error))?;
+
+    state.renderer.blank()?;
 
     loop {
         event_loop.dispatch(None, &mut state)?;
