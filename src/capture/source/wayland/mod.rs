@@ -1,3 +1,4 @@
+mod dmabuf_probe;
 mod image_copy;
 mod screencopy;
 
@@ -50,6 +51,12 @@ use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zw
 use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1};
 use smithay_client_toolkit::reexports::protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
 
+fn connect(display: &str) -> Result<Connection> {
+    let stream = UnixStream::connect(display)
+        .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
+    Connection::from_socket(stream).context("Failed to create Wayland connection from socket")
+}
+
 pub struct Backend {
     display: String,
     feedback: DmabufFeedback,
@@ -57,27 +64,7 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(display: &str) -> Result<Self> {
-        let stream = UnixStream::connect(display)
-            .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
-        let conn = Connection::from_socket(stream)
-            .context("Failed to create Wayland connection from socket")?;
-
-        let (globals, mut event_queue) = registry_queue_init::<PreInitState>(&conn)?;
-        let qh = event_queue.handle();
-
-        let mut state = PreInitState {
-            registry_state: RegistryState::new(&globals),
-            dmabuf_state: DmabufState::new(&globals, &qh),
-            feedback: None,
-        };
-
-        state.dmabuf_state.get_default_feedback(&qh)?;
-        event_queue.roundtrip(&mut state)?;
-
-        let feedback = state
-            .feedback
-            .context("Compositor did not provide dmabuf feedback")?;
-
+        let feedback = dmabuf_probe::query_dmabuf_feedback(display)?;
         Ok(Self {
             display: display.to_owned(),
             feedback,
@@ -112,58 +99,6 @@ impl CaptureBackend for Backend {
         })
     }
 }
-
-// Minimal state for device_id pre-init
-struct PreInitState {
-    registry_state: RegistryState,
-    dmabuf_state: DmabufState,
-    feedback: Option<DmabufFeedback>,
-}
-
-impl ProvidesRegistryState for PreInitState {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![];
-}
-
-impl DmabufHandler for PreInitState {
-    fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.dmabuf_state
-    }
-
-    fn dmabuf_feedback(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _proxy: &ZwpLinuxDmabufFeedbackV1,
-        feedback: DmabufFeedback,
-    ) {
-        self.feedback = Some(feedback);
-    }
-
-    fn created(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _params: &ZwpLinuxBufferParamsV1,
-        _buffer: WlBuffer,
-    ) {
-    }
-
-    fn failed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _params: &ZwpLinuxBufferParamsV1,
-    ) {
-    }
-
-    fn released(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _buffer: &WlBuffer) {}
-}
-
-delegate_registry!(PreInitState);
-delegate_dmabuf!(PreInitState);
 
 // Main backend state for the calloop event loop
 
@@ -398,10 +333,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         backend,
     } = env;
     let use_screencopy = backend == BackendType::Screencopy;
-    let stream = UnixStream::connect(display)
-        .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
-    let conn = Connection::from_socket(stream)
-        .context("Failed to create Wayland connection from socket")?;
+    let conn = connect(display)?;
 
     let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
     let qh = event_queue.handle();
