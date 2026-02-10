@@ -209,7 +209,8 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
                     commit: None,
                     capture_mono_ns,
                     present: None,
-                    cursor_visible: true,
+                    // TODO: start using create_pointer_cursor_session
+                    cursor_visible: false,
                 };
                 frame.destroy();
                 state.handle_ready(info, buf);
