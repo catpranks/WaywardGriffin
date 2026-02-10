@@ -1,4 +1,4 @@
-use super::{Buffer, CaptureMode, FrameState, State};
+use super::{Buffer, CaptureMode, FrameState, State, fourcc_to_format};
 use crate::capture::plotter::FrameInfo;
 use anyhow::{Context as _, Result, anyhow};
 use drm_fourcc::DrmFourcc;
@@ -55,36 +55,8 @@ impl State {
     fn image_copy_issue_capture_inner(&mut self) -> Result<()> {
         let ic = self.image_copy.as_ref().unwrap();
         let c = &ic.caps;
-        // Caps may not be available yet if the session Done event hasn't
-        // arrived. Return without error; the Done handler will issue the
-        // capture.
-        if c.formats.is_empty() {
-            return Ok(());
-        }
         let width = c.width;
         let height = c.height;
-
-        // Prefer ABGR/XBGR; fall back to ARGB/XRGB (wlroots adds those as fallbacks).
-        let entry = c
-            .formats
-            .iter()
-            .find(|e| {
-                matches!(
-                    DrmFourcc::try_from(e.format),
-                    Ok(DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888)
-                )
-            })
-            .or_else(|| {
-                c.formats.iter().find(|e| {
-                    matches!(
-                        DrmFourcc::try_from(e.format),
-                        Ok(DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888)
-                    )
-                })
-            })
-            .context("no usable format in imagecopy caps")?;
-        let fourcc = entry.format;
-        let modifiers = entry.modifiers.clone();
 
         let start = Instant::now();
 
@@ -94,6 +66,20 @@ impl State {
             (ext[0], ext[1]) == (width, height)
         });
         if !reuse {
+            // Caps may not be available yet if the session Done event hasn't
+            // arrived. Return without error; the Done handler will issue the
+            // capture.
+            if c.formats.is_empty() {
+                return Ok(());
+            }
+            let entry = c
+                .formats
+                .iter()
+                .find(|e| fourcc_to_format(e.format).is_ok())
+                .context("no usable format in imagecopy caps")?;
+            let fourcc = entry.format;
+            let modifiers = entry.modifiers.clone();
+
             if let Some(old) = &mut buf
                 && let Some(fence) = old.fence.take()
             {
@@ -165,6 +151,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
                     .chunks_exact(8)
                     .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
                     .collect();
+                info!(
+                    "{format:x} {:?} {parsed_modifiers:x?}",
+                    DrmFourcc::try_from(format)
+                );
                 ic.pending_caps.formats.push(DmabufFormatEntry {
                     format,
                     modifiers: parsed_modifiers,

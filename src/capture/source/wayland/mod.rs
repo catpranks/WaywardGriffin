@@ -524,9 +524,8 @@ impl Buffer {
             // VkImageDrmFormatModifierListCreateInfoEXT into pNext.
             // Create the VkImage ourselves and wrap it.
             let handle = {
-                let mut modifier_list =
-                    ash::vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-                        .drm_format_modifiers(&modifiers);
+                let mut modifier_list = ash::vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+                    .drm_format_modifiers(&modifiers);
                 let mut external_mem = ash::vk::ExternalMemoryImageCreateInfo::default()
                     .handle_types(ash::vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
                 let create_info_vk = ash::vk::ImageCreateInfo::default()
@@ -542,8 +541,7 @@ impl Buffer {
                     .samples(ash::vk::SampleCountFlags::TYPE_1)
                     .tiling(ash::vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
                     .usage(
-                        ash::vk::ImageUsageFlags::TRANSFER_SRC
-                            | ash::vk::ImageUsageFlags::SAMPLED,
+                        ash::vk::ImageUsageFlags::TRANSFER_SRC | ash::vk::ImageUsageFlags::SAMPLED,
                     )
                     .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
                     .initial_layout(ash::vk::ImageLayout::UNDEFINED)
