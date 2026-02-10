@@ -1,4 +1,4 @@
-use super::{Buffer, FrameState, State, fourcc_to_format};
+use super::{Buffer, CaptureMode, FrameState, State, fourcc_to_format};
 use crate::capture::plotter::FrameInfo;
 use anyhow::{Result, anyhow};
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle, WEnum};
@@ -12,15 +12,36 @@ use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::c
 use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1};
 use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1};
 
+struct DmabufFormatEntry {
+    format: u32,
+    modifiers: Vec<u64>,
+}
+
+#[derive(Default)]
+struct ImageCopyCaps {
+    width: u32,
+    height: u32,
+    formats: Vec<DmabufFormatEntry>,
+}
+
 pub struct ImageCopyState {
-    pub session: ExtImageCopyCaptureSessionV1,
-    pub _source: ExtImageCaptureSourceV1,
-    // Session-level buffer constraints, populated by session events
-    pub width: u32,
-    pub height: u32,
-    pub format: u32,
-    // Accumulator for presentation_time (arrives before ready)
-    pub capture_mono_ns: u64,
+    session: ExtImageCopyCaptureSessionV1,
+    _source: ExtImageCaptureSourceV1,
+    caps: ImageCopyCaps,
+    pending_caps: ImageCopyCaps,
+    capture_mono_ns: u64,
+}
+
+impl ImageCopyState {
+    pub fn new(session: ExtImageCopyCaptureSessionV1, source: ExtImageCaptureSourceV1) -> Self {
+        Self {
+            session,
+            _source: source,
+            caps: Default::default(),
+            pending_caps: Default::default(),
+            capture_mono_ns: 0,
+        }
+    }
 }
 
 impl State {
@@ -32,13 +53,22 @@ impl State {
 
     fn image_copy_issue_capture_inner(&mut self) -> Result<()> {
         let ic = self.image_copy.as_ref().unwrap();
+        let c = &ic.caps;
+        // Caps may not be available yet if the session Done event hasn't
+        // arrived. Return without error; the Done handler will issue the
+        // capture.
+        if c.formats.is_empty() {
+            return Ok(());
+        }
+        let width = c.width;
+        let height = c.height;
         let start = Instant::now();
 
         let mut buf = self.pool.pop();
-        let vk_format = fourcc_to_format(ic.format)?;
+        let vk_format = fourcc_to_format(format)?;
         let reuse = buf.as_ref().is_some_and(|b| {
             let ext = b.image.extent();
-            b.image.format() == vk_format && (ext[0], ext[1]) == (ic.width, ic.height)
+            b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
         });
         if !reuse {
             if let Some(old) = &mut buf
@@ -51,9 +81,9 @@ impl State {
                 self.allocator.as_ref(),
                 &self.dmabuf_state,
                 &self.qh,
-                ic.format,
-                ic.width,
-                ic.height,
+                format,
+                width,
+                height,
             )?);
         }
         let mut buf = buf.unwrap();
@@ -64,7 +94,7 @@ impl State {
 
         let frame = ic.session.create_frame(&self.qh, ());
         frame.attach_buffer(&buf.wl_buffer);
-        frame.damage_buffer(0, 0, ic.width as i32, ic.height as i32);
+        frame.damage_buffer(0, 0, width as i32, height as i32);
         frame.capture();
 
         self.frame_state = Some(FrameState::Copying { buf, start, wait });
@@ -98,18 +128,37 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
         };
         match event {
             ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
-                // Constraints are being (re-)sent. Reset format so we accept
-                // the next dmabuf_format, and clear stale buffers.
-                ic.format = 0;
-                ic.width = width;
-                ic.height = height;
-                state.pool.clear();
+                ic.pending_caps.width = width;
+                ic.pending_caps.height = height;
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { device } => {
+                let dev = u64::from_ne_bytes(device[..8].try_into().unwrap());
+                info!("imagecopy dmabuf device {dev:#x}");
             }
             ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
-                info!("format {format:x} modifiers {modifiers:x?}");
-                // Take the first format we can map to Vulkan
-                if ic.format == 0 && fourcc_to_format(format).is_ok() {
-                    ic.format = format;
+                let parsed_modifiers = modifiers
+                    .chunks_exact(8)
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                ic.pending_caps.formats.push(DmabufFormatEntry {
+                    format,
+                    modifiers: parsed_modifiers,
+                });
+            }
+            ext_image_copy_capture_session_v1::Event::Done => {
+                let caps = std::mem::take(&mut ic.pending_caps);
+                ic.caps.width = caps.width;
+                ic.caps.height = caps.height;
+                if !caps.formats.is_empty() {
+                    ic.caps.formats = caps.formats;
+                }
+                state.pool.clear();
+
+                // If a capture was deferred because caps weren't ready yet,
+                // issue it now.
+                if matches!(state.mode, CaptureMode::DisplayWaiting) && state.frame_state.is_none()
+                {
+                    state.image_copy_issue_capture();
                 }
             }
             ext_image_copy_capture_session_v1::Event::Stopped => {

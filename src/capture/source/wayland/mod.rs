@@ -7,7 +7,6 @@ use crate::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::dummy::DummyInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
-use anyhow::ensure;
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use image_copy::ImageCopyState;
@@ -220,6 +219,8 @@ impl State {
             self.screencopy_issue_capture();
         } else if self.image_copy.is_some() {
             self.image_copy_issue_capture();
+        } else {
+            unreachable!();
         }
     }
 
@@ -450,26 +451,11 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
             &qh,
             (),
         );
-        state.image_copy = Some(ImageCopyState {
-            session,
-            _source: source,
-            width: 0,
-            height: 0,
-            format: 0,
-            capture_mono_ns: 0,
-        });
-        // Roundtrip to collect session constraints (buffer_size, dmabuf_format, done)
-        event_queue.roundtrip(&mut state)?;
+        state.image_copy = Some(ImageCopyState::new(session, source));
 
-        let ic = state.image_copy.as_ref().unwrap();
-        ensure!(
-            ic.width > 0 && ic.height > 0,
-            "image-copy session did not provide buffer_size"
-        );
-        ensure!(
-            ic.format != 0,
-            "image-copy session did not provide a usable dmabuf format"
-        );
+        // Flush session caps (BufferSize, DmabufFormat, Done) before entering the event loop,
+        // otherwise the first wakeup may try to capture before formats are known.
+        event_queue.roundtrip(&mut state)?;
     }
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;

@@ -45,4 +45,5 @@ C code in `src/c/nvcapture.c` compiled via build.rs (cc crate).
 # Tasks
 
 - [ ] Modifiers parsing negotiation for ext-image-copy
+  - deprioritize DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 because wlroots adds them as fallbacks
 - [ ] Safety render on timeout even without wakeup
