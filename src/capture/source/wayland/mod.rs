@@ -7,13 +7,15 @@ use crate::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::dummy::DummyInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use anyhow::anyhow;
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
 use image_copy::ImageCopyState;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel, Channel};
+use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
@@ -26,7 +28,7 @@ use smithay_client_toolkit::{
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::info;
 use vulkano::device::Device;
 use vulkano::format::Format;
@@ -183,6 +185,7 @@ struct State {
 
     mode: CaptureMode,
     done: Option<Result<()>>,
+    loop_handle: LoopHandle<'static, State>,
 }
 
 enum FrameState {
@@ -280,8 +283,16 @@ impl State {
         }
 
         if self.is_capturing() {
-            self.issue_capture();
             self.mode = mode;
+            if let Err(e) = self.loop_handle.insert_source(
+                Timer::from_duration(Duration::from_millis(100)),
+                |_, _, state| {
+                    state.issue_capture();
+                    TimeoutAction::Drop
+                },
+            ) {
+                self.done = Some(Err(anyhow!("failed to insert retry timer: {e}")));
+            }
         } else if let CaptureMode::FrameBuffered(pending) = mode {
             self.pool.push(pending.buf);
         }
@@ -396,6 +407,8 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
     let qh = event_queue.handle();
 
+    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+
     let screencopy_manager: Option<ZwlrScreencopyManagerV1> = if use_screencopy {
         Some(
             globals
@@ -426,6 +439,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
 
         mode: CaptureMode::Idle,
         done: None,
+        loop_handle: event_loop.handle(),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -455,11 +469,9 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         state.image_copy = Some(ImageCopyState::new(session, source));
     }
 
-    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
-
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
-        .map_err(|e| anyhow::anyhow!("{}", e.error))?;
+        .map_err(|e| anyhow!("{}", e.error))?;
 
     event_loop
         .handle()
@@ -467,7 +479,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
             calloop_channel::Event::Msg(()) => state.handle_wakeup(),
             calloop_channel::Event::Closed => state.done = Some(Ok(())),
         })
-        .map_err(|e| anyhow::anyhow!("{}", e.error))?;
+        .map_err(|e| anyhow!("{}", e.error))?;
 
     state.renderer.blank()?;
 
