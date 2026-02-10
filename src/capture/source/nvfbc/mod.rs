@@ -106,17 +106,17 @@ fn run(
     // First frame: wait for wakeup, render blank
     rx.recv()?;
     renderer.blank()?;
+    let mut last_render = Instant::now();
 
     loop {
         if !global_state.load().capture {
             match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(()) => {
-                    drain(&rx);
-                    renderer.blank()?;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
+            drain(&rx);
+            renderer.blank()?;
+            last_render = Instant::now();
             continue;
         }
 
@@ -192,9 +192,11 @@ fn run(
             global_state.rcu(|s| s.with_cursor_visible(info.cursor_visible));
         }
 
-        if drain(&rx) {
+        let woke = drain(&rx);
+        if woke || last_render.elapsed() >= Duration::from_secs(1) {
             let fence = renderer.render(pooled.image.clone(), frame_info)?;
             pooled.fence = Some(fence);
+            last_render = Instant::now();
         } else {
             ph.capture_miss();
         }

@@ -188,6 +188,7 @@ struct State {
     mode: CaptureMode,
     done: Option<Result<()>>,
     loop_handle: LoopHandle<'static, State>,
+    last_render: Instant,
 }
 
 enum FrameState {
@@ -234,7 +235,23 @@ impl State {
         self.global_state.load().capture
     }
 
-    fn handle_ready(&mut self, info: FrameInfo, mut buf: Buffer) {
+    fn do_render(&mut self, mut buf: Buffer, info: FrameInfo) -> CaptureMode {
+        match self.renderer.render(buf.image.clone(), info) {
+            Ok(fence) => {
+                buf.fence = Some(fence);
+                self.pool.push(buf);
+                self.last_render = Instant::now();
+                CaptureMode::Capturing
+            }
+            Err(e) => {
+                self.pool.push(buf);
+                self.done = Some(Err(e.context("render failed")));
+                CaptureMode::Idle
+            }
+        }
+    }
+
+    fn handle_ready(&mut self, info: FrameInfo, buf: Buffer) {
         if !self.is_capturing() {
             self.pool.push(buf);
             if let CaptureMode::FrameBuffered(pending) =
@@ -253,20 +270,15 @@ impl State {
         }
 
         let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
+        let safety = self.last_render.elapsed() >= Duration::from_secs(1);
         self.mode = match mode {
-            CaptureMode::DisplayWaiting => match self.renderer.render(buf.image.clone(), info) {
-                Ok(fence) => {
-                    buf.fence = Some(fence);
-                    self.pool.push(buf);
-                    CaptureMode::Capturing
-                }
-                Err(e) => {
-                    self.pool.push(buf);
-                    self.done = Some(Err(e.context("render failed")));
-                    CaptureMode::Idle
-                }
-            },
+            CaptureMode::DisplayWaiting => self.do_render(buf, info),
+            CaptureMode::Capturing if safety => self.do_render(buf, info),
             CaptureMode::Capturing => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
+            CaptureMode::FrameBuffered(old) if safety => {
+                self.pool.push(old.buf);
+                self.do_render(buf, info)
+            }
             CaptureMode::FrameBuffered(old) => {
                 self.ph.capture_miss();
                 self.pool.push(old.buf);
@@ -305,6 +317,7 @@ impl State {
             if let Err(e) = self.renderer.blank() {
                 self.done = Some(Err(e.context("render blank failed")));
             }
+            self.last_render = Instant::now();
             return;
         }
 
@@ -314,23 +327,7 @@ impl State {
                 self.issue_capture();
                 CaptureMode::DisplayWaiting
             }
-            CaptureMode::FrameBuffered(mut pending) => {
-                match self
-                    .renderer
-                    .render(pending.buf.image.clone(), pending.info)
-                {
-                    Ok(fence) => {
-                        pending.buf.fence = Some(fence);
-                        self.pool.push(pending.buf);
-                        CaptureMode::Capturing
-                    }
-                    Err(e) => {
-                        self.pool.push(pending.buf);
-                        self.done = Some(Err(e.context("render failed")));
-                        CaptureMode::Idle
-                    }
-                }
-            }
+            CaptureMode::FrameBuffered(pending) => self.do_render(pending.buf, pending.info),
             CaptureMode::Capturing | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
         };
     }
@@ -442,6 +439,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         mode: CaptureMode::Idle,
         done: None,
         loop_handle: event_loop.handle(),
+        last_render: Instant::now(),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -486,9 +484,13 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     state.renderer.blank()?;
 
     loop {
-        event_loop.dispatch(None, &mut state)?;
+        event_loop.dispatch(Some(Duration::from_secs(1)), &mut state)?;
         if let Some(result) = state.done.take() {
             return result;
+        }
+        if !state.is_capturing() && state.last_render.elapsed() >= Duration::from_secs(1) {
+            state.renderer.blank()?;
+            state.last_render = Instant::now();
         }
     }
 }
