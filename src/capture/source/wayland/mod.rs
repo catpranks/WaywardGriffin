@@ -4,10 +4,11 @@ mod screencopy;
 
 use super::{BackendType, CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
 use crate::GlobalState;
-use crate::OwningWlBuffer;
+use crate::utils::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::wayland::WaylandInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::utils::wayland_connect;
 use anyhow::anyhow;
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
@@ -28,7 +29,6 @@ use smithay_client_toolkit::{
 };
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd as _;
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -51,11 +51,6 @@ use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zw
 use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1};
 use smithay_client_toolkit::reexports::protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
 
-pub fn connect(display: &str) -> Result<Connection> {
-    let stream = UnixStream::connect(display)
-        .with_context(|| format!("Failed to connect to Wayland socket: {display}"))?;
-    Connection::from_socket(stream).context("Failed to create Wayland connection from socket")
-}
 
 pub struct Backend {
     display: String,
@@ -337,7 +332,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         backend,
     } = env;
     let use_screencopy = backend == BackendType::Screencopy;
-    let conn = connect(display)?;
+    let conn = wayland_connect(display)?;
 
     let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
     let qh = event_queue.handle();

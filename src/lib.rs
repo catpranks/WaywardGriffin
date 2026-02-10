@@ -3,6 +3,7 @@
 mod capture;
 mod display;
 pub mod sizer;
+mod utils;
 
 use crate::capture::plotter::{Plotter, PlotterHandle};
 use crate::capture::source::BackendType;
@@ -10,7 +11,6 @@ use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
-use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -146,23 +146,3 @@ impl Drop for PlotterWriter {
     }
 }
 
-pub struct OwningWlBuffer(pub WlBuffer);
-
-impl std::ops::Deref for OwningWlBuffer {
-    type Target = WlBuffer;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for OwningWlBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for OwningWlBuffer {
-    fn drop(&mut self) {
-        self.0.destroy();
-    }
-}

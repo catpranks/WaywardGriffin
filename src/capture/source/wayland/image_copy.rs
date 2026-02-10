@@ -1,5 +1,6 @@
 use super::{Buffer, CaptureMode, FrameState, State, fourcc_to_format};
 use crate::capture::plotter::FrameInfo;
+use crate::utils::compose_timestamp;
 use anyhow::{Context as _, Result, anyhow};
 use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle, WEnum};
@@ -200,9 +201,7 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
                 tv_nsec,
             } => {
                 if let Some(ic) = &mut state.image_copy {
-                    ic.capture_mono_ns = ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64)
-                        * 1_000_000_000
-                        + tv_nsec as u64;
+                    ic.capture_mono_ns = compose_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec);
                 }
             }
             ext_image_copy_capture_frame_v1::Event::Ready => {

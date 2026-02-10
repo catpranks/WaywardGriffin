@@ -1,5 +1,6 @@
 use super::{Buffer, FrameState, State, fourcc_to_format};
 use crate::capture::plotter::FrameInfo;
+use crate::utils::compose_timestamp;
 use anyhow::{Result, bail};
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
 use std::time::Instant;
@@ -126,8 +127,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     return;
                 };
                 let obtain = Instant::now();
-                let capture_mono_ns =
-                    ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64) * 1_000_000_000 + tv_nsec as u64;
+                let capture_mono_ns = compose_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec);
                 let info = FrameInfo {
                     start,
                     wait,

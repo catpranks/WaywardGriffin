@@ -1,6 +1,7 @@
 mod input;
 
-use crate::capture::plotter::{FrameInfo, PlotterHandle, clock_monotonic_ns};
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::utils::clock_monotonic_ns;
 use crate::capture::source;
 use crate::display::input::InputState;
 use crate::sizer::SharedSizer;

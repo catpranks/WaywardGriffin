@@ -1,5 +1,5 @@
 mod nvfbc;
-pub mod wayland;
+mod wayland;
 
 use super::CaptureOpts;
 use super::SwapchainRenderer;

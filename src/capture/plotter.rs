@@ -11,10 +11,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-pub fn clock_monotonic_ns() -> u64 {
-    let ts = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).unwrap();
-    ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64
-}
 
 #[derive(Debug)]
 enum PlotEvent {

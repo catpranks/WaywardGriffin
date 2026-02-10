@@ -1,5 +1,5 @@
 use super::InputBridge;
-use crate::capture::source::wayland::connect;
+use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result};
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::{self, WlSeat};
@@ -16,7 +16,7 @@ pub struct WaylandInput;
 
 impl WaylandInput {
     pub fn new(display: &str) -> Result<Self> {
-        let conn = connect(display)?;
+        let conn = wayland_connect(display)?;
 
         let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
         let qh = event_queue.handle();

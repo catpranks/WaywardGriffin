@@ -1,4 +1,4 @@
-use super::connect;
+use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::reexports::client::QueueHandle;
@@ -12,7 +12,7 @@ use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client:
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 
 pub fn query_dmabuf_feedback(display: &str) -> Result<DmabufFeedback> {
-    let conn = connect(display)?;
+    let conn = wayland_connect(display)?;
 
     let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
     let qh = event_queue.handle();

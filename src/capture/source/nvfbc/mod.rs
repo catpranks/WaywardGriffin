@@ -3,7 +3,8 @@ mod nvcapture;
 use self::nvcapture::NvCapture;
 use super::{CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
 use crate::capture::input::xinput::XInput;
-use crate::capture::plotter::{FrameInfo, clock_monotonic_ns};
+use crate::capture::plotter::FrameInfo;
+use crate::utils::clock_monotonic_ns;
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
