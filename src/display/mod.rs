@@ -1,10 +1,10 @@
 mod input;
 
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
-use crate::utils::clock_monotonic_ns;
 use crate::capture::source;
 use crate::display::input::InputState;
 use crate::sizer::SharedSizer;
+use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};
 use anyhow::{Result, anyhow, bail};
 use copypasta::wayland_clipboard;
@@ -451,7 +451,7 @@ pub fn run(
         pending_feedback: Arc::new(Mutex::new(VecDeque::new())),
         qh: qh.clone(),
     };
-    let source::SpawnResult { injector, wake: ch } =
+    let source::SpawnResult { bridge, wake: ch } =
         source::setup_and_spawn(&opts.capture_opts, dc.clone(), &conn)?;
 
     // Initialize clipboards
@@ -495,7 +495,7 @@ pub fn run(
             keyboard_focus: false,
             wl_primary,
             wl_clipboard,
-            bridge: injector,
+            bridge,
         },
 
         // Window State

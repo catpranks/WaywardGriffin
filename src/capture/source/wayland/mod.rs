@@ -4,10 +4,10 @@ mod screencopy;
 
 use super::{BackendType, CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
 use crate::GlobalState;
-use crate::utils::OwningWlBuffer;
 use crate::capture::SwapchainRenderer;
 use crate::capture::input::wayland::WaylandInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::utils::OwningWlBuffer;
 use crate::utils::wayland_connect;
 use anyhow::anyhow;
 use anyhow::{Context as _, Result, bail};
@@ -51,7 +51,6 @@ use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zw
 use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1};
 use smithay_client_toolkit::reexports::protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
 
-
 pub struct Backend {
     display: String,
     feedback: DmabufFeedback,
@@ -74,7 +73,7 @@ impl CaptureBackend for Backend {
     }
 
     fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
-        let injector = Box::new(WaylandInput::new(&self.display, env.sizer.clone())?);
+        let bridge = Box::new(WaylandInput::new(&self.display, env.sizer.clone())?);
         let (calloop_tx, calloop_rx) = calloop_channel::channel();
         std::thread::Builder::new()
             .name("capture-wayland".into())
@@ -91,7 +90,7 @@ impl CaptureBackend for Backend {
             })
             .unwrap();
         Ok(SpawnResult {
-            injector,
+            bridge,
             wake: Box::new(move || {
                 let _ = calloop_tx.send(());
             }),

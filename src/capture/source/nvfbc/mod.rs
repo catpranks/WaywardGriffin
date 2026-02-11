@@ -61,7 +61,7 @@ impl CaptureBackend for Backend {
     }
 
     fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
-        let injector = Box::new(XInput::new(&self.display)?);
+        let bridgde = Box::new(XInput::new(&self.display)?);
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("capture-nvfbc".into())
@@ -75,7 +75,7 @@ impl CaptureBackend for Backend {
             })
             .unwrap();
         Ok(SpawnResult {
-            injector,
+            bridge: bridgde,
             wake: Box::new(move || {
                 let _ = tx.send(());
             }),

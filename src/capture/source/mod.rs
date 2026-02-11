@@ -44,7 +44,7 @@ pub struct CaptureEnv {
 }
 
 pub struct SpawnResult {
-    pub injector: Box<dyn InputBridge>,
+    pub bridge: Box<dyn InputBridge>,
     pub wake: Box<dyn Fn() + Send>,
 }
 
