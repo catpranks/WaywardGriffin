@@ -15,6 +15,15 @@ pub trait InputBridge: Send {
     fn scroll_stop(&mut self, _horizontal: bool, _vertical: bool) -> Result<()> {
         Ok(())
     }
+    fn update_modifiers(
+        &mut self,
+        _depressed: u32,
+        _latched: u32,
+        _locked: u32,
+        _group: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     fn get_primary(&mut self) -> Option<String> {
         None

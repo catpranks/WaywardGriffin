@@ -416,11 +416,23 @@ impl KeyboardHandler for App {
         _: &wl_keyboard::WlKeyboard,
         _serial: u32,
         modifiers: Modifiers,
-        _raw_modifiers: RawModifiers,
-        _layout: u32,
+        raw_modifiers: RawModifiers,
+        layout: u32,
     ) {
         // info!("Update modifiers: {modifiers:?}");
         self.input.modifiers = modifiers;
+        if self.input.confined {
+            const MOD4_MASK: u32 = 1 << 6;
+            self.input
+                .bridge
+                .update_modifiers(
+                    raw_modifiers.depressed & !MOD4_MASK,
+                    raw_modifiers.latched & !MOD4_MASK,
+                    raw_modifiers.locked & !MOD4_MASK,
+                    layout,
+                )
+                .unwrap();
+        }
     }
 }
 

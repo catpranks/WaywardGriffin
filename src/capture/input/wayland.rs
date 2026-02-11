@@ -163,6 +163,17 @@ impl InputBridge for WaylandInput {
         self.vptr.frame();
         self.flush()
     }
+
+    fn update_modifiers(
+        &mut self,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    ) -> Result<()> {
+        self.vkbd.modifiers(depressed, latched, locked, group);
+        self.flush()
+    }
 }
 
 struct State {
