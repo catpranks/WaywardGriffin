@@ -225,6 +225,7 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
                     present: None,
                     // TODO: start using create_pointer_cursor_session
                     cursor_visible: false,
+                    safety: false,
                 };
                 frame.destroy();
                 state.handle_ready(info, buf);

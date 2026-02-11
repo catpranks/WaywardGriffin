@@ -184,7 +184,7 @@ impl State {
         }
     }
 
-    fn handle_ready(&mut self, info: FrameInfo, buf: Buffer) {
+    fn handle_ready(&mut self, mut info: FrameInfo, buf: Buffer) {
         if !self.is_capturing() {
             self.pool.push(buf);
             if let CaptureMode::FrameBuffered(pending) =
@@ -206,9 +206,13 @@ impl State {
         let safety = self.last_render.elapsed() >= Duration::from_secs(1);
         self.mode = match mode {
             CaptureMode::DisplayWaiting => self.do_render(buf, info),
-            CaptureMode::Capturing if safety => self.do_render(buf, info),
+            CaptureMode::Capturing if safety => {
+                info.safety = true;
+                self.do_render(buf, info)
+            }
             CaptureMode::Capturing => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
             CaptureMode::FrameBuffered(old) if safety => {
+                info.safety = true;
                 self.pool.push(old.buf);
                 self.do_render(buf, info)
             }

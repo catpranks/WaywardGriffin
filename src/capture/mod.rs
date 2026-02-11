@@ -615,7 +615,9 @@ impl SwapchainRenderer {
             .signal_semaphores(&present_semaphore);
 
         info.mark_commit();
-        self.dc.request_feedback(info);
+        if !info.safety {
+            self.dc.request_feedback(info);
+        }
 
         let present_suboptimal = self.queue.with(|mut guard| unsafe {
             (self.device.fns().v1_0.queue_submit)(

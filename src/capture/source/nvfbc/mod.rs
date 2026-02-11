@@ -185,22 +185,22 @@ fn run(
 
         ph.capture();
 
-        let frame_info = FrameInfo {
-            start,
-            wait,
-            obtain,
-            commit: None,
-            capture_mono_ns,
-            present: None,
-            cursor_visible: info.cursor_visible,
-        };
-
         if global_state.load().cursor_visible != info.cursor_visible {
             global_state.rcu(|s| s.with_cursor_visible(info.cursor_visible));
         }
 
         let woke = drain(&rx);
         if woke || last_render.elapsed() >= Duration::from_secs(1) {
+            let frame_info = FrameInfo {
+                start,
+                wait,
+                obtain,
+                commit: None,
+                capture_mono_ns,
+                present: None,
+                cursor_visible: info.cursor_visible,
+                safety: !woke,
+            };
             let fence = renderer.render(pooled.image.clone(), frame_info)?;
             pooled.fence = Some(fence);
             last_render = Instant::now();

@@ -129,6 +129,7 @@ pub struct FrameInfo {
     pub capture_mono_ns: u64,
     pub present: Option<Duration>,
     pub cursor_visible: bool,
+    pub safety: bool,
 }
 
 impl FrameInfo {

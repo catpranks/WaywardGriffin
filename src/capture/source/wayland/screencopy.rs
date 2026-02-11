@@ -136,6 +136,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     capture_mono_ns,
                     present: None,
                     cursor_visible: false,
+                    safety: false,
                 };
                 frame.destroy();
                 state.handle_ready(info, buf);
