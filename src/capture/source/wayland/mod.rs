@@ -73,7 +73,11 @@ impl CaptureBackend for Backend {
     }
 
     fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
-        let bridge = Box::new(WaylandInput::new(&self.display, env.sizer.clone())?);
+        let bridge = Box::new(WaylandInput::new(
+            &self.display,
+            env.sizer.clone(),
+            env.ph.clone(),
+        )?);
         let (calloop_tx, calloop_rx) = calloop_channel::channel();
         std::thread::Builder::new()
             .name("capture-wayland".into())
