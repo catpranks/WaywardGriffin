@@ -6,7 +6,7 @@ use anyhow::Result;
 
 pub trait InputBridge: Send {
     fn mouse_delta(&mut self, x: f64, y: f64) -> Result<()>;
-    fn mouse_absolute(&mut self, x: i32, y: i32) -> Result<()>;
+    fn mouse_absolute(&mut self, x: u32, y: u32) -> Result<()>;
     fn mouse_press(&mut self, button: u32) -> Result<()>;
     fn mouse_release(&mut self, button: u32) -> Result<()>;
     fn key_press(&mut self, keycode: u32) -> Result<()>;

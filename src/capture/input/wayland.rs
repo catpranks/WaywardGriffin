@@ -96,10 +96,9 @@ impl InputBridge for WaylandInput {
         self.flush()
     }
 
-    fn mouse_absolute(&mut self, x: i32, y: i32) -> Result<()> {
+    fn mouse_absolute(&mut self, x: u32, y: u32) -> Result<()> {
         let (sw, sh) = self.sizer.load().source_size;
-        self.vptr
-            .motion_absolute(self.millis(), x as u32, y as u32, sw, sh);
+        self.vptr.motion_absolute(self.millis(), x, y, sw, sh);
         self.vptr.frame();
         self.flush()
     }

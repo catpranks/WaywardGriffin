@@ -16,7 +16,7 @@ impl InputBridge for DummyInput {
         Ok(())
     }
 
-    fn mouse_absolute(&mut self, _x: i32, _y: i32) -> Result<()> {
+    fn mouse_absolute(&mut self, _x: u32, _y: u32) -> Result<()> {
         Ok(())
     }
 

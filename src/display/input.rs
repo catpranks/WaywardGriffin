@@ -263,7 +263,7 @@ impl PointerHandler for App {
                     {
                         self.input
                             .bridge
-                            .mouse_absolute(sx as i32, sy as i32)
+                            .mouse_absolute(sx, sy)
                             .unwrap();
                     }
                     // info!("motion {event:#?}");

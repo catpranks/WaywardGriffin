@@ -73,7 +73,7 @@ impl InputBridge for XInput {
         Ok(())
     }
 
-    fn mouse_absolute(&mut self, x: i32, y: i32) -> Result<()> {
+    fn mouse_absolute(&mut self, x: u32, y: u32) -> Result<()> {
         self.conn
             .xtest_fake_input(6, 0, 0, self.root, x as i16, y as i16, 0)?;
         self.conn.flush()?;
