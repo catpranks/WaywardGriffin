@@ -12,8 +12,8 @@ use x11rb::rust_connection::RustConnection;
 pub struct XInput {
     conn: RustConnection,
     root: xproto::Window,
-    scroll_h_accumulator: i32,
-    scroll_v_accumulator: i32,
+    scroll_h_acc: i32,
+    scroll_v_acc: i32,
     mouse_x_accumulator: f64,
     mouse_y_accumulator: f64,
     primary: X11ClipboardContext<X11Primary>,
@@ -37,8 +37,8 @@ impl XInput {
         Ok(Self {
             conn,
             root,
-            scroll_h_accumulator: 0,
-            scroll_v_accumulator: 0,
+            scroll_h_acc: 0,
+            scroll_v_acc: 0,
             mouse_x_accumulator: 0.0,
             mouse_y_accumulator: 0.0,
             primary,
@@ -114,11 +114,11 @@ impl InputBridge for XInput {
         Ok(())
     }
 
-    fn scroll(&mut self, h: i32, v: i32) -> Result<()> {
-        let h_acc = &mut self.scroll_h_accumulator;
-        *h_acc += h;
-        let v_acc = &mut self.scroll_v_accumulator;
-        *v_acc += v;
+    fn scroll(&mut self, _h_abs: f64, _v_abs: f64, h120: i32, v120: i32) -> Result<()> {
+        let h_acc = &mut self.scroll_h_acc;
+        *h_acc += h120;
+        let v_acc = &mut self.scroll_v_acc;
+        *v_acc += v120;
         while h_acc.abs() >= 120 {
             let button = if *h_acc > 0 { 7 } else { 6 }; // right/left
             self.conn.xtest_fake_input(4, button, 0, 0, 0, 0, 0)?;

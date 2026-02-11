@@ -25,6 +25,8 @@ pub struct WaylandInput {
     vptr: ZwlrVirtualPointerV1,
     sizer: SharedSizer,
     epoch: Instant,
+    scroll_h_acc: i32,
+    scroll_v_acc: i32,
 }
 
 impl WaylandInput {
@@ -76,6 +78,8 @@ impl WaylandInput {
             vptr,
             sizer,
             epoch: Instant::now(),
+            scroll_h_acc: 0,
+            scroll_v_acc: 0,
         })
     }
 
@@ -127,21 +131,34 @@ impl InputBridge for WaylandInput {
         self.flush()
     }
 
-    fn scroll(&mut self, h: i32, v: i32) -> Result<()> {
+    fn scroll(&mut self, h_abs: f64, v_abs: f64, h120: i32, v120: i32) -> Result<()> {
         let time = self.millis();
-        if v != 0 {
-            self.vptr.axis(
-                time,
-                wl_pointer::Axis::VerticalScroll,
-                v as f64 / 120.0 * 15.0,
-            );
+        for (abs, v120, acc, axis) in [
+            (v_abs, v120, &mut self.scroll_v_acc, wl_pointer::Axis::VerticalScroll),
+            (h_abs, h120, &mut self.scroll_h_acc, wl_pointer::Axis::HorizontalScroll),
+        ] {
+            if v120 != 0 {
+                *acc += v120;
+                let discrete = *acc / 120;
+                *acc %= 120;
+                self.vptr.axis_discrete(time, axis, abs, discrete);
+            } else if abs != 0.0 {
+                self.vptr.axis(time, axis, abs);
+            }
         }
-        if h != 0 {
-            self.vptr.axis(
-                time,
-                wl_pointer::Axis::HorizontalScroll,
-                h as f64 / 120.0 * 15.0,
-            );
+        self.vptr.frame();
+        self.flush()
+    }
+
+    fn scroll_stop(&mut self, horizontal: bool, vertical: bool) -> Result<()> {
+        let time = self.millis();
+        if vertical {
+            self.vptr
+                .axis_stop(time, wl_pointer::Axis::VerticalScroll);
+        }
+        if horizontal {
+            self.vptr
+                .axis_stop(time, wl_pointer::Axis::HorizontalScroll);
         }
         self.vptr.frame();
         self.flush()

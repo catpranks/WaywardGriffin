@@ -36,7 +36,7 @@ impl InputBridge for DummyInput {
         Ok(())
     }
 
-    fn scroll(&mut self, _h: i32, _v: i32) -> Result<()> {
+    fn scroll(&mut self, _h_abs: f64, _v_abs: f64, _h120: i32, _v120: i32) -> Result<()> {
         Ok(())
     }
 }

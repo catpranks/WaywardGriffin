@@ -292,8 +292,19 @@ impl PointerHandler for App {
                     if self.input.confined {
                         self.input
                             .bridge
-                            .scroll(horizontal.value120, vertical.value120)
+                            .scroll(
+                                horizontal.absolute,
+                                vertical.absolute,
+                                horizontal.value120,
+                                vertical.value120,
+                            )
                             .unwrap();
+                        if horizontal.stop || vertical.stop {
+                            self.input
+                                .bridge
+                                .scroll_stop(horizontal.stop, vertical.stop)
+                                .unwrap();
+                        }
                     }
                 }
             }

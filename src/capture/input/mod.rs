@@ -11,7 +11,10 @@ pub trait InputBridge: Send {
     fn mouse_release(&mut self, button: u32) -> Result<()>;
     fn key_press(&mut self, keycode: u32) -> Result<()>;
     fn key_release(&mut self, keycode: u32) -> Result<()>;
-    fn scroll(&mut self, h: i32, v: i32) -> Result<()>;
+    fn scroll(&mut self, h_abs: f64, v_abs: f64, h120: i32, v120: i32) -> Result<()>;
+    fn scroll_stop(&mut self, _horizontal: bool, _vertical: bool) -> Result<()> {
+        Ok(())
+    }
 
     fn get_primary(&mut self) -> Option<String> {
         None
