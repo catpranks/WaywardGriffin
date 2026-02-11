@@ -7,6 +7,7 @@ use super::input::InputBridge;
 use crate::GlobalState;
 use crate::capture::plotter::PlotterHandle;
 use crate::display::DisplayCtx;
+use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result};
 use clap::ValueEnum;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
@@ -36,6 +37,7 @@ pub struct CaptureEnv {
     pub renderer: SwapchainRenderer,
     pub ph: PlotterHandle,
     pub global_state: GlobalState,
+    pub sizer: SharedSizer,
     pub device: Arc<Device>,
     pub allocator: Arc<StandardMemoryAllocator>,
     pub backend: BackendType,
@@ -151,6 +153,7 @@ pub fn setup_and_spawn(
 
     let ph = dc.ph.clone();
     let global_state = dc.global_state.clone();
+    let sizer = dc.sizer.clone();
 
     let renderer = SwapchainRenderer::new(dc, device.clone(), queue, surface)?;
 
@@ -158,6 +161,7 @@ pub fn setup_and_spawn(
         renderer,
         ph,
         global_state,
+        sizer,
         device,
         allocator,
         backend: opts.backend,

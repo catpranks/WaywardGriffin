@@ -74,7 +74,7 @@ impl CaptureBackend for Backend {
     }
 
     fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
-        let injector = Box::new(WaylandInput::new(&self.display)?);
+        let injector = Box::new(WaylandInput::new(&self.display, env.sizer.clone())?);
         let (calloop_tx, calloop_rx) = calloop_channel::channel();
         std::thread::Builder::new()
             .name("capture-wayland".into())
@@ -327,6 +327,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         renderer,
         ph,
         global_state,
+        sizer: _,
         device,
         allocator,
         backend,

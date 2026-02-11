@@ -101,6 +101,7 @@ fn run(
         mut renderer,
         ph,
         global_state,
+        sizer: _,
         device,
         allocator,
         backend: _,

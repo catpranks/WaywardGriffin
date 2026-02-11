@@ -1,14 +1,17 @@
 use super::InputBridge;
+use crate::sizer::SharedSizer;
 use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result};
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
+use smithay_client_toolkit::reexports::client::protocol::wl_pointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::{self, WlSeat};
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle, WEnum};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsFd;
+use std::time::Instant;
 use tracing::{error, info, warn};
 
 use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
@@ -16,10 +19,16 @@ use smithay_client_toolkit::reexports::protocols_misc::zwp_virtual_keyboard_v1::
 use smithay_client_toolkit::reexports::protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 use smithay_client_toolkit::reexports::protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
-pub struct WaylandInput;
+pub struct WaylandInput {
+    conn: Connection,
+    vkbd: ZwpVirtualKeyboardV1,
+    vptr: ZwlrVirtualPointerV1,
+    sizer: SharedSizer,
+    epoch: Instant,
+}
 
 impl WaylandInput {
-    pub fn new(display: &str) -> Result<Self> {
+    pub fn new(display: &str, sizer: SharedSizer) -> Result<Self> {
         let conn = wayland_connect(display)?;
 
         let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
@@ -41,8 +50,8 @@ impl WaylandInput {
 
         let mut state = State {
             registry_state: RegistryState::new(&globals),
-            vkbd,
-            _vptr: vptr,
+            vkbd: vkbd.clone(),
+            _vptr: vptr.clone(),
             _keyboard: keyboard,
             last_keymap: None,
         };
@@ -51,50 +60,92 @@ impl WaylandInput {
 
         std::thread::Builder::new()
             .name("wayland-input".into())
-            .spawn(move || {
-                let _conn = conn;
-                loop {
-                    match event_queue.blocking_dispatch(&mut state) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("wayland input: {e}");
-                            break;
-                        }
+            .spawn(move || loop {
+                match event_queue.blocking_dispatch(&mut state) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("wayland input: {e}");
+                        break;
                     }
                 }
             })?;
 
-        Ok(WaylandInput)
+        Ok(WaylandInput {
+            conn,
+            vkbd,
+            vptr,
+            sizer,
+            epoch: Instant::now(),
+        })
+    }
+
+    fn millis(&self) -> u32 {
+        self.epoch.elapsed().as_millis() as u32
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.conn.flush()?;
+        Ok(())
     }
 }
 
 impl InputBridge for WaylandInput {
-    fn mouse_delta(&mut self, _x: f64, _y: f64) -> Result<()> {
-        Ok(())
+    fn mouse_delta(&mut self, x: f64, y: f64) -> Result<()> {
+        self.vptr.motion(self.millis(), x, y);
+        self.vptr.frame();
+        self.flush()
     }
 
-    fn mouse_absolute(&mut self, _x: i32, _y: i32) -> Result<()> {
-        Ok(())
+    fn mouse_absolute(&mut self, x: i32, y: i32) -> Result<()> {
+        let (sw, sh) = self.sizer.load().source_size;
+        self.vptr
+            .motion_absolute(self.millis(), x as u32, y as u32, sw, sh);
+        self.vptr.frame();
+        self.flush()
     }
 
-    fn mouse_press(&mut self, _button: u32) -> Result<()> {
-        Ok(())
+    fn mouse_press(&mut self, button: u32) -> Result<()> {
+        self.vptr
+            .button(self.millis(), button, wl_pointer::ButtonState::Pressed);
+        self.vptr.frame();
+        self.flush()
     }
 
-    fn mouse_release(&mut self, _button: u32) -> Result<()> {
-        Ok(())
+    fn mouse_release(&mut self, button: u32) -> Result<()> {
+        self.vptr
+            .button(self.millis(), button, wl_pointer::ButtonState::Released);
+        self.vptr.frame();
+        self.flush()
     }
 
-    fn key_press(&mut self, _keycode: u32) -> Result<()> {
-        Ok(())
+    fn key_press(&mut self, keycode: u32) -> Result<()> {
+        self.vkbd.key(self.millis(), keycode, 1);
+        self.flush()
     }
 
-    fn key_release(&mut self, _keycode: u32) -> Result<()> {
-        Ok(())
+    fn key_release(&mut self, keycode: u32) -> Result<()> {
+        self.vkbd.key(self.millis(), keycode, 0);
+        self.flush()
     }
 
-    fn scroll(&mut self, _h: i32, _v: i32) -> Result<()> {
-        Ok(())
+    fn scroll(&mut self, h: i32, v: i32) -> Result<()> {
+        let time = self.millis();
+        if v != 0 {
+            self.vptr.axis(
+                time,
+                wl_pointer::Axis::VerticalScroll,
+                v as f64 / 120.0 * 15.0,
+            );
+        }
+        if h != 0 {
+            self.vptr.axis(
+                time,
+                wl_pointer::Axis::HorizontalScroll,
+                h as f64 / 120.0 * 15.0,
+            );
+        }
+        self.vptr.frame();
+        self.flush()
     }
 }
 
