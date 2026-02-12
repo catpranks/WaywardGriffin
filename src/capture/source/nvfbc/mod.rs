@@ -98,7 +98,7 @@ fn run(
     rx: mpsc::Receiver<()>,
 ) -> Result<()> {
     let CaptureEnv {
-        mut renderer,
+        renderer,
         ph,
         global_state,
         sizer: _,
@@ -106,6 +106,9 @@ fn run(
         allocator,
         backend: _,
     } = env;
+    // SwapchainRenderer must not be dropped on this thread — its Vulkan swapchain
+    // destruction calls wl_proxy_destroy, which is not thread-safe.
+    let mut renderer = std::mem::ManuallyDrop::new(renderer);
     ctx.bind_to_thread()?;
     capturer.bind_thread()?;
     let mut bufs: VecDeque<Buffer> = VecDeque::new();

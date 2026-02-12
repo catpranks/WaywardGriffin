@@ -105,7 +105,9 @@ impl CaptureBackend for Backend {
 // Main backend state for the calloop event loop
 
 struct State {
-    renderer: SwapchainRenderer,
+    // ManuallyDrop: SwapchainRenderer must not be dropped on this thread — its Vulkan
+    // swapchain destruction calls wl_proxy_destroy, which is not thread-safe.
+    renderer: std::mem::ManuallyDrop<SwapchainRenderer>,
     ph: PlotterHandle,
     global_state: GlobalState,
     device: Arc<Device>,
@@ -358,7 +360,7 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     };
 
     let mut state = State {
-        renderer,
+        renderer: std::mem::ManuallyDrop::new(renderer),
         ph,
         global_state,
         device,
