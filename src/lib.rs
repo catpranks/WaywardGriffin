@@ -145,4 +145,3 @@ impl Drop for PlotterWriter {
         self.ph.log(String::from_utf8_lossy(&self.buf).to_string());
     }
 }
-

@@ -261,10 +261,7 @@ impl PointerHandler for App {
                         && !self.input.force_relative
                         && self.input.confined
                     {
-                        self.input
-                            .bridge
-                            .mouse_absolute(sx, sy)
-                            .unwrap();
+                        self.input.bridge.mouse_absolute(sx, sy).unwrap();
                     }
                     // info!("motion {event:#?}");
                 }
