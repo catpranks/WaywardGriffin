@@ -60,5 +60,5 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
   Dispatches frame and resize events to capture thread.
 - [input](./src/display/input.rs). Input event forwarding.
 - [capture thread](./src/capture/mod.rs). Renders captured frames onto Vulkan swapchain. Cool breathing border effect when input capture is disabled.
-- [nvfbc](./src/capture/backend/nvfbc/mod.rs). NVFBC capture backend.
+- [nvfbc](./src/capture/source/nvfbc/mod.rs). NVFBC capture backend.
 - [plotter](./src/capture/plotter.rs). TUI with frame timing charts.
