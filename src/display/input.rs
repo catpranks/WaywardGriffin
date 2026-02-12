@@ -42,7 +42,7 @@ pub struct InputState {
     pub seat_state: SeatState,
     pub relative_pointer_state: RelativePointerState,
     pub pointer_constraints_state: PointerConstraintsState,
-    pub shortcuts_inhibit_manager: SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>,
+    pub shortcuts_inhibit_manager: Option<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>>,
 
     // Wayland Objects
     pub cursor_surface: WlSurface,
@@ -101,14 +101,16 @@ impl App {
     }
 
     fn input_update_shortcut_inhibitor(&mut self) {
+        let Some(ref manager) = self.input.shortcuts_inhibit_manager else {
+            return;
+        };
         if self.input.confined {
             if self.input.shortcuts_inhibitor.is_some() {
                 return;
             }
             if let Some(seat) = self.input.seat_state.seats().next() {
                 self.input.shortcuts_inhibitor = Some(
-                    self.input
-                        .shortcuts_inhibit_manager
+                    manager
                         .get()
                         .unwrap()
                         .inhibit_shortcuts(&self.dc.surface, &seat, &self.dc.qh, ()),
@@ -526,7 +528,7 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
 
 impl AsMut<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>> for App {
     fn as_mut(&mut self) -> &mut SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1> {
-        &mut self.input.shortcuts_inhibit_manager
+        self.input.shortcuts_inhibit_manager.as_mut().unwrap()
     }
 }
 

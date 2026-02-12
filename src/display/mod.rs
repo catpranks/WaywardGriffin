@@ -479,7 +479,13 @@ pub fn run(
             seat_state: SeatState::new(&globals, &qh),
             relative_pointer_state: RelativePointerState::bind(&globals, &qh),
             pointer_constraints_state: PointerConstraintsState::bind(&globals, &qh),
-            shortcuts_inhibit_manager: SimpleGlobal::bind(&globals, &qh)?,
+            shortcuts_inhibit_manager: match SimpleGlobal::bind(&globals, &qh) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    info!("zwp_keyboard_shortcuts_inhibit_manager_v1 not available, grab won't inhibit compositor shortcuts");
+                    None
+                }
+            },
             cursor_surface,
             keyboard: None,
             pointer: None,
