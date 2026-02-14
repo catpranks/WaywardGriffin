@@ -1,9 +1,9 @@
 mod input;
 
 use crate::capture::Renderer;
-use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
 use crate::display::input::InputMsg;
+use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};

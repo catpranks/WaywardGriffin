@@ -10,10 +10,11 @@ use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
 use smithay::input::{SeatHandler, SeatState};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_output, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
-use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::utils::{Logical, Serial, Size};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -27,7 +28,6 @@ use smithay::wayland::drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, Dr
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use std::fs::File;
 use std::os::fd::OwnedFd;
@@ -163,8 +163,7 @@ impl CompositorHandler for State {
                     Some(BufferAssignment::NewBuffer(ref buffer)) => {
                         match get_dmabuf(buffer) {
                             Ok(dmabuf) => {
-                                let mut sync =
-                                    states.cached_state.get::<DrmSyncobjCachedState>();
+                                let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
                                 let sync_current = sync.current();
                                 let size = dmabuf.size();
                                 // TODO: does this need to retain the Buffer in order to avoid smithay automatically calling release while we're sampling the texture?
@@ -240,7 +239,10 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.toplevels.retain(|t| t != &surface);
-        debug!("overlay toplevel destroyed (remaining: {})", self.toplevels.len());
+        debug!(
+            "overlay toplevel destroyed (remaining: {})",
+            self.toplevels.len()
+        );
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
@@ -255,13 +257,7 @@ impl XdgShellHandler for State {
     ) {
     }
 
-    fn grab(
-        &mut self,
-        _surface: PopupSurface,
-        _seat: wl_seat::WlSeat,
-        _serial: Serial,
-    ) {
-    }
+    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
 }
 
 impl DmabufHandler for State {

@@ -5,8 +5,8 @@ use super::{CaptureBackendBuilder, CaptureEnv, DeviceId};
 use crate::GlobalState;
 use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
-use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::{CaptureBackend, CapturedFrame, ReclaimedBuffer};
+use crate::plotter::{FrameInfo, PlotterHandle};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,

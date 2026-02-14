@@ -8,8 +8,8 @@ use super::{
 use crate::GlobalState;
 use crate::capture::input::InputBridge;
 use crate::capture::input::wayland::WaylandInput;
-use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::CaptureBackend;
+use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::utils::OwningWlBuffer;
 use crate::utils::wayland_connect;
 use anyhow::anyhow;
@@ -442,9 +442,7 @@ impl Buffer {
                 .array_layers(1)
                 .samples(ash::vk::SampleCountFlags::TYPE_1)
                 .tiling(ash::vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(
-                    ash::vk::ImageUsageFlags::TRANSFER_SRC | ash::vk::ImageUsageFlags::SAMPLED,
-                )
+                .usage(ash::vk::ImageUsageFlags::TRANSFER_SRC | ash::vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
                 .initial_layout(ash::vk::ImageLayout::UNDEFINED)
                 .push_next(&mut modifier_list)

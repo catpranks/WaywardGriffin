@@ -7,8 +7,8 @@ pub mod plotter;
 pub mod sizer;
 mod utils;
 
-use crate::plotter::{Plotter, PlotterHandle};
 use crate::capture::source::BackendType;
+use crate::plotter::{Plotter, PlotterHandle};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
