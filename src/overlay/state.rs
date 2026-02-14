@@ -11,9 +11,10 @@ use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
 use smithay::input::{SeatHandler, SeatState};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
+use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_output, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
-use smithay::utils::Serial;
+use smithay::reexports::wayland_server::protocol::wl_seat;
+use smithay::utils::{Logical, Serial, Size};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
@@ -26,6 +27,7 @@ use smithay::wayland::drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, Dr
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use std::fs::File;
 use std::os::fd::OwnedFd;
@@ -47,7 +49,8 @@ pub struct State {
     pub syncobj_state: DrmSyncobjState,
 
     pub slot: OverlaySlot,
-    pub toplevel: Option<ToplevelSurface>,
+    pub toplevels: Vec<ToplevelSurface>,
+    pub size: Size<i32, Logical>,
     start: Instant,
 }
 
@@ -114,7 +117,8 @@ impl State {
             syncobj_state,
 
             slot,
-            toplevel: None,
+            toplevels: Vec::new(),
+            size: Size::from((1280, 720)),
             start: Instant::now(),
         })
     }
@@ -138,22 +142,50 @@ impl CompositorHandler for State {
             {
                 let mut attrs = states.cached_state.get::<SurfaceAttributes>();
                 let current = attrs.current();
-                // TODO: warn on unsupported elements of the commit.
-                if let Some(BufferAssignment::NewBuffer(ref buffer)) = current.buffer
-                    && let Ok(dmabuf) = get_dmabuf(buffer)
-                {
-                    let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
-                    let sync_current = sync.current();
-                    let size = dmabuf.size();
-                    // TODO: does this need to retain the Buffer in order to avoid smithay automatically calling release while we're sampling the texture?
-                    let frame = OverlayFrame {
-                        dmabuf: dmabuf.clone(),
-                        acquire_point: sync_current.acquire_point.clone(),
-                        release_point: sync_current.release_point.clone(),
-                        size: (size.w, size.h),
-                    };
-                    debug!(w = size.w, h = size.h, "overlay frame committed");
-                    *self.slot.lock().unwrap() = Some(frame);
+
+                if current.buffer_scale != 1 {
+                    warn!(scale = current.buffer_scale, "buffer scale != 1 ignored");
+                }
+                if current.buffer_transform != wl_output::Transform::Normal {
+                    warn!(transform = ?current.buffer_transform, "buffer transform ignored");
+                }
+                if let Some(ref delta) = current.buffer_delta {
+                    warn!(?delta, "buffer delta ignored");
+                }
+                if current.opaque_region.is_some() {
+                    warn!("opaque region ignored");
+                }
+                if current.input_region.is_some() {
+                    warn!("input region ignored");
+                }
+
+                match current.buffer {
+                    Some(BufferAssignment::NewBuffer(ref buffer)) => {
+                        match get_dmabuf(buffer) {
+                            Ok(dmabuf) => {
+                                let mut sync =
+                                    states.cached_state.get::<DrmSyncobjCachedState>();
+                                let sync_current = sync.current();
+                                let size = dmabuf.size();
+                                // TODO: does this need to retain the Buffer in order to avoid smithay automatically calling release while we're sampling the texture?
+                                let frame = OverlayFrame {
+                                    dmabuf: dmabuf.clone(),
+                                    acquire_point: sync_current.acquire_point.clone(),
+                                    release_point: sync_current.release_point.clone(),
+                                    size: (size.w, size.h),
+                                };
+                                debug!(w = size.w, h = size.h, "overlay frame committed");
+                                *self.slot.lock().unwrap() = Some(frame);
+                            }
+                            Err(_) => {
+                                warn!("non-dmabuf buffer (shm?) ignored");
+                            }
+                        }
+                    }
+                    Some(BufferAssignment::Removed) => {
+                        warn!("buffer removal ignored");
+                    }
+                    None => {}
                 }
             }
 
@@ -195,9 +227,20 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        debug!("new overlay toplevel");
-        self.toplevel = Some(surface.clone());
+        let size = self.size;
+        surface.with_pending_state(|state| {
+            state.size = Some(size);
+            state.states.set(xdg_toplevel::State::Fullscreen);
+            state.states.set(xdg_toplevel::State::Activated);
+        });
         surface.send_configure();
+        debug!("new overlay toplevel (total: {})", self.toplevels.len() + 1);
+        self.toplevels.push(surface);
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.toplevels.retain(|t| t != &surface);
+        debug!("overlay toplevel destroyed (remaining: {})", self.toplevels.len());
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
@@ -215,7 +258,7 @@ impl XdgShellHandler for State {
     fn grab(
         &mut self,
         _surface: PopupSurface,
-        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        _seat: wl_seat::WlSeat,
         _serial: Serial,
     ) {
     }
