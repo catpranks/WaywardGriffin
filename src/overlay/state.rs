@@ -5,7 +5,6 @@ use anyhow::{Context as _, Result, ensure};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::DrmDeviceFd;
-use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_dmabuf;
 use smithay::delegate_drm_syncobj;
@@ -239,68 +238,55 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        on_commit_buffer_handler::<Self>(surface);
-
-        let start = self.start;
-
         with_states(surface, |states| {
-            {
-                let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-                let current = attrs.current();
+            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+            let current = attrs.current();
 
-                if current.buffer_scale != 1 {
-                    warn!(scale = current.buffer_scale, "buffer scale != 1 ignored");
-                }
-                if current.buffer_transform != wl_output::Transform::Normal {
-                    warn!(transform = ?current.buffer_transform, "buffer transform ignored");
-                }
-                if let Some(ref delta) = current.buffer_delta {
-                    warn!(?delta, "buffer delta ignored");
-                }
-                if current.opaque_region.is_some() {
-                    warn!("opaque region ignored");
-                }
-                if current.input_region.is_some() {
-                    warn!("input region ignored");
-                }
-
-                match current.buffer {
-                    Some(BufferAssignment::NewBuffer(ref buffer)) => match get_dmabuf(buffer) {
-                        Ok(dmabuf) => {
-                            let image = self.image_cache.get(dmabuf);
-                            if image.is_none() {
-                                warn!("committed buffer not in image cache");
-                            }
-                            let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
-                            let sync_current = sync.current();
-                            let size = dmabuf.size();
-                            let frame = OverlayFrame {
-                                dmabuf: dmabuf.clone(),
-                                acquire_point: sync_current.acquire_point.clone(),
-                                release_point: sync_current.release_point.clone(),
-                                size: (size.w, size.h),
-                            };
-                            debug!(w = size.w, h = size.h, "overlay frame committed");
-                            *self.slot.lock().unwrap() = Some(frame);
-                        }
-                        Err(_) => {
-                            warn!("non-dmabuf buffer (shm?) ignored");
-                        }
-                    },
-                    Some(BufferAssignment::Removed) => {
-                        warn!("buffer removal ignored");
-                    }
-                    None => {}
-                }
+            if current.buffer_scale != 1 {
+                warn!(scale = current.buffer_scale, "buffer scale != 1 ignored");
+            }
+            if current.buffer_transform != wl_output::Transform::Normal {
+                warn!(transform = ?current.buffer_transform, "buffer transform ignored");
+            }
+            if let Some(ref delta) = current.buffer_delta {
+                warn!(?delta, "buffer delta ignored");
             }
 
-            {
-                let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-                let current = attrs.current();
-                let time_ms = start.elapsed().as_millis() as u32;
-                for callback in current.frame_callbacks.drain(..) {
-                    callback.done(time_ms);
-                }
+            match current.buffer.take() {
+                Some(BufferAssignment::NewBuffer(buffer)) => match get_dmabuf(&buffer) {
+                    Ok(dmabuf) => {
+                        let Some(image) = self.image_cache.get(dmabuf).cloned() else {
+                            warn!("committed buffer not in image cache");
+                            return;
+                        };
+                        let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
+                        let sync_current = sync.current();
+                        let (Some(acquire_point), Some(release_point)) = (
+                            sync_current.acquire_point.clone(),
+                            sync_current.release_point.clone(),
+                        ) else {
+                            warn!("committed buffer without explicit sync points");
+                            return;
+                        };
+                        let frame_callbacks = current.frame_callbacks.drain(..).collect();
+                        let frame = OverlayFrame {
+                            image,
+                            acquire_point,
+                            release_point,
+                            buffer,
+                            frame_callbacks,
+                            start: self.start,
+                        };
+                        let extent = frame.image.extent();
+                        debug!(w = extent[0], h = extent[1], "overlay frame committed");
+                        *self.slot.lock().unwrap() = Some(frame);
+                    }
+                    Err(_) => {
+                        warn!("non-dmabuf buffer (shm?) ignored");
+                    }
+                },
+                Some(BufferAssignment::Removed) => {}
+                None => {}
             }
         });
     }

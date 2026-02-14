@@ -119,13 +119,10 @@ fn main() -> Result<()> {
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 if let Some(frame) = handle.slot.lock().unwrap().take() {
-                    use smithay::backend::allocator::Buffer as _;
-                    let fmt = frame.dmabuf.format();
+                    let extent = frame.image.extent();
                     info!(
-                        w = frame.size.0,
-                        h = frame.size.1,
-                        format = ?fmt.code,
-                        modifier = format!("{:#x}", u64::from(fmt.modifier)),
+                        w = extent[0],
+                        h = extent[1],
                         "overlay frame received"
                     );
                     got_frame = true;
