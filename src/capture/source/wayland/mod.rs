@@ -8,7 +8,7 @@ use super::{
 use crate::GlobalState;
 use crate::capture::input::InputBridge;
 use crate::capture::input::wayland::WaylandInput;
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::CaptureBackend;
 use crate::utils::OwningWlBuffer;
 use crate::utils::wayland_connect;

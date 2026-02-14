@@ -1,5 +1,5 @@
 use super::{Buffer, FrameState, State, fourcc_to_format};
-use crate::capture::plotter::FrameInfo;
+use crate::plotter::FrameInfo;
 use crate::utils::compose_timestamp;
 use anyhow::{Result, bail};
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};

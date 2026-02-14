@@ -1,5 +1,5 @@
 use super::InputBridge;
-use crate::capture::plotter::PlotterHandle;
+use crate::plotter::PlotterHandle;
 use crate::sizer::SharedSizer;
 use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result, anyhow};

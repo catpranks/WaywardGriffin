@@ -3,10 +3,11 @@
 mod capture;
 mod display;
 pub mod overlay;
+pub mod plotter;
 pub mod sizer;
 mod utils;
 
-use crate::capture::plotter::{Plotter, PlotterHandle};
+use crate::plotter::{Plotter, PlotterHandle};
 use crate::capture::source::BackendType;
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
@@ -90,7 +91,7 @@ pub fn run() -> Result<()> {
 
 type GlobalState = Arc<ArcSwap<GlobalStateInner>>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GlobalStateInner {
     pub cursor_visible: bool,
     pub confine: bool,

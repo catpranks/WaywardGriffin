@@ -1,4 +1,7 @@
 use anyhow::{Context as _, Result};
+use arc_swap::ArcSwap;
+use std::sync::Arc;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -7,7 +10,10 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, QueueCreateInfo,
 };
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
+use waygriff::GlobalStateInner;
 use waygriff::overlay::{self, OverlayEnv};
+use waygriff::plotter::Plotter;
+use waygriff::sizer::Sizer;
 
 fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -67,27 +73,38 @@ fn main() -> Result<()> {
         },
     )?;
 
+    let global_state = Arc::new(ArcSwap::from_pointee(GlobalStateInner::default()));
+    let sizer = Arc::new(ArcSwap::from_pointee(Sizer::default()));
+    let plotter = Plotter::new(global_state, sizer);
+    let ph = plotter.handle();
+
     let handle = overlay::spawn(OverlayEnv {
         physical_device: physical,
+        ph,
     })?;
 
-    tracing::info!(
+    info!(
         "Overlay compositor listening. Run: WAYLAND_DISPLAY={} <app>",
         handle.socket_name
     );
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(16));
-        if let Some(frame) = handle.slot.lock().unwrap().take() {
-            use smithay::backend::allocator::Buffer as _;
-            let fmt = frame.dmabuf.format();
-            tracing::info!(
-                w = frame.size.0,
-                h = frame.size.1,
-                format = ?fmt.code,
-                modifier = format!("{:#x}", u64::from(fmt.modifier)),
-                "overlay frame received"
-            );
-        }
-    }
+    std::thread::Builder::new()
+        .name("overlay-poll".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            if let Some(frame) = handle.slot.lock().unwrap().take() {
+                use smithay::backend::allocator::Buffer as _;
+                let fmt = frame.dmabuf.format();
+                info!(
+                    w = frame.size.0,
+                    h = frame.size.1,
+                    format = ?fmt.code,
+                    modifier = format!("{:#x}", u64::from(fmt.modifier)),
+                    "overlay frame received"
+                );
+            }
+        })
+        .unwrap();
+
+    plotter.run(None)
 }

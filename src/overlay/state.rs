@@ -97,7 +97,6 @@ impl State {
         let dmabuf_global =
             dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &feedback);
 
-        // Open render node for syncobj
         let render_path = format!("/dev/dri/renderD{minor}");
         let syncobj_state = match File::open(&render_path) {
             Ok(file) => {
@@ -129,8 +128,6 @@ impl State {
     }
 }
 
-// -- CompositorHandler --
-
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -145,7 +142,6 @@ impl CompositorHandler for State {
         let start = self.start;
 
         with_states(surface, |states| {
-            // Extract dmabuf if present
             {
                 let mut attrs = states.cached_state.get::<SurfaceAttributes>();
                 let current = attrs.current();
@@ -166,7 +162,6 @@ impl CompositorHandler for State {
                 }
             }
 
-            // Fire frame callbacks to pace the client
             {
                 let mut attrs = states.cached_state.get::<SurfaceAttributes>();
                 let current = attrs.current();
@@ -179,21 +174,15 @@ impl CompositorHandler for State {
     }
 }
 
-// -- BufferHandler --
-
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
-
-// -- ShmHandler --
 
 impl ShmHandler for State {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
     }
 }
-
-// -- SeatHandler --
 
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
@@ -204,8 +193,6 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 }
-
-// -- XdgShellHandler --
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -239,8 +226,6 @@ impl XdgShellHandler for State {
     }
 }
 
-// -- DmabufHandler --
-
 impl DmabufHandler for State {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -252,20 +237,15 @@ impl DmabufHandler for State {
         _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // Always accept — actual Vulkan import is deferred to the display thread
         let _ = notifier.successful::<Self>();
     }
 }
-
-// -- DrmSyncobjHandler --
 
 impl DrmSyncobjHandler for State {
     fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
         self.syncobj_state.as_mut()
     }
 }
-
-// -- Delegate macros --
 
 delegate_compositor!(State);
 delegate_shm!(State);

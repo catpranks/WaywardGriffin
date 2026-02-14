@@ -1,6 +1,7 @@
 pub mod state;
 
-use anyhow::{Context as _, Result};
+use crate::plotter::PlotterHandle;
+use anyhow::{Context as _, Result, anyhow};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
@@ -8,8 +9,8 @@ use smithay::reexports::wayland_server::Display;
 use smithay::wayland::drm_syncobj::DrmSyncPoint;
 use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use tracing::info;
 use vulkano::device::physical::PhysicalDevice;
 
 pub struct OverlayFrame {
@@ -28,45 +29,15 @@ pub struct OverlayHandle {
 
 pub struct OverlayEnv {
     pub physical_device: Arc<PhysicalDevice>,
+    pub ph: PlotterHandle,
 }
 
 pub fn spawn(env: OverlayEnv) -> Result<OverlayHandle> {
     let slot: OverlaySlot = Arc::new(Mutex::new(None));
 
-    // Channel to receive socket name (or error) from the thread after setup.
-    let (setup_tx, setup_rx) = mpsc::channel::<Result<String>>();
-
-    let slot2 = slot.clone();
-    std::thread::Builder::new()
-        .name("overlay".into())
-        .spawn(move || {
-            let result = run(env, slot2, setup_tx);
-            if let Err(e) = result {
-                tracing::error!("overlay thread exited: {e:#}");
-            }
-        })
-        .unwrap();
-
-    let socket_name = setup_rx
-        .recv()
-        .context("overlay thread died during setup")??;
-
-    Ok(OverlayHandle { slot, socket_name })
-}
-
-fn run(env: OverlayEnv, slot: OverlaySlot, setup_tx: mpsc::Sender<Result<String>>) -> Result<()> {
     let display: Display<State> = Display::new().context("failed to create wayland display")?;
     let dh = display.handle();
-
-    let state = match State::new(dh, &env, slot) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = setup_tx.send(Err(anyhow::anyhow!("{e:#}")));
-            return Err(e);
-        }
-    };
-
-    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+    let state = State::new(dh, &env, slot.clone())?;
 
     let listening_socket =
         ListeningSocketSource::with_name("waygriff-0").context("failed to bind socket")?;
@@ -75,7 +46,21 @@ fn run(env: OverlayEnv, slot: OverlaySlot, setup_tx: mpsc::Sender<Result<String>
         .to_str()
         .context("socket name not utf-8")?
         .to_owned();
-    tracing::info!(socket = %socket_name, "overlay compositor listening");
+    info!(socket = %socket_name, "overlay compositor listening");
+
+    let ph = env.ph.clone();
+    std::thread::Builder::new()
+        .name("overlay".into())
+        .spawn(move || {
+            ph.fatal(run(display, state, listening_socket).context("overlay thread"));
+        })
+        .unwrap();
+
+    Ok(OverlayHandle { slot, socket_name })
+}
+
+fn run(display: Display<State>, mut state: State, listening_socket: ListeningSocketSource) -> Result<()> {
+    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
 
     event_loop
         .handle()
@@ -88,7 +73,7 @@ fn run(env: OverlayEnv, slot: OverlaySlot, setup_tx: mpsc::Sender<Result<String>
                     .unwrap();
             },
         )
-        .map_err(|e| anyhow::anyhow!("{}", e.error))?;
+        .map_err(|e| anyhow!("{}", e.error))?;
 
     event_loop
         .handle()
@@ -101,12 +86,8 @@ fn run(env: OverlayEnv, slot: OverlaySlot, setup_tx: mpsc::Sender<Result<String>
                 Ok(PostAction::Continue)
             },
         )
-        .map_err(|e| anyhow::anyhow!("{}", e.error))?;
+        .map_err(|e| anyhow!("{}", e.error))?;
 
-    // Signal setup complete
-    let _ = setup_tx.send(Ok(socket_name));
-
-    let mut state = state;
     loop {
         event_loop.dispatch(None, &mut state)?;
     }

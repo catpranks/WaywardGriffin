@@ -1,7 +1,7 @@
 mod input;
 
 use crate::capture::Renderer;
-use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
 use crate::display::input::InputMsg;
 use crate::sizer::SharedSizer;

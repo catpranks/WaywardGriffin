@@ -1,5 +1,4 @@
 pub mod input;
-pub mod plotter;
 pub mod source;
 
 use crate::capture::source::{CapturedFrame, DeviceId};
