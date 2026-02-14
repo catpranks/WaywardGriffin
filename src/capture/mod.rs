@@ -685,9 +685,9 @@ impl Renderer {
                 image_memory_barriers: smallvec![ImageMemoryBarrier {
                     old_layout: ImageLayout::ShaderReadOnlyOptimal,
                     new_layout: ImageLayout::General,
-                    src_stages: PipelineStages::TOP_OF_PIPE,
-                    src_access: AccessFlags::empty(),
-                    dst_stages: PipelineStages::TOP_OF_PIPE,
+                    src_stages: PipelineStages::FRAGMENT_SHADER,
+                    src_access: AccessFlags::SHADER_SAMPLED_READ,
+                    dst_stages: PipelineStages::BOTTOM_OF_PIPE,
                     dst_access: AccessFlags::empty(),
                     queue_family_ownership_transfer: Some(
                         QueueFamilyOwnershipTransfer::ExclusiveToExternal { src_index: qfi },
