@@ -1,7 +1,15 @@
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use smithay_client_toolkit::reexports::client::Connection;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
+use std::mem::MaybeUninit;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use vulkano::VulkanObject as _;
+use vulkano::device::Device;
+use vulkano::format::Format;
+use vulkano::image::sys::RawImage;
+use vulkano::image::{ImageCreateInfo, ImageTiling, ImageUsage};
+use vulkano::memory::ExternalMemoryHandleTypes;
 
 pub fn clock_monotonic_ns() -> u64 {
     let ts = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).unwrap();
@@ -37,4 +45,69 @@ impl Drop for OwningWlBuffer {
     fn drop(&mut self) {
         self.0.destroy();
     }
+}
+
+/// Create a Vulkan image with DRM format modifier tiling.
+///
+/// Workaround for vulkano 0.35.2 not chaining
+/// VkImageDrmFormatModifierListCreateInfoEXT into pNext.
+pub fn create_drm_modifier_image(
+    device: Arc<Device>,
+    format: Format,
+    width: u32,
+    height: u32,
+    usage: ImageUsage,
+    modifiers: Vec<u64>,
+) -> Result<RawImage> {
+    let handle = {
+        let mut modifier_list = ash::vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+            .drm_format_modifiers(&modifiers);
+        let mut external_mem = ash::vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(ash::vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let create_info_vk = ash::vk::ImageCreateInfo::default()
+            .image_type(ash::vk::ImageType::TYPE_2D)
+            .format(format.into())
+            .extent(ash::vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(ash::vk::SampleCountFlags::TYPE_1)
+            .tiling(ash::vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(usage.into())
+            .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
+            .initial_layout(ash::vk::ImageLayout::UNDEFINED)
+            .push_next(&mut modifier_list)
+            .push_next(&mut external_mem);
+        let mut output = MaybeUninit::uninit();
+        unsafe {
+            (device.fns().v1_0.create_image)(
+                device.handle(),
+                &create_info_vk,
+                std::ptr::null(),
+                output.as_mut_ptr(),
+            )
+        }
+        .result()
+        .map_err(|e| anyhow!("vkCreateImage: {e:?}"))?;
+        unsafe { output.assume_init() }
+    };
+    unsafe {
+        RawImage::from_handle(
+            device,
+            handle,
+            ImageCreateInfo {
+                format,
+                extent: [width, height, 1],
+                usage,
+                external_memory_handle_types: ExternalMemoryHandleTypes::DMA_BUF,
+                tiling: ImageTiling::DrmFormatModifier,
+                drm_format_modifiers: modifiers,
+                ..Default::default()
+            },
+        )
+    }
+    .context("RawImage::from_handle")
 }

@@ -30,17 +30,14 @@ use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{
     delegate_dmabuf, delegate_output, delegate_registry, registry_handlers,
 };
-use std::mem::MaybeUninit;
 use std::os::fd::AsFd as _;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::info;
-use vulkano::VulkanObject as _;
 use vulkano::device::Device;
 use vulkano::format::Format;
-use vulkano::image::sys::RawImage;
-use vulkano::image::{Image, ImageAspect, ImageCreateInfo, ImageTiling, ImageUsage};
+use vulkano::image::{Image, ImageAspect, ImageUsage};
 use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::memory::{
     DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, ExternalMemoryHandleTypes,
@@ -421,61 +418,14 @@ impl Buffer {
         height: u32,
     ) -> Result<Self> {
         let vk_format = fourcc_to_format(format)?;
-
-        // Workaround: vulkano 0.35.2 doesn't chain
-        // VkImageDrmFormatModifierListCreateInfoEXT into pNext.
-        // Create the VkImage ourselves and wrap it.
-        let handle = {
-            let mut modifier_list = ash::vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-                .drm_format_modifiers(&modifiers);
-            let mut external_mem = ash::vk::ExternalMemoryImageCreateInfo::default()
-                .handle_types(ash::vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let create_info_vk = ash::vk::ImageCreateInfo::default()
-                .image_type(ash::vk::ImageType::TYPE_2D)
-                .format(vk_format.into())
-                .extent(ash::vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(ash::vk::SampleCountFlags::TYPE_1)
-                .tiling(ash::vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(ash::vk::ImageUsageFlags::TRANSFER_SRC | ash::vk::ImageUsageFlags::SAMPLED)
-                .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
-                .initial_layout(ash::vk::ImageLayout::UNDEFINED)
-                .push_next(&mut modifier_list)
-                .push_next(&mut external_mem);
-            let mut output = MaybeUninit::uninit();
-            unsafe {
-                (device.fns().v1_0.create_image)(
-                    device.handle(),
-                    &create_info_vk,
-                    std::ptr::null(),
-                    output.as_mut_ptr(),
-                )
-            }
-            .result()
-            .map_err(|e| anyhow!("vkCreateImage: {e:?}"))?;
-            unsafe { output.assume_init() }
-        };
-        let raw_image = unsafe {
-            RawImage::from_handle(
-                device.clone(),
-                handle,
-                ImageCreateInfo {
-                    format: vk_format,
-                    extent: [width, height, 1],
-                    usage: ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
-                    external_memory_handle_types: ExternalMemoryHandleTypes::DMA_BUF,
-                    tiling: ImageTiling::DrmFormatModifier,
-                    drm_format_modifiers: modifiers,
-                    ..Default::default()
-                },
-            )
-        }
-        .context("RawImage::from_handle")?;
+        let raw_image = crate::utils::create_drm_modifier_image(
+            device.clone(),
+            vk_format,
+            width,
+            height,
+            ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
+            modifiers,
+        )?;
 
         let (modifier, layout_aspect) =
             if let Some((modifier, _planes)) = raw_image.drm_format_modifier() {
