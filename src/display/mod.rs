@@ -2,15 +2,15 @@ mod input;
 
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source;
-use crate::display::input::InputState;
+use crate::display::input::InputMsg;
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};
 use anyhow::{Result, anyhow, bail};
-use copypasta::wayland_clipboard;
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -32,19 +32,14 @@ use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_vie
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay_client_toolkit::registry::SimpleGlobal;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::seat::SeatState;
-use smithay_client_toolkit::seat::keyboard::Modifiers;
-use smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState;
-use smithay_client_toolkit::seat::relative_pointer::RelativePointerState;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
     Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
-use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_dmabuf, delegate_output, delegate_registry, delegate_shm,
-    delegate_simple, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
+    delegate_compositor, delegate_dmabuf, delegate_output, delegate_registry, delegate_simple,
+    delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -86,19 +81,16 @@ struct App {
     loop_handle: LoopHandle<'static, App>,
     dc: DisplayCtx,
     ch: Box<dyn Fn() + Send>,
+    input_resize_tx: calloop_channel::Sender<InputMsg>,
 
     // Wayland State
     registry_state: RegistryState,
     output_state: OutputState,
     dmabuf_state: DmabufState,
-    shm_state: Shm,
     _xdg_shell: XdgShell,
     wp_viewporter: SimpleGlobal<WpViewporter, 1>,
     wp_frac_mgr: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
     _wp_frac: Option<WpFractionalScaleV1>,
-
-    // Input State
-    input: InputState,
 
     // Window State
     size: (u32, u32),
@@ -119,17 +111,7 @@ impl App {
             .sizer
             .rcu(|s| s.with_window_size(self.size, self.scale120));
 
-        let sizer = self.dc.sizer.load();
-        let rect = sizer.window_sizing.content;
-        let region = Region::new(&self.dc.compositor_state).expect("Failed to create region");
-        region.add(
-            rect.x as i32,
-            rect.y as i32,
-            rect.width as i32,
-            rect.height as i32,
-        );
-        self.input.confinement_region = Some(region);
-        self.input_update_confine();
+        let _ = self.input_resize_tx.send(InputMsg::Resize);
     }
 
     fn sched_resize(&mut self) {
@@ -168,7 +150,6 @@ impl WindowHandler for App {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        // info!("configure {:?}", configure.new_size);
         let width = configure.new_size.0.map(|v| v.get()).unwrap_or(1280);
         let height = configure.new_size.1.map(|v| v.get()).unwrap_or(720);
         self.size = (width, height);
@@ -193,7 +174,6 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _new_factor: i32,
     ) {
-        // info!("scale factor display: {_new_factor}");
     }
 
     fn transform_changed(
@@ -203,7 +183,6 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _new_transform: wl_output::Transform,
     ) {
-        // info!("scale transform display: {_new_transform:?}");
     }
 
     fn frame(
@@ -224,7 +203,6 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // info!("enter, display");
     }
 
     fn surface_leave(
@@ -234,7 +212,6 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // info!("leave, display");
     }
 }
 
@@ -250,18 +227,6 @@ impl DmabufHandler for App {
         _proxy: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
         feedback: DmabufFeedback,
     ) {
-        // eprintln!("dmabuf feedback:");
-        // eprintln!("  device: {:x}", feedback.main_device());
-        // for fmt in feedback.format_table() {
-        //     if fmt.modifier == 0 {
-        //         eprintln!(
-        //             "  fmt {} fourcc {:?} mod {}",
-        //             fmt.format,
-        //             DrmFourcc::try_from(fmt.format).map(|v| v.to_string()),
-        //             fmt.modifier
-        //         );
-        //     }
-        // }
         self.feedback = Some(feedback);
     }
 
@@ -317,7 +282,6 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // info!("fractional {event:?}");
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             state.scale120 = scale;
             state.sched_resize();
@@ -340,12 +304,6 @@ impl Dispatch<WpViewport, ()> for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-    }
-}
-
-impl ShmHandler for App {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm_state
     }
 }
 
@@ -401,7 +359,6 @@ delegate_compositor!(App);
 delegate_dmabuf!(App);
 delegate_output!(App);
 delegate_registry!(App);
-delegate_shm!(App);
 delegate_simple!(App, WpFractionalScaleManagerV1, 1);
 delegate_simple!(App, WpViewporter, 1);
 
@@ -421,7 +378,6 @@ pub fn run(
 
     let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let compositor_state = CompositorState::bind(&globals, &qh)?;
-    let shm_state = Shm::bind(&globals, &qh)?;
     let surface = compositor_state.create_surface(&qh);
     let wp_viewporter = SimpleGlobal::<WpViewporter, 1>::bind(&globals, &qh)?;
     let viewport = wp_viewporter.get()?.get_viewport(&surface, &qh, ());
@@ -430,7 +386,6 @@ pub fn run(
     window.set_title("WaywardGriffin");
     window.set_app_id("waygriff");
     window.commit();
-    let cursor_surface = compositor_state.create_surface(&qh);
 
     let mut wp_frac_mgr = None;
     let mut wp_frac = None;
@@ -442,8 +397,8 @@ pub fn run(
     let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, ())?;
     let dc = DisplayCtx {
         ph,
-        global_state,
-        sizer,
+        global_state: global_state.clone(),
+        sizer: sizer.clone(),
         surface: surface.clone(),
         viewport,
         compositor_state,
@@ -454,55 +409,46 @@ pub fn run(
     let source::SpawnResult { bridge, wake: ch } =
         source::setup_and_spawn(&opts.capture_opts, dc.clone(), &conn)?;
 
-    // Initialize clipboards
-    let (wl_primary, wl_clipboard) = unsafe {
-        wayland_clipboard::create_clipboards_from_external(conn.display().id().as_ptr() as *mut _)
-    };
+    // Spawn input thread
+    let (input_resize_tx, input_resize_rx) = calloop_channel::channel();
+    let input_conn = conn.clone();
+    let input_globals = globals.clone();
+    let input_surface = surface.clone();
+    let input_global_state = global_state.clone();
+    let input_sizer = sizer.clone();
+    let input_confined = opts.confine;
+    std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || {
+            if let Err(e) = input::run(
+                input_conn,
+                input_globals,
+                input_surface,
+                input_global_state,
+                input_sizer,
+                bridge,
+                input_confined,
+                input_resize_rx,
+            ) {
+                info!("input thread error: {e:#}");
+            }
+        })
+        .unwrap();
 
     let mut app = App {
         loop_handle: loop_handle.clone(),
         dc,
         ch,
+        input_resize_tx,
 
         // Wayland State
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         dmabuf_state: DmabufState::new(&globals, &qh),
-        shm_state,
         _xdg_shell: xdg_shell,
         wp_viewporter,
         wp_frac_mgr,
         _wp_frac: wp_frac,
-
-        // Input State
-        input: InputState {
-            seat_state: SeatState::new(&globals, &qh),
-            relative_pointer_state: RelativePointerState::bind(&globals, &qh),
-            pointer_constraints_state: PointerConstraintsState::bind(&globals, &qh),
-            shortcuts_inhibit_manager: match SimpleGlobal::bind(&globals, &qh) {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    info!("zwp_keyboard_shortcuts_inhibit_manager_v1 not available, grab won't inhibit compositor shortcuts");
-                    None
-                }
-            },
-            cursor_surface,
-            keyboard: None,
-            pointer: None,
-            relative_pointer: None,
-            confined_pointer: None,
-            shortcuts_inhibitor: None,
-            modifiers: Modifiers::default(),
-            pointer_serial: 0,
-            confinement_region: None,
-            confined: opts.confine,
-            force_relative: false,
-            cursor_over_surface: false,
-            keyboard_focus: false,
-            wl_primary,
-            wl_clipboard,
-            bridge,
-        },
 
         // Window State
         size: (0, 0),
@@ -513,7 +459,7 @@ pub fn run(
         res: None,
     };
 
-    // Discover seats
+    // Roundtrip for dmabuf feedback
     event_queue.roundtrip(&mut app)?;
 
     if let Some(4..) = app.dmabuf_state.version() {
