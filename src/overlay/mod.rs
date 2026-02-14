@@ -10,7 +10,7 @@ use smithay::wayland::drm_syncobj::DrmSyncPoint;
 use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 use vulkano::device::physical::PhysicalDevice;
 
 pub struct OverlayFrame {
@@ -59,7 +59,11 @@ pub fn spawn(env: OverlayEnv) -> Result<OverlayHandle> {
     Ok(OverlayHandle { slot, socket_name })
 }
 
-fn run(display: Display<State>, mut state: State, listening_socket: ListeningSocketSource) -> Result<()> {
+fn run(
+    display: Display<State>,
+    mut state: State,
+    listening_socket: ListeningSocketSource,
+) -> Result<()> {
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
 
     event_loop
@@ -67,10 +71,12 @@ fn run(display: Display<State>, mut state: State, listening_socket: ListeningSoc
         .insert_source(
             listening_socket,
             move |client_stream, _, state: &mut State| {
-                state
+                if let Err(err) = state
                     .display_handle
                     .insert_client(client_stream, Arc::new(state::ClientState::default()))
-                    .unwrap();
+                {
+                    warn!("error adding wayland client: {err}");
+                }
             },
         )
         .map_err(|e| anyhow!("{}", e.error))?;
@@ -81,7 +87,7 @@ fn run(display: Display<State>, mut state: State, listening_socket: ListeningSoc
             Generic::new(display, Interest::READ, Mode::Level),
             |_, display, state| {
                 unsafe {
-                    display.get_mut().dispatch_clients(state).unwrap();
+                    display.get_mut().dispatch_clients(state)?;
                 }
                 Ok(PostAction::Continue)
             },

@@ -2,6 +2,7 @@ use super::{OverlayEnv, OverlayFrame, OverlaySlot};
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::DrmDeviceFd;
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_dmabuf;
 use smithay::delegate_drm_syncobj;
@@ -43,7 +44,7 @@ pub struct State {
     pub seat_state: SeatState<Self>,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
-    pub syncobj_state: Option<DrmSyncobjState>,
+    pub syncobj_state: DrmSyncobjState,
 
     pub slot: OverlaySlot,
     pub toplevel: Option<ToplevelSurface>,
@@ -60,12 +61,9 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-fn render_minor(physical_device: &PhysicalDevice) -> Option<u64> {
-    physical_device.properties().render_minor.map(|v| v as u64)
-}
-
-fn render_major(physical_device: &PhysicalDevice) -> Option<u64> {
-    physical_device.properties().render_major.map(|v| v as u64)
+fn render_dev(physical_device: &PhysicalDevice) -> Option<(u64, u64)> {
+    let props = physical_device.properties();
+    Some((props.render_major? as u64, props.render_minor? as u64))
 }
 
 impl State {
@@ -75,8 +73,8 @@ impl State {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let seat_state = SeatState::new();
 
-        let major = render_major(&env.physical_device).context("no render_major on device")?;
-        let minor = render_minor(&env.physical_device).context("no render_minor on device")?;
+        let (major, minor) =
+            render_dev(&env.physical_device).context("no render major/minor on device")?;
 
         let dev_t = nix::sys::stat::makedev(major, minor);
         let formats = vec![
@@ -98,18 +96,12 @@ impl State {
             dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &feedback);
 
         let render_path = format!("/dev/dri/renderD{minor}");
-        let syncobj_state = match File::open(&render_path) {
-            Ok(file) => {
-                let owned_fd: OwnedFd = file.into();
-                let device_fd = DeviceFd::from(owned_fd);
-                let drm_fd = DrmDeviceFd::new(device_fd);
-                Some(DrmSyncobjState::new::<Self>(&dh, drm_fd))
-            }
-            Err(e) => {
-                warn!(path = %render_path, "failed to open render node for syncobj: {e}");
-                None
-            }
-        };
+        let file = File::open(&render_path)
+            .with_context(|| format!("failed to open render node {render_path}"))?;
+        let owned_fd: OwnedFd = file.into();
+        let device_fd = DeviceFd::from(owned_fd);
+        let drm_fd = DrmDeviceFd::new(device_fd);
+        let syncobj_state = DrmSyncobjState::new::<Self>(&dh, drm_fd);
 
         Ok(Self {
             display_handle: dh,
@@ -138,19 +130,22 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        let slot = self.slot.clone();
+        on_commit_buffer_handler::<Self>(surface);
+
         let start = self.start;
 
         with_states(surface, |states| {
             {
                 let mut attrs = states.cached_state.get::<SurfaceAttributes>();
                 let current = attrs.current();
+                // TODO: warn on unsupported elements of the commit.
                 if let Some(BufferAssignment::NewBuffer(ref buffer)) = current.buffer
                     && let Ok(dmabuf) = get_dmabuf(buffer)
                 {
                     let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
                     let sync_current = sync.current();
                     let size = dmabuf.size();
+                    // TODO: does this need to retain the Buffer in order to avoid smithay automatically calling release while we're sampling the texture?
                     let frame = OverlayFrame {
                         dmabuf: dmabuf.clone(),
                         acquire_point: sync_current.acquire_point.clone(),
@@ -158,7 +153,7 @@ impl CompositorHandler for State {
                         size: (size.w, size.h),
                     };
                     debug!(w = size.w, h = size.h, "overlay frame committed");
-                    *slot.lock().unwrap() = Some(frame);
+                    *self.slot.lock().unwrap() = Some(frame);
                 }
             }
 
@@ -243,7 +238,7 @@ impl DmabufHandler for State {
 
 impl DrmSyncobjHandler for State {
     fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
-        self.syncobj_state.as_mut()
+        Some(&mut self.syncobj_state)
     }
 }
 
