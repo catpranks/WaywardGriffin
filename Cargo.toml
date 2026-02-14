@@ -29,6 +29,7 @@ nix = { version = "0.31.1", features = ["fs", "time"] }
 ratatui = "0.30.0"
 ratatui-widgets = "0.3.0"
 smallvec = "1.15.1"
+smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "backend_drm"] }
 smithay-client-toolkit = "0.20.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"

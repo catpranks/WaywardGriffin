@@ -2,6 +2,7 @@
 
 mod capture;
 mod display;
+pub mod overlay;
 pub mod sizer;
 mod utils;
 
