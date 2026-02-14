@@ -13,14 +13,14 @@ lto = "fat"
 codegen-units = 1
 
 [dependencies]
-anyhow = { version = "1.0.100", features = ["backtrace"] }
-arc-swap = "1.8.0"
+anyhow = { version = "1.0.101", features = ["backtrace"] }
+arc-swap = "1.8.1"
 ash = "0.38.0"
-bytemuck = "1.24.0"
-clap = { version = "4.5.54", features = ["derive"] }
+bytemuck = "1.25.0"
+clap = { version = "4.5.58", features = ["derive"] }
 copypasta = "0.10.2"
 crossterm = "0.29.0"
-cudarc = { version = "0.19.0", features = ["cuda-version-from-build-system"] }
+cudarc = { version = "0.19.2", features = ["cuda-version-from-build-system"] }
 drm-fourcc = "2.2.0"
 humantime = "2.3.0"
 image = "0.25.9"
@@ -41,4 +41,4 @@ wayland-backend = { version = "0.3.12", features = ["client_system"] }
 x11rb = { version = "0.13.2", features = ["xtest"] }
 
 [build-dependencies]
-cc = "1.2.54"
+cc = "1.2.56"
