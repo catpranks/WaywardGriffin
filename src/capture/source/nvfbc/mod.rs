@@ -7,7 +7,6 @@ use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
 use crate::capture::source::{CaptureBackend, CapturedFrame, ReclaimedBuffer};
-use crate::utils::clock_monotonic_ns;
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
@@ -100,7 +99,6 @@ impl CaptureBackend for Backend {
     fn capture(&mut self) -> Result<Option<CapturedFrame>> {
         let stream_ptr = std::ptr::null_mut();
         let start = Instant::now();
-        // TODO: compare info.timestamp_us vs capture_mono_ns
         let (dptr, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
         for _ in 0..info.missed_frames {
             self.ph.capture_miss();
@@ -109,7 +107,8 @@ impl CaptureBackend for Backend {
             return Ok(None);
         }
         self.ph.capture();
-        let capture_mono_ns = clock_monotonic_ns();
+        // let capture_mono_ns = clock_monotonic_ns();
+        let capture_mono_ns = info.timestamp_us * 1000;
 
         while let Ok(rbuf) = self.reclaim_rx.try_recv() {
             self.bufs.push_back(rbuf.into());
