@@ -14,7 +14,7 @@ codegen-units = 1
 
 [dependencies]
 anyhow = { version = "1.0.101", features = ["backtrace"] }
-arc-swap = "1.8.1"
+arc-swap = "1.8.2"
 ash = "0.38.0"
 bytemuck = "1.25.0"
 clap = { version = "4.5.58", features = ["derive"] }
@@ -26,6 +26,7 @@ humantime = "2.3.0"
 image = "0.25.9"
 itertools = "0.14.0"
 nix = { version = "0.31.1", features = ["fs", "time"] }
+pollster = "0.4.0"
 ratatui = "0.30.0"
 ratatui-widgets = "0.3.0"
 smallvec = "1.15.1"
@@ -33,9 +34,11 @@ smithay = { version = "0.7.0", default-features = false, features = ["wayland_fr
 smithay-client-toolkit = "0.20.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+vello = "0.7.0"
 viuer = "0.11.0"
 vulkano = "0.35.2"
 vulkano-shaders = "0.35.0"
+winit = "0.30.12"
 x11rb = { version = "0.13.2", features = ["xtest"] }
 
 [build-dependencies]
