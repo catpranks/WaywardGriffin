@@ -47,8 +47,10 @@ fn main() -> Result<()> {
     )?;
     let physical = instance
         .enumerate_physical_devices()?
-        .next()
-        .context("no GPU")?;
+        .find(|p| {
+            p.properties().device_type == vulkano::device::physical::PhysicalDeviceType::DiscreteGpu
+        })
+        .context("no discrete GPU found")?;
 
     let queue_family_index = physical
         .queue_family_properties()
@@ -101,6 +103,7 @@ fn main() -> Result<()> {
     let vello_bin = concat!(env!("CARGO_MANIFEST_DIR"), "/target/release/vello");
     info!(vello_bin, "spawning vello client");
     let child = Command::new(vello_bin)
+        .args(["--max-frames", "10"])
         .env("WAYLAND_DISPLAY", &handle.socket_name)
         .env("WAYLAND_DEBUG", "1")
         .spawn()
