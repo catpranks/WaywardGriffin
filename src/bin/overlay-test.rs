@@ -11,8 +11,9 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, QueueCreateInfo,
 };
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use waygriff::GlobalStateInner;
-use waygriff::overlay::{self, OverlayEnv};
+use waygriff::overlay;
 use waygriff::plotter::Plotter;
 use waygriff::sizer::Sizer;
 
@@ -62,8 +63,8 @@ fn main() -> Result<()> {
         .map(|i| i as u32)
         .context("no graphics queue family")?;
 
-    let (_device, _queues) = Device::new(
-        physical.clone(),
+    let (device, _queues) = Device::new(
+        physical,
         DeviceCreateInfo {
             enabled_extensions: DeviceExtensions {
                 khr_external_memory: true,
@@ -90,10 +91,8 @@ fn main() -> Result<()> {
     let plotter = Plotter::new(global_state, sizer);
     let ph = plotter.handle();
 
-    let handle = overlay::spawn(OverlayEnv {
-        physical_device: physical,
-        ph,
-    })?;
+    let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let handle = overlay::spawn(device, allocator, ph)?;
 
     info!(
         "Overlay compositor listening. Run: WAYLAND_DISPLAY={} <app>",

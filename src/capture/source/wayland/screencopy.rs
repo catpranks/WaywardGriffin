@@ -1,7 +1,8 @@
-use super::{Buffer, FrameState, State, fourcc_to_format};
+use super::{Buffer, FrameState, State};
 use crate::plotter::FrameInfo;
-use crate::utils::compose_timestamp;
-use anyhow::{Result, bail};
+use crate::utils::{compose_timestamp, fourcc_to_vk_format};
+use anyhow::{Context as _, Result, bail};
+use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
 use std::time::Instant;
 
@@ -33,7 +34,8 @@ impl State {
         else {
             bail!("BufferDone without prior LinuxDmabuf");
         };
-        let vk_format = fourcc_to_format(format)?;
+        let vk_format =
+            fourcc_to_vk_format(DrmFourcc::try_from(format).context("unknown fourcc")?)?;
 
         self.drain_reclaimed();
         let mut buf = None;

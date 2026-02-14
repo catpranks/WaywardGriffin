@@ -1,5 +1,8 @@
-use super::{OverlayEnv, OverlayFrame, OverlaySlot};
-use anyhow::{Context as _, Result};
+use crate::utils::{create_drm_modifier_image, fourcc_to_vk_format};
+
+use super::{OverlayFrame, OverlaySlot};
+use anyhow::{Context as _, Result, ensure};
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
@@ -29,11 +32,20 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
-use vulkano::device::physical::PhysicalDevice;
+use vulkano::device::Device;
+use vulkano::image::Image;
+use vulkano::image::ImageUsage;
+use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::memory::{
+    DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, MemoryAllocateInfo,
+    MemoryImportInfo, ResourceMemory,
+};
 
 use smithay::backend::allocator::Format;
 use smithay::utils::DeviceFd;
@@ -47,6 +59,10 @@ pub struct State {
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
     pub syncobj_state: DrmSyncobjState,
+
+    pub device: Arc<Device>,
+    pub allocator: Arc<StandardMemoryAllocator>,
+    pub image_cache: HashMap<Dmabuf, Arc<Image>>,
 
     pub slot: OverlaySlot,
     pub toplevels: Vec<ToplevelSurface>,
@@ -64,20 +80,21 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-fn render_dev(physical_device: &PhysicalDevice) -> Option<(u64, u64)> {
-    let props = physical_device.properties();
-    Some((props.render_major? as u64, props.render_minor? as u64))
-}
-
 impl State {
-    pub fn new(dh: DisplayHandle, env: &OverlayEnv, slot: OverlaySlot) -> Result<Self> {
+    pub fn new(
+        dh: DisplayHandle,
+        device: Arc<Device>,
+        allocator: Arc<StandardMemoryAllocator>,
+        slot: OverlaySlot,
+    ) -> Result<Self> {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let seat_state = SeatState::new();
 
-        let (major, minor) =
-            render_dev(&env.physical_device).context("no render major/minor on device")?;
+        let props = device.physical_device().properties();
+        let major = props.render_major.context("no render_major on device")? as u64;
+        let minor = props.render_minor.context("no render_minor on device")? as u64;
 
         let dev_t = nix::sys::stat::makedev(major, minor);
         let formats = vec![
@@ -116,11 +133,99 @@ impl State {
             dmabuf_global,
             syncobj_state,
 
+            device,
+            allocator,
+            image_cache: HashMap::new(),
+
             slot,
             toplevels: Vec::new(),
             size: Size::from((1280, 720)),
             start: Instant::now(),
         })
+    }
+
+    fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> Result<Arc<Image>> {
+        if let Some(image) = self.image_cache.get(dmabuf) {
+            return Ok(image.clone());
+        }
+
+        let fmt = dmabuf.format();
+        let size = dmabuf.size();
+        let num_planes = dmabuf.num_planes();
+        ensure!(
+            num_planes == 1,
+            "multi-plane dmabufs not supported ({num_planes} planes)"
+        );
+        let vk_format = fourcc_to_vk_format(fmt.code)?;
+        let modifier = u64::from(fmt.modifier);
+
+        let raw_image = create_drm_modifier_image(
+            self.device.clone(),
+            vk_format,
+            size.w as u32,
+            size.h as u32,
+            ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
+            vec![modifier],
+        )?;
+
+        let req = raw_image.memory_requirements()[0];
+
+        // dup the fd since vulkano takes ownership
+        let borrowed_fd = dmabuf.handles().next().context("dmabuf has no planes")?;
+        let owned_fd = borrowed_fd
+            .try_clone_to_owned()
+            .context("failed to dup dmabuf fd")?;
+        let file = File::from(owned_fd);
+
+        let fd_props = unsafe {
+            self.device
+                .memory_fd_properties(ExternalMemoryHandleType::DmaBuf, file)
+        }
+        .context("memory_fd_properties")?;
+
+        // dup again for the actual import (previous call consumed the fd)
+        let borrowed_fd = dmabuf.handles().next().context("dmabuf has no planes")?;
+        let owned_fd = borrowed_fd
+            .try_clone_to_owned()
+            .context("failed to dup dmabuf fd")?;
+        let file = File::from(owned_fd);
+
+        let memory_type_index = req.memory_type_bits & fd_props.memory_type_bits;
+        let memory_type_index = memory_type_index.trailing_zeros();
+
+        let alloc = unsafe {
+            DeviceMemory::import(
+                self.device.clone(),
+                MemoryAllocateInfo {
+                    allocation_size: req.layout.size(),
+                    memory_type_index,
+                    dedicated_allocation: Some(DedicatedAllocation::Image(&raw_image)),
+                    ..Default::default()
+                },
+                MemoryImportInfo::Fd {
+                    handle_type: ExternalMemoryHandleType::DmaBuf,
+                    file,
+                },
+            )
+        }
+        .context("DeviceMemory::import")?;
+
+        let image = Arc::new(
+            raw_image
+                .bind_memory([ResourceMemory::new_dedicated(alloc)])
+                .map_err(|(e, _, _)| e)?,
+        );
+
+        debug!(
+            w = size.w,
+            h = size.h,
+            format = ?fmt.code,
+            modifier = format!("{modifier:#x}"),
+            "imported dmabuf into vulkano image"
+        );
+
+        self.image_cache.insert(dmabuf.clone(), image.clone());
+        Ok(image)
     }
 }
 
@@ -160,27 +265,28 @@ impl CompositorHandler for State {
                 }
 
                 match current.buffer {
-                    Some(BufferAssignment::NewBuffer(ref buffer)) => {
-                        match get_dmabuf(buffer) {
-                            Ok(dmabuf) => {
-                                let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
-                                let sync_current = sync.current();
-                                let size = dmabuf.size();
-                                // TODO: does this need to retain the Buffer in order to avoid smithay automatically calling release while we're sampling the texture?
-                                let frame = OverlayFrame {
-                                    dmabuf: dmabuf.clone(),
-                                    acquire_point: sync_current.acquire_point.clone(),
-                                    release_point: sync_current.release_point.clone(),
-                                    size: (size.w, size.h),
-                                };
-                                debug!(w = size.w, h = size.h, "overlay frame committed");
-                                *self.slot.lock().unwrap() = Some(frame);
+                    Some(BufferAssignment::NewBuffer(ref buffer)) => match get_dmabuf(buffer) {
+                        Ok(dmabuf) => {
+                            let image = self.image_cache.get(dmabuf);
+                            if image.is_none() {
+                                warn!("committed buffer not in image cache");
                             }
-                            Err(_) => {
-                                warn!("non-dmabuf buffer (shm?) ignored");
-                            }
+                            let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
+                            let sync_current = sync.current();
+                            let size = dmabuf.size();
+                            let frame = OverlayFrame {
+                                dmabuf: dmabuf.clone(),
+                                acquire_point: sync_current.acquire_point.clone(),
+                                release_point: sync_current.release_point.clone(),
+                                size: (size.w, size.h),
+                            };
+                            debug!(w = size.w, h = size.h, "overlay frame committed");
+                            *self.slot.lock().unwrap() = Some(frame);
                         }
-                    }
+                        Err(_) => {
+                            warn!("non-dmabuf buffer (shm?) ignored");
+                        }
+                    },
                     Some(BufferAssignment::Removed) => {
                         warn!("buffer removal ignored");
                     }
@@ -201,7 +307,13 @@ impl CompositorHandler for State {
 }
 
 impl BufferHandler for State {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+    fn buffer_destroyed(&mut self, buffer: &wl_buffer::WlBuffer) {
+        if let Ok(dmabuf) = get_dmabuf(buffer)
+            && self.image_cache.remove(dmabuf).is_some()
+        {
+            debug!("evicted cached image for destroyed buffer");
+        }
+    }
 }
 
 impl ShmHandler for State {
@@ -268,10 +380,18 @@ impl DmabufHandler for State {
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
         notifier: ImportNotifier,
     ) {
-        let _ = notifier.successful::<Self>();
+        match self.import_dmabuf(&dmabuf) {
+            Ok(_) => {
+                let _ = notifier.successful::<Self>();
+            }
+            Err(e) => {
+                warn!("dmabuf import failed: {e:#}");
+                notifier.failed();
+            }
+        }
     }
 }
 

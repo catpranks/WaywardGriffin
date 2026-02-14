@@ -1,4 +1,5 @@
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
+use drm_fourcc::DrmFourcc;
 use smithay_client_toolkit::reexports::client::Connection;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use std::mem::MaybeUninit;
@@ -110,4 +111,12 @@ pub fn create_drm_modifier_image(
         )
     }
     .context("RawImage::from_handle")
+}
+
+pub fn fourcc_to_vk_format(fourcc: DrmFourcc) -> Result<Format> {
+    match fourcc {
+        DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => Ok(Format::B8G8R8A8_SRGB),
+        DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Ok(Format::R8G8B8A8_SRGB),
+        other => bail!("unsupported fourcc: {other:?}"),
+    }
 }

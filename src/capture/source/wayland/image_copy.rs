@@ -1,4 +1,4 @@
-use super::{Buffer, FrameState, State, fourcc_to_format};
+use super::{Buffer, FrameState, State};
 use crate::plotter::FrameInfo;
 use crate::utils::compose_timestamp;
 use anyhow::{Context as _, Result, anyhow};
@@ -81,7 +81,12 @@ impl State {
             let entry = c
                 .formats
                 .iter()
-                .find(|e| fourcc_to_format(e.format).is_ok())
+                .find(|e| {
+                    DrmFourcc::try_from(e.format)
+                        .ok()
+                        .and_then(|f| crate::utils::fourcc_to_vk_format(f).ok())
+                        .is_some()
+                })
                 .context("no usable format in imagecopy caps")?;
             let fourcc = entry.format;
             let modifiers = entry.modifiers.clone();

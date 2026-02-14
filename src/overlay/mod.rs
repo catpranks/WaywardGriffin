@@ -11,7 +11,8 @@ use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
-use vulkano::device::physical::PhysicalDevice;
+use vulkano::device::Device;
+use vulkano::memory::allocator::StandardMemoryAllocator;
 
 pub struct OverlayFrame {
     pub dmabuf: Dmabuf,
@@ -27,17 +28,16 @@ pub struct OverlayHandle {
     pub socket_name: String,
 }
 
-pub struct OverlayEnv {
-    pub physical_device: Arc<PhysicalDevice>,
-    pub ph: PlotterHandle,
-}
-
-pub fn spawn(env: OverlayEnv) -> Result<OverlayHandle> {
+pub fn spawn(
+    device: Arc<Device>,
+    allocator: Arc<StandardMemoryAllocator>,
+    ph: PlotterHandle,
+) -> Result<OverlayHandle> {
     let slot: OverlaySlot = Arc::new(Mutex::new(None));
 
     let display: Display<State> = Display::new().context("failed to create wayland display")?;
     let dh = display.handle();
-    let state = State::new(dh, &env, slot.clone())?;
+    let state = State::new(dh, device, allocator, slot.clone())?;
 
     let listening_socket =
         ListeningSocketSource::with_name("waygriff-0").context("failed to bind socket")?;
@@ -48,7 +48,7 @@ pub fn spawn(env: OverlayEnv) -> Result<OverlayHandle> {
         .to_owned();
     info!(socket = %socket_name, "overlay compositor listening");
 
-    let ph = env.ph.clone();
+    let ph = ph.clone();
     std::thread::Builder::new()
         .name("overlay".into())
         .spawn(move || {

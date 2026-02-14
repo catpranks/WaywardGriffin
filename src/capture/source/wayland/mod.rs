@@ -10,10 +10,10 @@ use crate::capture::input::InputBridge;
 use crate::capture::input::wayland::WaylandInput;
 use crate::capture::source::CaptureBackend;
 use crate::plotter::{FrameInfo, PlotterHandle};
-use crate::utils::OwningWlBuffer;
 use crate::utils::wayland_connect;
+use crate::utils::{OwningWlBuffer, create_drm_modifier_image, fourcc_to_vk_format};
 use anyhow::anyhow;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use drm_fourcc::DrmFourcc;
 use image_copy::ImageCopyState;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -36,7 +36,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::info;
 use vulkano::device::Device;
-use vulkano::format::Format;
 use vulkano::image::{Image, ImageAspect, ImageUsage};
 use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::memory::{
@@ -417,8 +416,9 @@ impl Buffer {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let vk_format = fourcc_to_format(format)?;
-        let raw_image = crate::utils::create_drm_modifier_image(
+        let vk_format =
+            fourcc_to_vk_format(DrmFourcc::try_from(format).context("unknown fourcc")?)?;
+        let raw_image = create_drm_modifier_image(
             device.clone(),
             vk_format,
             width,
@@ -494,13 +494,5 @@ impl From<ReclaimedBuffer> for Buffer {
             wl_buffer: *rbuf.backend_data.downcast().unwrap(),
             image: rbuf.image,
         }
-    }
-}
-
-fn fourcc_to_format(fourcc: u32) -> Result<Format> {
-    match DrmFourcc::try_from(fourcc).context("unknown fourcc")? {
-        DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => Ok(Format::B8G8R8A8_SRGB),
-        DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Ok(Format::R8G8B8A8_SRGB),
-        other => bail!("unsupported fourcc: {other:?}"),
     }
 }
