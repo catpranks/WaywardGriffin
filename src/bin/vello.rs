@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use std::sync::Arc;
 use std::time::Instant;
 use vello::kurbo::{Affine, Rect};
@@ -27,6 +28,8 @@ struct App {
     state: RenderState,
     scene: Scene,
     start: Instant,
+    frames_rendered: u32,
+    max_frames: Option<u32>,
 }
 
 impl ApplicationHandler for App {
@@ -172,6 +175,11 @@ impl ApplicationHandler for App {
 
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();
 
+                self.frames_rendered += 1;
+                if self.max_frames.is_some_and(|max| self.frames_rendered >= max) {
+                    event_loop.exit();
+                    return;
+                }
                 window.request_redraw();
             }
 
@@ -180,13 +188,23 @@ impl ApplicationHandler for App {
     }
 }
 
+#[derive(Parser)]
+struct Args {
+    /// Exit after rendering this many frames
+    #[arg(long)]
+    max_frames: Option<u32>,
+}
+
 fn main() -> Result<()> {
+    let args = Args::parse();
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
         state: RenderState::Suspended(None),
         scene: Scene::new(),
         start: Instant::now(),
+        frames_rendered: 0,
+        max_frames: args.max_frames,
     };
 
     let event_loop = EventLoop::new()?;
