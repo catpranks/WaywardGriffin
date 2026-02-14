@@ -9,7 +9,7 @@ use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::window::{Fullscreen, Window};
+use winit::window::Window;
 
 #[derive(Debug)]
 enum RenderState {
@@ -38,8 +38,7 @@ impl ApplicationHandler for App {
         let window = cached_window.take().unwrap_or_else(|| {
             let attr = Window::default_attributes()
                 .with_title("vello-minimal")
-                .with_transparent(true)
-                .with_fullscreen(Some(Fullscreen::Borderless(None)));
+                .with_transparent(true);
             Arc::new(event_loop.create_window(attr).unwrap())
         });
 

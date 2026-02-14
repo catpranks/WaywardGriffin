@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -14,6 +15,15 @@ use waygriff::GlobalStateInner;
 use waygriff::overlay::{self, OverlayEnv};
 use waygriff::plotter::Plotter;
 use waygriff::sizer::Sizer;
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -88,21 +98,42 @@ fn main() -> Result<()> {
         handle.socket_name
     );
 
+    let vello_bin = concat!(env!("CARGO_MANIFEST_DIR"), "/target/release/vello");
+    info!(vello_bin, "spawning vello client");
+    let child = Command::new(vello_bin)
+        .env("WAYLAND_DISPLAY", &handle.socket_name)
+        .env("WAYLAND_DEBUG", "1")
+        .spawn()
+        .context("failed to spawn vello")?;
+    let guard = ChildGuard(child);
+
+    let ph2 = plotter.handle();
     std::thread::Builder::new()
         .name("overlay-poll".into())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(16));
-            if let Some(frame) = handle.slot.lock().unwrap().take() {
-                use smithay::backend::allocator::Buffer as _;
-                let fmt = frame.dmabuf.format();
-                info!(
-                    w = frame.size.0,
-                    h = frame.size.1,
-                    format = ?fmt.code,
-                    modifier = format!("{:#x}", u64::from(fmt.modifier)),
-                    "overlay frame received"
-                );
+        .spawn(move || {
+            let _guard = guard;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut got_frame = false;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if let Some(frame) = handle.slot.lock().unwrap().take() {
+                    use smithay::backend::allocator::Buffer as _;
+                    let fmt = frame.dmabuf.format();
+                    info!(
+                        w = frame.size.0,
+                        h = frame.size.1,
+                        format = ?fmt.code,
+                        modifier = format!("{:#x}", u64::from(fmt.modifier)),
+                        "overlay frame received"
+                    );
+                    got_frame = true;
+                    break;
+                }
             }
+            if !got_frame {
+                info!("no frame received within 1s");
+            }
+            ph2.fatal(Ok(()));
         })
         .unwrap();
 
