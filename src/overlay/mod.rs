@@ -96,5 +96,6 @@ fn run(
 
     loop {
         event_loop.dispatch(None, &mut state)?;
+        state.display_handle.flush_clients()?;
     }
 }
