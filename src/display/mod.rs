@@ -420,7 +420,6 @@ pub fn run(
         dc.clone(),
         sizer.clone(),
     )?;
-    // TODO: dissolve this
     let env = CaptureEnv {
         ph,
         global_state: global_state.clone(),
