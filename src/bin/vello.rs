@@ -176,7 +176,10 @@ impl ApplicationHandler for App {
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();
 
                 self.frames_rendered += 1;
-                if self.max_frames.is_some_and(|max| self.frames_rendered >= max) {
+                if self
+                    .max_frames
+                    .is_some_and(|max| self.frames_rendered >= max)
+                {
                     event_loop.exit();
                     return;
                 }
