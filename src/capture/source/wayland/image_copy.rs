@@ -1,4 +1,4 @@
-use super::{Buffer, CaptureMode, FrameState, State, fourcc_to_format};
+use super::{Buffer, FrameState, State, fourcc_to_format};
 use crate::capture::plotter::FrameInfo;
 use crate::utils::compose_timestamp;
 use anyhow::{Context as _, Result, anyhow};
@@ -54,6 +54,8 @@ impl State {
     }
 
     fn image_copy_issue_capture_inner(&mut self) -> Result<()> {
+        self.drain_reclaimed();
+
         let ic = self.image_copy.as_ref().unwrap();
         let c = &ic.caps;
         let width = c.width;
@@ -61,12 +63,15 @@ impl State {
 
         let start = Instant::now();
 
-        let mut buf = self.pool.pop();
-        let reuse = buf.as_ref().is_some_and(|b| {
-            let ext = b.image.extent();
-            (ext[0], ext[1]) == (width, height)
-        });
-        if !reuse {
+        let mut buf = None;
+        while let Some(pooled) = self.pool.pop() {
+            let ext = pooled.image.extent();
+            if (ext[0], ext[1]) == (width, height) {
+                buf = Some(pooled);
+                break;
+            }
+        }
+        if buf.is_none() {
             // Caps may not be available yet if the session Done event hasn't
             // arrived. Return without error; the Done handler will issue the
             // capture.
@@ -81,11 +86,6 @@ impl State {
             let fourcc = entry.format;
             let modifiers = entry.modifiers.clone();
 
-            if let Some(old) = &mut buf
-                && let Some(fence) = old.fence.take()
-            {
-                fence.wait(None)?;
-            }
             buf = Some(Buffer::new(
                 self.device.clone(),
                 self.allocator.as_ref(),
@@ -97,10 +97,7 @@ impl State {
                 height,
             )?);
         }
-        let mut buf = buf.unwrap();
-        if let Some(fence) = buf.fence.take() {
-            fence.wait(None)?;
-        }
+        let buf = buf.unwrap();
         let wait = Instant::now();
 
         let ic = self.image_copy.as_ref().unwrap();
@@ -172,8 +169,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
 
                 // If a capture was deferred because caps weren't ready yet,
                 // issue it now.
-                if matches!(state.mode, CaptureMode::DisplayWaiting) && state.frame_state.is_none()
-                {
+                if state.capturing() && state.frame_state.is_none() {
                     state.image_copy_issue_capture();
                 }
             }
@@ -225,7 +221,6 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
                     present: None,
                     // TODO: start using create_pointer_cursor_session
                     cursor_visible: false,
-                    safety: false,
                 };
                 frame.destroy();
                 state.handle_ready(info, buf);

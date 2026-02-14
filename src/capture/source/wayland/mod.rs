@@ -2,11 +2,14 @@ mod dmabuf_probe;
 mod image_copy;
 mod screencopy;
 
-use super::{BackendType, CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
+use super::{
+    BackendType, CaptureBackendBuilder, CaptureEnv, CapturedFrame, DeviceId, ReclaimedBuffer,
+};
 use crate::GlobalState;
-use crate::capture::SwapchainRenderer;
+use crate::capture::input::InputBridge;
 use crate::capture::input::wayland::WaylandInput;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::source::CaptureBackend;
 use crate::utils::OwningWlBuffer;
 use crate::utils::wayland_connect;
 use anyhow::anyhow;
@@ -29,7 +32,8 @@ use smithay_client_toolkit::{
 };
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd as _;
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::info;
 use vulkano::VulkanObject as _;
@@ -42,7 +46,6 @@ use vulkano::memory::{
     DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, ExternalMemoryHandleTypes,
     MemoryAllocateInfo, ResourceMemory,
 };
-use vulkano::sync::fence::Fence;
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
@@ -51,63 +54,76 @@ use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::zw
 use smithay_client_toolkit::reexports::protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1};
 use smithay_client_toolkit::reexports::protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
 
-pub struct Backend {
+pub struct Builder {
     display: String,
+    backend: BackendType,
     feedback: DmabufFeedback,
 }
 
-impl Backend {
-    pub fn new(display: &str) -> Result<Self> {
+impl Builder {
+    pub fn new(display: &str, backend: BackendType) -> Result<Self> {
         let feedback = dmabuf_probe::query_dmabuf_feedback(display)?;
         Ok(Self {
             display: display.to_owned(),
+            backend,
             feedback,
         })
     }
 }
 
-impl CaptureBackend for Backend {
-    fn device_id(&self) -> DeviceId {
+impl CaptureBackendBuilder for Builder {
+    fn device_id(&self) -> Result<DeviceId> {
         let dev = self.feedback.main_device();
-        DeviceId::DevMajorMinor(nix::sys::stat::major(dev), nix::sys::stat::minor(dev))
+        Ok(DeviceId::DevMajorMinor(
+            nix::sys::stat::major(dev),
+            nix::sys::stat::minor(dev),
+        ))
     }
 
-    fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
+    fn build(
+        self: Box<Self>,
+        env: CaptureEnv,
+    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         let bridge = Box::new(WaylandInput::new(
             &self.display,
             env.sizer.clone(),
             env.ph.clone(),
         )?);
-        let (calloop_tx, calloop_rx) = calloop_channel::channel();
+        let slot: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
+        let (ping_tx, ping_rx) = calloop_channel::channel();
+
         std::thread::Builder::new()
             .name("capture-wayland".into())
             .spawn({
-                let display = self.display;
-                let backend = env.backend;
-                let ph = env.ph.clone();
+                let slot = slot.clone();
                 move || {
+                    let ph = env.ph.clone();
                     ph.fatal(
-                        run(env, &display, calloop_rx)
-                            .context(format!("capture thread ({backend:?})")),
+                        run(env, &self.display, self.backend, slot, ping_rx)
+                            .context(format!("capture thread ({:?})", self.backend)),
                     );
                 }
             })
             .unwrap();
-        Ok(SpawnResult {
-            bridge,
-            wake: Box::new(move || {
-                let _ = calloop_tx.send(());
-            }),
-        })
+
+        Ok((Box::new(Backend { slot, ping_tx }), bridge))
     }
 }
 
-// Main backend state for the calloop event loop
+pub struct Backend {
+    slot: Arc<Mutex<Option<CapturedFrame>>>,
+    ping_tx: calloop_channel::Sender<()>,
+}
+
+impl CaptureBackend for Backend {
+    fn capture(&mut self) -> Result<Option<CapturedFrame>> {
+        let _ = self.ping_tx.send(());
+        let frame = self.slot.lock().unwrap().take();
+        Ok(frame)
+    }
+}
 
 struct State {
-    // ManuallyDrop: SwapchainRenderer must not be dropped on this thread — its Vulkan
-    // swapchain destruction calls wl_proxy_destroy, which is not thread-safe.
-    renderer: std::mem::ManuallyDrop<SwapchainRenderer>,
     ph: PlotterHandle,
     global_state: GlobalState,
     device: Arc<Device>,
@@ -124,10 +140,12 @@ struct State {
     frame_state: Option<FrameState>,
     pool: Vec<Buffer>,
 
-    mode: CaptureMode,
+    slot: Arc<Mutex<Option<CapturedFrame>>>,
+    reclaim_tx: mpsc::Sender<ReclaimedBuffer>,
+    reclaim_rx: mpsc::Receiver<ReclaimedBuffer>,
+
     done: Option<Result<()>>,
     loop_handle: LoopHandle<'static, State>,
-    last_render: Instant,
 }
 
 enum FrameState {
@@ -147,18 +165,6 @@ enum FrameState {
     },
 }
 
-struct PendingFrame {
-    info: FrameInfo,
-    buf: Buffer,
-}
-
-enum CaptureMode {
-    Idle,
-    Capturing,
-    DisplayWaiting,
-    FrameBuffered(PendingFrame),
-}
-
 impl State {
     fn issue_capture(&mut self) {
         if self.screencopy_manager.is_some() {
@@ -170,34 +176,19 @@ impl State {
         }
     }
 
-    fn is_capturing(&self) -> bool {
+    fn capturing(&self) -> bool {
         self.global_state.load().capture
     }
 
-    fn do_render(&mut self, mut buf: Buffer, info: FrameInfo) -> CaptureMode {
-        match self.renderer.render(buf.image.clone(), info) {
-            Ok(fence) => {
-                buf.fence = Some(fence);
-                self.pool.push(buf);
-                self.last_render = Instant::now();
-                CaptureMode::Capturing
-            }
-            Err(e) => {
-                self.pool.push(buf);
-                self.done = Some(Err(e.context("render failed")));
-                CaptureMode::Idle
-            }
+    fn drain_reclaimed(&mut self) {
+        while let Ok(rbuf) = self.reclaim_rx.try_recv() {
+            self.pool.push(Buffer::from(rbuf));
         }
     }
 
-    fn handle_ready(&mut self, mut info: FrameInfo, buf: Buffer) {
-        if !self.is_capturing() {
+    fn handle_ready(&mut self, info: FrameInfo, buf: Buffer) {
+        if !self.capturing() {
             self.pool.push(buf);
-            if let CaptureMode::FrameBuffered(pending) =
-                std::mem::replace(&mut self.mode, CaptureMode::Idle)
-            {
-                self.pool.push(pending.buf);
-            }
             return;
         }
 
@@ -208,71 +199,46 @@ impl State {
                 .rcu(|s| s.with_cursor_visible(info.cursor_visible));
         }
 
-        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
-        let safety = self.last_render.elapsed() >= Duration::from_secs(1);
-        self.mode = match mode {
-            CaptureMode::DisplayWaiting => self.do_render(buf, info),
-            CaptureMode::Capturing if safety => {
-                info.safety = true;
-                self.do_render(buf, info)
-            }
-            CaptureMode::Capturing => CaptureMode::FrameBuffered(PendingFrame { info, buf }),
-            CaptureMode::FrameBuffered(old) if safety => {
-                info.safety = true;
-                self.pool.push(old.buf);
-                self.do_render(buf, info)
-            }
-            CaptureMode::FrameBuffered(old) => {
-                self.ph.capture_miss();
-                self.pool.push(old.buf);
-                CaptureMode::FrameBuffered(PendingFrame { info, buf })
-            }
-            CaptureMode::Idle => unreachable!("handle_ready called while Idle"),
+        let Buffer { wl_buffer, image } = buf;
+        let frame = CapturedFrame {
+            image,
+            backend_data: Some(Box::new(wl_buffer)),
+            info: Some(info),
+            reclaim_tx: self.reclaim_tx.clone(),
         };
+        {
+            let mut slot = self.slot.lock().unwrap();
+            if slot.is_some() {
+                self.ph.capture_miss();
+            }
+            *slot = Some(frame);
+        }
+
         self.issue_capture();
     }
 
     fn handle_failed(&mut self) {
-        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
-
-        if matches!(mode, CaptureMode::Idle) {
-            unreachable!("handle_failed called while Idle");
-        }
-
-        if self.is_capturing() {
-            self.mode = mode;
-            if let Err(e) = self.loop_handle.insert_source(
-                Timer::from_duration(Duration::from_millis(100)),
-                |_, _, state| {
-                    state.issue_capture();
-                    TimeoutAction::Drop
-                },
-            ) {
-                self.done = Some(Err(anyhow!("failed to insert retry timer: {e}")));
-            }
-        } else if let CaptureMode::FrameBuffered(pending) = mode {
-            self.pool.push(pending.buf);
-        }
-    }
-
-    fn handle_wakeup(&mut self) {
-        if !self.is_capturing() {
-            if let Err(e) = self.renderer.blank() {
-                self.done = Some(Err(e.context("render blank failed")));
-            }
-            self.last_render = Instant::now();
+        if !self.capturing() {
             return;
         }
 
-        let mode = std::mem::replace(&mut self.mode, CaptureMode::Idle);
-        self.mode = match mode {
-            CaptureMode::Idle => {
-                self.issue_capture();
-                CaptureMode::DisplayWaiting
-            }
-            CaptureMode::FrameBuffered(pending) => self.do_render(pending.buf, pending.info),
-            CaptureMode::Capturing | CaptureMode::DisplayWaiting => CaptureMode::DisplayWaiting,
-        };
+        if let Err(e) = self.loop_handle.insert_source(
+            Timer::from_duration(Duration::from_millis(100)),
+            |_, _, state| {
+                if state.capturing() && state.frame_state.is_none() {
+                    state.issue_capture();
+                }
+                TimeoutAction::Drop
+            },
+        ) {
+            self.done = Some(Err(anyhow!("failed to insert retry timer: {e}")));
+        }
+    }
+
+    fn handle_ping(&mut self) {
+        if self.capturing() && self.frame_state.is_none() {
+            self.issue_capture();
+        }
     }
 }
 
@@ -331,15 +297,19 @@ delegate_registry!(State);
 delegate_output!(State);
 delegate_dmabuf!(State);
 
-fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
+fn run(
+    env: CaptureEnv,
+    display: &str,
+    backend: BackendType,
+    slot: Arc<Mutex<Option<CapturedFrame>>>,
+    ping_rx: Channel<()>,
+) -> Result<()> {
     let CaptureEnv {
-        renderer,
         ph,
         global_state,
         sizer: _,
         device,
         allocator,
-        backend,
     } = env;
     let use_screencopy = backend == BackendType::Screencopy;
     let conn = wayland_connect(display)?;
@@ -348,6 +318,8 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     let qh = event_queue.handle();
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+
+    let (reclaim_tx, reclaim_rx) = mpsc::channel();
 
     let screencopy_manager: Option<ZwlrScreencopyManagerV1> = if use_screencopy {
         Some(
@@ -360,7 +332,6 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
     };
 
     let mut state = State {
-        renderer: std::mem::ManuallyDrop::new(renderer),
         ph,
         global_state,
         device,
@@ -377,10 +348,12 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
         frame_state: None,
         pool: Vec::new(),
 
-        mode: CaptureMode::Idle,
+        slot,
+        reclaim_tx,
+        reclaim_rx,
+
         done: None,
         loop_handle: event_loop.handle(),
-        last_render: Instant::now(),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -416,22 +389,16 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
 
     event_loop
         .handle()
-        .insert_source(calloop_rx, |event, _, state| match event {
-            calloop_channel::Event::Msg(()) => state.handle_wakeup(),
+        .insert_source(ping_rx, |event, _, state| match event {
+            calloop_channel::Event::Msg(()) => state.handle_ping(),
             calloop_channel::Event::Closed => state.done = Some(Ok(())),
         })
         .map_err(|e| anyhow!("{}", e.error))?;
 
-    state.renderer.blank()?;
-
     loop {
-        event_loop.dispatch(Some(Duration::from_secs(1)), &mut state)?;
+        event_loop.dispatch(None, &mut state)?;
         if let Some(result) = state.done.take() {
             return result;
-        }
-        if !state.is_capturing() && state.last_render.elapsed() >= Duration::from_secs(1) {
-            state.renderer.blank()?;
-            state.last_render = Instant::now();
         }
     }
 }
@@ -439,7 +406,6 @@ fn run(env: CaptureEnv, display: &str, calloop_rx: Channel<()>) -> Result<()> {
 struct Buffer {
     wl_buffer: OwningWlBuffer,
     image: Arc<Image>,
-    fence: Option<Arc<Fence>>,
 }
 
 impl Buffer {
@@ -590,8 +556,16 @@ impl Buffer {
         Ok(Self {
             wl_buffer: OwningWlBuffer(wl_buffer),
             image,
-            fence: None,
         })
+    }
+}
+
+impl From<ReclaimedBuffer> for Buffer {
+    fn from(rbuf: ReclaimedBuffer) -> Self {
+        Self {
+            wl_buffer: *rbuf.backend_data.downcast().unwrap(),
+            image: rbuf.image,
+        }
     }
 }
 

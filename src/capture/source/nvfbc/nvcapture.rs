@@ -34,9 +34,9 @@ pub struct NvfbcFrameInfo {
     pub size: (u32, u32),
     pub byte_size: u32,
     current_frame: u32,
-    is_new_frame: bool,
-    timestamp_us: u64,
-    missed_frames: u32,
+    pub is_new_frame: bool,
+    pub timestamp_us: u64,
+    pub missed_frames: u32,
     required_post_processing: bool,
     direct_capture: bool,
     pub cursor_visible: bool,
@@ -87,6 +87,7 @@ impl NvCapture {
         Ok(NvCapture { handle })
     }
 
+    #[allow(dead_code)]
     pub fn release_thread(&self) -> Result<()> {
         let status = unsafe { nvcapture_release_thread(self.handle) };
         if status != NVFBC_SUCCESS {
@@ -95,6 +96,7 @@ impl NvCapture {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn bind_thread(&self) -> Result<()> {
         let status = unsafe { nvcapture_bind_thread(self.handle) };
         if status != NVFBC_SUCCESS {
@@ -137,6 +139,3 @@ impl Drop for NvCapture {
         }
     }
 }
-
-unsafe impl Send for NvCapture {}
-unsafe impl Sync for NvCapture {}

@@ -1,9 +1,12 @@
 mod nvcapture;
 
 use self::nvcapture::NvCapture;
-use super::{CaptureBackend, CaptureEnv, DeviceId, SpawnResult};
+use super::{CaptureBackendBuilder, CaptureEnv, DeviceId};
+use crate::GlobalState;
+use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
-use crate::capture::plotter::FrameInfo;
+use crate::capture::plotter::{FrameInfo, PlotterHandle};
+use crate::capture::source::{CaptureBackend, CapturedFrame, ReclaimedBuffer};
 use crate::utils::clock_monotonic_ns;
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
@@ -28,140 +31,109 @@ use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sys::RawImage;
 use vulkano::image::{Image, ImageCreateInfo, ImageTiling, ImageUsage};
-use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter};
+use vulkano::memory::allocator::{MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::memory::{
     DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, ExternalMemoryHandleTypes,
     MemoryAllocateInfo, ResourceMemory,
 };
-use vulkano::sync::fence::Fence;
 
-pub struct Backend {
+pub struct Builder {
     ctx: Arc<CudaContext>,
-    capturer: NvCapture,
     display: String,
 }
 
-impl Backend {
+impl Builder {
     pub fn new(display: &str) -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         ctx.set_flags(CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
-        let capturer = NvCapture::new()?;
-        capturer.release_thread()?;
         Ok(Self {
             ctx,
-            capturer,
             display: display.to_owned(),
         })
     }
 }
 
-impl CaptureBackend for Backend {
-    fn device_id(&self) -> DeviceId {
-        DeviceId::Uuid(bytemuck::cast(self.ctx.uuid().unwrap().bytes))
+impl CaptureBackendBuilder for Builder {
+    fn device_id(&self) -> Result<DeviceId> {
+        self.ctx.bind_to_thread()?;
+        Ok(DeviceId::Uuid(bytemuck::cast(self.ctx.uuid()?.bytes)))
     }
 
-    fn spawn(self: Box<Self>, env: CaptureEnv) -> Result<SpawnResult> {
-        let bridgde = Box::new(XInput::new(&self.display)?);
-        let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("capture-nvfbc".into())
-            .spawn({
-                let ph = env.ph.clone();
-                move || {
-                    ph.fatal(
-                        run(self.ctx, self.capturer, env, rx).context("capture thread (nvfbc)"),
-                    );
-                }
-            })
-            .unwrap();
-        Ok(SpawnResult {
-            bridge: bridgde,
-            wake: Box::new(move || {
-                let _ = tx.send(());
+    fn build(
+        self: Box<Self>,
+        env: CaptureEnv,
+    ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
+        self.ctx.bind_to_thread()?;
+        let capturer = NvCapture::new()?;
+        let bridge = Box::new(XInput::new(&self.display)?);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel();
+        Ok((
+            Box::new(Backend {
+                ctx: self.ctx,
+                capturer,
+                ph: env.ph,
+                global_state: env.global_state,
+                device: env.device,
+                allocator: env.allocator,
+                bufs: VecDeque::new(),
+                reclaim_tx,
+                reclaim_rx,
             }),
-        })
+            bridge,
+        ))
     }
 }
 
-fn drain(rx: &mpsc::Receiver<()>) -> bool {
-    let mut got = false;
-    while rx.try_recv().is_ok() {
-        got = true;
-    }
-    got
-}
-
-fn run(
+pub struct Backend {
     ctx: Arc<CudaContext>,
     capturer: NvCapture,
-    env: CaptureEnv,
-    rx: mpsc::Receiver<()>,
-) -> Result<()> {
-    let CaptureEnv {
-        renderer,
-        ph,
-        global_state,
-        sizer: _,
-        device,
-        allocator,
-        backend: _,
-    } = env;
-    // SwapchainRenderer must not be dropped on this thread — its Vulkan swapchain
-    // destruction calls wl_proxy_destroy, which is not thread-safe.
-    let mut renderer = std::mem::ManuallyDrop::new(renderer);
-    ctx.bind_to_thread()?;
-    capturer.bind_thread()?;
-    let mut bufs: VecDeque<Buffer> = VecDeque::new();
+    ph: PlotterHandle,
+    global_state: GlobalState,
+    device: Arc<Device>,
+    allocator: Arc<StandardMemoryAllocator>,
+    bufs: VecDeque<Buffer>,
+    reclaim_tx: mpsc::Sender<ReclaimedBuffer>,
+    reclaim_rx: mpsc::Receiver<ReclaimedBuffer>,
+}
 
-    // First frame: wait for wakeup, render blank
-    rx.recv()?;
-    renderer.blank()?;
-    let mut last_render = Instant::now();
-
-    loop {
-        if !global_state.load().capture {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-            drain(&rx);
-            renderer.blank()?;
-            last_render = Instant::now();
-            continue;
-        }
-
+impl CaptureBackend for Backend {
+    fn capture(&mut self) -> Result<Option<CapturedFrame>> {
         let stream_ptr = std::ptr::null_mut();
-        capturer.bind_thread()?;
-
         let start = Instant::now();
-        let (dptr, info) = capturer.capture_frame(None)?;
+        // TODO: compare info.timestamp_us vs capture_mono_ns
+        let (dptr, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
+        for _ in 0..info.missed_frames {
+            self.ph.capture_miss();
+        }
+        if !info.is_new_frame {
+            return Ok(None);
+        }
+        self.ph.capture();
         let capture_mono_ns = clock_monotonic_ns();
 
-        let mut pooled = bufs.pop_front();
-        let reuse = pooled.as_ref().is_some_and(|p| {
-            let ext = p.image.extent();
-            (ext[0], ext[1]) == info.size
-        });
-        if !reuse {
-            if let Some(old) = &mut pooled
-                && let Some(fence) = old.fence.take()
-            {
-                fence.wait(None)?;
+        while let Ok(rbuf) = self.reclaim_rx.try_recv() {
+            self.bufs.push_back(rbuf.into());
+        }
+
+        let mut buf = None;
+        while let Some(pooled) = self.bufs.pop_front() {
+            let ext = pooled.image.extent();
+            if (ext[0], ext[1]) == info.size {
+                buf = Some(pooled);
+                break;
             }
-            pooled = Some(Buffer::new(
-                device.clone(),
-                &allocator,
-                ctx.clone(),
+        }
+        if buf.is_none() {
+            buf = Some(Buffer::new(
+                self.device.clone(),
+                &self.allocator,
+                self.ctx.clone(),
                 info.size,
             )?);
         }
-        let mut pooled = pooled.unwrap();
+        let buf = buf.unwrap();
 
-        if let Some(fence) = pooled.fence.take() {
-            fence.wait(None)?;
-        }
         let wait = Instant::now();
-
         let (width, height) = info.size;
         let pitch = (width * 4) as usize;
         let copy = CUDA_MEMCPY2D {
@@ -177,7 +149,7 @@ fn run(
             dstMemoryType: CUmemorytype::CU_MEMORYTYPE_ARRAY,
             dstHost: std::ptr::null_mut(),
             dstDevice: 0,
-            dstArray: pooled.cumem.array,
+            dstArray: buf.cumem.array,
             dstPitch: 0,
             WidthInBytes: pitch,
             Height: height as usize,
@@ -186,33 +158,26 @@ fn run(
         unsafe { stream::synchronize(stream_ptr) }?;
         let obtain = Instant::now();
 
-        ph.capture();
-
-        if global_state.load().cursor_visible != info.cursor_visible {
-            global_state.rcu(|s| s.with_cursor_visible(info.cursor_visible));
+        if self.global_state.load().cursor_visible != info.cursor_visible {
+            self.global_state
+                .rcu(|s| s.with_cursor_visible(info.cursor_visible));
         }
 
-        let woke = drain(&rx);
-        if woke || last_render.elapsed() >= Duration::from_secs(1) {
-            let frame_info = FrameInfo {
-                start,
-                wait,
-                obtain,
-                commit: None,
-                capture_mono_ns,
-                present: None,
-                cursor_visible: info.cursor_visible,
-                safety: !woke,
-            };
-            let fence = renderer.render(pooled.image.clone(), frame_info)?;
-            pooled.fence = Some(fence);
-            last_render = Instant::now();
-        } else {
-            ph.capture_miss();
-        }
-
-        assert!(bufs.len() < 4, "buffer pool bloated");
-        bufs.push_back(pooled);
+        let info = FrameInfo {
+            start,
+            wait,
+            obtain,
+            commit: None,
+            capture_mono_ns,
+            present: None,
+            cursor_visible: info.cursor_visible,
+        };
+        Ok(Some(CapturedFrame {
+            info: Some(info),
+            image: buf.image,
+            backend_data: Some(Box::new(buf.cumem)),
+            reclaim_tx: self.reclaim_tx.clone(),
+        }))
     }
 }
 
@@ -274,7 +239,6 @@ unsafe impl Sync for CudaArray {}
 struct Buffer {
     cumem: CudaArray,
     image: Arc<Image>,
-    fence: Option<Arc<Fence>>,
 }
 
 impl Buffer {
@@ -298,7 +262,7 @@ impl Buffer {
         )?;
         let req = raw_image.memory_requirements()[0];
         let alloc = DeviceMemory::allocate(
-            device.clone(),
+            device,
             MemoryAllocateInfo {
                 allocation_size: req.layout.size(),
                 memory_type_index: allocator
@@ -316,10 +280,15 @@ impl Buffer {
                 .bind_memory([ResourceMemory::new_dedicated(alloc)])
                 .map_err(|(e, _, _)| e)?,
         );
-        Ok(Self {
-            cumem,
-            image,
-            fence: None,
-        })
+        Ok(Self { cumem, image })
+    }
+}
+
+impl From<ReclaimedBuffer> for Buffer {
+    fn from(rbuf: ReclaimedBuffer) -> Self {
+        Self {
+            cumem: *rbuf.backend_data.downcast().unwrap(),
+            image: rbuf.image,
+        }
     }
 }

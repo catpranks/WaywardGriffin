@@ -2,14 +2,16 @@ pub mod input;
 pub mod plotter;
 pub mod source;
 
-use crate::capture::plotter::FrameInfo;
+use crate::capture::source::{CapturedFrame, DeviceId};
 use crate::display::DisplayCtx;
-use crate::sizer::Sizer;
+use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use clap::Args;
 use smallvec::smallvec;
 use smithay_client_toolkit::compositor::Region;
+use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
 use source::BackendType;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
@@ -21,11 +23,15 @@ use vulkano::command_buffer::{
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, Queue};
+use vulkano::device::{
+    Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
+};
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage};
+use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
@@ -50,7 +56,7 @@ use vulkano::sync::semaphore::{Semaphore, SemaphoreCreateInfo};
 use vulkano::sync::{
     AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer,
 };
-use vulkano::{VulkanObject as _, single_pass_renderpass};
+use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
 
 #[derive(Debug, Clone, Args)]
 pub struct CaptureOpts {
@@ -140,16 +146,18 @@ struct InFlight {
     present: Arc<Semaphore>,
     fence: Arc<Fence>,
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
+    frames: Vec<Rc<CapturedFrame>>,
 }
 
-pub struct SwapchainRenderer {
+pub struct Renderer {
     dc: DisplayCtx,
+    sizer: SharedSizer,
     last_committed_sizer: Option<Sizer>,
     needs_recreate: bool,
 
     frame_idx: usize,
-
     in_flight: Vec<InFlight>,
+    current_frames: Vec<Option<Rc<CapturedFrame>>>,
     images: Vec<Arc<Framebuffer>>,
     pipeline: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
@@ -159,20 +167,100 @@ pub struct SwapchainRenderer {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
+    pub allocator: Arc<StandardMemoryAllocator>,
     queue: Arc<Queue>,
-    device: Arc<Device>,
+    pub device: Arc<Device>,
     _surface: Arc<Surface>,
     start_time: Instant,
 }
 
-impl SwapchainRenderer {
+impl Renderer {
     pub fn new(
+        conn: &Connection,
+        device_id: DeviceId,
         dc: DisplayCtx,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        surface: Arc<Surface>,
+        sizer: SharedSizer,
     ) -> Result<Self> {
-        let physical_device = device.physical_device();
+        let library = VulkanLibrary::new().context("no Vulkan library")?;
+        let instance = Instance::new(
+            library,
+            InstanceCreateInfo {
+                enabled_extensions: InstanceExtensions {
+                    khr_wayland_surface: true,
+                    khr_external_memory_capabilities: true,
+                    ..InstanceExtensions::empty()
+                },
+                ..Default::default()
+            },
+        )?;
+
+        let physical_device = match device_id {
+            DeviceId::Uuid(uuid) => instance
+                .enumerate_physical_devices()?
+                .find(|p| p.properties().device_uuid == Some(uuid))
+                .context("no physical device with matching UUID")?,
+            DeviceId::DevMajorMinor(major, minor) => instance
+                .enumerate_physical_devices()?
+                .find(|p| {
+                    let props = p.properties();
+                    let major = major as i64;
+                    let minor = minor as i64;
+                    (props.primary_major == Some(major) && props.primary_minor == Some(minor))
+                        || (props.render_major == Some(major) && props.render_minor == Some(minor))
+                })
+                .context("no physical device with matching major/minor")?,
+        };
+
+        let surface = unsafe {
+            Surface::from_wayland(
+                instance,
+                conn.backend().display_ptr() as _,
+                dc.surface.id().as_ptr() as _,
+                None,
+            )?
+        };
+
+        let device_extensions = DeviceExtensions {
+            khr_swapchain: true,
+            khr_external_memory: true,
+            khr_external_memory_fd: true,
+            ext_external_memory_dma_buf: true,
+            khr_external_semaphore_fd: true,
+            khr_timeline_semaphore: true,
+            ext_image_drm_format_modifier: true,
+            ..DeviceExtensions::empty()
+        };
+
+        let queue_family_index = physical_device
+            .queue_family_properties()
+            .iter()
+            .enumerate()
+            .position(|(i, q)| {
+                q.queue_flags.intersects(QueueFlags::GRAPHICS)
+                    && physical_device
+                        .surface_support(i as u32, &surface)
+                        .unwrap_or(false)
+            })
+            .map(|i| i as u32)
+            .context("No graphics queue family found on the device")?;
+
+        let (device, mut queues) = Device::new(
+            physical_device.clone(),
+            DeviceCreateInfo {
+                enabled_extensions: device_extensions,
+                queue_create_infos: vec![QueueCreateInfo {
+                    queue_family_index,
+                    ..Default::default()
+                }],
+                enabled_features: DeviceFeatures {
+                    timeline_semaphore: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?;
+        let queue = queues.next().unwrap();
+        let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
         let (swapchain, swapchain_images) = {
             let surface_capabilities =
@@ -289,16 +377,19 @@ impl SwapchainRenderer {
                     present,
                     fence,
                     last_command_buffer: None,
+                    frames: vec![],
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             dc,
+            sizer,
             last_committed_sizer: None,
             needs_recreate: false,
             frame_idx: 0,
             in_flight,
+            current_frames: vec![None],
             images: Self::build_framebuffers(render_pass.clone(), swapchain_images)?,
             pipeline,
             sampler,
@@ -306,6 +397,7 @@ impl SwapchainRenderer {
             swapchain,
             command_buffer_allocator,
             descriptor_set_allocator,
+            allocator,
             queue,
             device,
             _surface: surface,
@@ -370,7 +462,7 @@ impl SwapchainRenderer {
     }
 
     pub fn blank(&mut self) -> Result<()> {
-        let sizer = self.dc.sizer.load();
+        let sizer = self.sizer.load();
         self.configure(&sizer)?;
 
         let ifli = self.frame_idx % self.in_flight.len();
@@ -439,19 +531,30 @@ impl SwapchainRenderer {
         Ok(())
     }
 
-    pub fn render(&mut self, image: Arc<Image>, mut info: FrameInfo) -> Result<Arc<Fence>> {
+    pub fn render(&mut self, new: Option<CapturedFrame>) -> Result<()> {
+        let info = new.and_then(|mut frame| {
+            let info = frame.info.take();
+            self.current_frames[0] = Some(Rc::new(frame));
+            info
+        });
+        let Some(frame) = self.current_frames[0].as_ref().cloned() else {
+            return self.blank();
+        };
+        let image = frame.image.clone();
+
         let frame_size = image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
-        if self.dc.sizer.load().source_size != frame_size {
-            self.dc.sizer.rcu(|s| s.with_source_size(frame_size));
+        if self.sizer.load().source_size != frame_size {
+            self.sizer.rcu(|s| s.with_source_size(frame_size));
         }
 
-        let sizer = self.dc.sizer.load();
+        let sizer = self.sizer.load();
         self.configure(&sizer)?;
 
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
+        ifl.frames = vec![frame];
 
         let AcquiredImage {
             image_index,
@@ -614,8 +717,8 @@ impl SwapchainRenderer {
             .wait_dst_stage_mask(&[ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
             .signal_semaphores(&present_semaphore);
 
-        info.mark_commit();
-        if !info.safety {
+        if let Some(mut info) = info {
+            info.mark_commit();
             self.dc.request_feedback(info);
         }
 
@@ -642,12 +745,11 @@ impl SwapchainRenderer {
                 .context("present")
         })?;
 
-        let fence = ifl.fence.clone();
         self.frame_idx += 1;
         if is_suboptimal || present_suboptimal {
             info!("suboptimal");
             self.needs_recreate = true;
         }
-        Ok(fence)
+        Ok(())
     }
 }

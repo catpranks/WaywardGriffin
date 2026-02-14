@@ -35,18 +35,16 @@ impl State {
         };
         let vk_format = fourcc_to_format(format)?;
 
-        let mut buf = self.pool.pop();
-
-        let reuse = buf.as_ref().is_some_and(|b| {
-            let ext = b.image.extent();
-            b.image.format() == vk_format && (ext[0], ext[1]) == (width, height)
-        });
-        if !reuse {
-            if let Some(old) = &mut buf
-                && let Some(fence) = old.fence.take()
-            {
-                fence.wait(None)?;
+        self.drain_reclaimed();
+        let mut buf = None;
+        while let Some(pooled) = self.pool.pop() {
+            let ext = pooled.image.extent();
+            if pooled.image.format() == vk_format && (ext[0], ext[1]) == (width, height) {
+                buf = Some(pooled);
+                break;
             }
+        }
+        if buf.is_none() {
             buf = Some(Buffer::new(
                 self.device.clone(),
                 self.allocator.as_ref(),
@@ -58,11 +56,7 @@ impl State {
                 height,
             )?);
         }
-        let mut buf = buf.unwrap();
-
-        if let Some(fence) = buf.fence.take() {
-            fence.wait(None)?;
-        }
+        let buf = buf.unwrap();
         let wait = Instant::now();
 
         frame.copy(&buf.wl_buffer);
@@ -136,7 +130,6 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     capture_mono_ns,
                     present: None,
                     cursor_visible: false,
-                    safety: false,
                 };
                 frame.destroy();
                 state.handle_ready(info, buf);

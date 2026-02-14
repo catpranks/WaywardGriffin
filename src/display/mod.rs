@@ -1,7 +1,8 @@
 mod input;
 
+use crate::capture::Renderer;
 use crate::capture::plotter::{FrameInfo, PlotterHandle};
-use crate::capture::source;
+use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
 use crate::display::input::InputMsg;
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
@@ -54,7 +55,6 @@ use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::clie
 pub struct DisplayCtx {
     pub ph: PlotterHandle,
     pub global_state: GlobalState,
-    pub sizer: SharedSizer,
     pub surface: WlSurface,
     pub viewport: WpViewport,
     pub compositor_state: CompositorState,
@@ -79,8 +79,10 @@ impl DisplayCtx {
 
 struct App {
     loop_handle: LoopHandle<'static, App>,
+    sizer: SharedSizer,
     dc: DisplayCtx,
-    ch: Box<dyn Fn() + Send>,
+    backend: Box<dyn CaptureBackend>,
+    renderer: Renderer,
     input_resize_tx: calloop_channel::Sender<InputMsg>,
 
     // Wayland State
@@ -103,12 +105,11 @@ struct App {
 
 impl App {
     fn handle_resize(&mut self) {
-        let sizer = self.dc.sizer.load();
+        let sizer = self.sizer.load();
         if !sizer.ready() || (sizer.window_size == self.size && sizer.scale120 == self.scale120) {
             return;
         }
-        self.dc
-            .sizer
+        self.sizer
             .rcu(|s| s.with_window_size(self.size, self.scale120));
 
         let _ = self.input_resize_tx.send(InputMsg::Resize);
@@ -159,7 +160,7 @@ impl WindowHandler for App {
             self.handle_resize();
 
             self.dc.surface.frame(qh, self.dc.surface.clone());
-            (self.ch)();
+            self.renderer.blank().unwrap();
         } else {
             self.sched_resize();
         }
@@ -193,7 +194,15 @@ impl CompositorHandler for App {
         _time: u32,
     ) {
         self.dc.surface.frame(qh, self.dc.surface.clone());
-        (self.ch)();
+        if !self.dc.global_state.load().capture {
+            self.renderer.blank().unwrap();
+            return;
+        }
+        let frame = self.backend.capture().unwrap();
+        if frame.is_none() {
+            self.dc.ph.skip();
+        }
+        self.renderer.render(frame).unwrap();
     }
 
     fn surface_enter(
@@ -345,7 +354,6 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for App {
                 let mut deque = state.dc.pending_feedback.lock().unwrap();
                 if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
                     deque.remove(pos);
-                    state.dc.ph.skip();
                 }
             }
             _ => {}
@@ -396,9 +404,8 @@ pub fn run(
 
     let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, ())?;
     let dc = DisplayCtx {
-        ph,
+        ph: ph.clone(),
         global_state: global_state.clone(),
-        sizer: sizer.clone(),
         surface: surface.clone(),
         viewport,
         compositor_state,
@@ -406,17 +413,28 @@ pub fn run(
         pending_feedback: Arc::new(Mutex::new(VecDeque::new())),
         qh: qh.clone(),
     };
-    let source::SpawnResult { bridge, wake: ch } =
-        source::setup_and_spawn(&opts.capture_opts, dc.clone(), &conn)?;
+    let backend_builder = create_backend_builder(&opts.capture_opts)?;
+    let renderer = Renderer::new(
+        &conn,
+        backend_builder.device_id()?,
+        dc.clone(),
+        sizer.clone(),
+    )?;
+    // TODO: dissolve this
+    let env = CaptureEnv {
+        ph,
+        global_state: global_state.clone(),
+        sizer: sizer.clone(),
+        device: renderer.device.clone(),
+        allocator: renderer.allocator.clone(),
+    };
+    let (backend, bridge) = backend_builder.build(env)?;
 
-    // Spawn input thread
     let (input_resize_tx, input_resize_rx) = calloop_channel::channel();
     let input_conn = conn.clone();
     let input_globals = globals.clone();
     let input_surface = surface.clone();
-    let input_global_state = global_state.clone();
     let input_sizer = sizer.clone();
-    let input_confined = opts.confine;
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
@@ -424,10 +442,10 @@ pub fn run(
                 input_conn,
                 input_globals,
                 input_surface,
-                input_global_state,
+                global_state,
                 input_sizer,
                 bridge,
-                input_confined,
+                opts.confine,
                 input_resize_rx,
             ) {
                 info!("input thread error: {e:#}");
@@ -437,8 +455,10 @@ pub fn run(
 
     let mut app = App {
         loop_handle: loop_handle.clone(),
+        sizer,
         dc,
-        ch,
+        backend,
+        renderer,
         input_resize_tx,
 
         // Wayland State
