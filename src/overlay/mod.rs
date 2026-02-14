@@ -23,10 +23,10 @@ use vulkano::sync::semaphore::{
 
 pub struct OverlayFrame {
     pub image: Arc<Image>,
-    pub acquire_point: DrmSyncPoint,
-    pub release_point: DrmSyncPoint,
-    pub buffer: wl_buffer::WlBuffer,
-    pub frame_callbacks: Vec<wl_callback::WlCallback>,
+    acquire_point: DrmSyncPoint,
+    release_point: DrmSyncPoint,
+    buffer: wl_buffer::WlBuffer,
+    frame_callbacks: Vec<wl_callback::WlCallback>,
     start: Instant,
 }
 
@@ -70,8 +70,13 @@ impl Drop for OverlayFrame {
 pub type OverlaySlot = Arc<Mutex<Option<OverlayFrame>>>;
 
 pub struct OverlayHandle {
-    pub slot: OverlaySlot,
-    pub socket_name: String,
+    slot: OverlaySlot,
+}
+
+impl OverlayHandle {
+    pub fn take(&self) -> Option<OverlayFrame> {
+        self.slot.lock().unwrap().take()
+    }
 }
 
 pub fn spawn(
@@ -102,7 +107,7 @@ pub fn spawn(
         })
         .unwrap();
 
-    Ok(OverlayHandle { slot, socket_name })
+    Ok(OverlayHandle { slot })
 }
 
 fn run(
