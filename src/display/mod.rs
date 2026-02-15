@@ -432,11 +432,10 @@ pub fn run(
     let env = CaptureEnv {
         ph,
         global_state: global_state.clone(),
-        sizer: sizer.clone(),
         device: renderer.device.clone(),
         allocator: renderer.allocator.clone(),
     };
-    let (backend, bridge) = backend_builder.build(env)?;
+    let (backend, bridge) = backend_builder.build(env, sizer.clone())?;
 
     let (input_resize_tx, input_resize_rx) = calloop_channel::channel();
     input::spawn(

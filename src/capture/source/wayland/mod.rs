@@ -10,6 +10,7 @@ use crate::capture::input::InputBridge;
 use crate::capture::input::wayland::WaylandInput;
 use crate::capture::source::CaptureBackend;
 use crate::plotter::{FrameInfo, PlotterHandle};
+use crate::sizer::SharedSizer;
 use crate::utils::wayland_connect;
 use crate::utils::{OwningWlBuffer, create_drm_modifier_image, fourcc_to_vk_format};
 use anyhow::anyhow;
@@ -79,12 +80,9 @@ impl CaptureBackendBuilder for Builder {
     fn build(
         self: Box<Self>,
         env: CaptureEnv,
+        sizer: SharedSizer,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
-        let bridge = Box::new(WaylandInput::new(
-            &self.display,
-            env.sizer.clone(),
-            env.ph.clone(),
-        )?);
+        let bridge = Box::new(WaylandInput::new(&self.display, sizer, env.ph.clone())?);
         let slot: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
         let (ping_tx, ping_rx) = calloop_channel::channel();
 
@@ -302,7 +300,6 @@ fn run(
     let CaptureEnv {
         ph,
         global_state,
-        sizer: _,
         device,
         allocator,
     } = env;

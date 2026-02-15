@@ -7,6 +7,7 @@ use crate::capture::input::InputBridge;
 use crate::capture::input::xinput::XInput;
 use crate::capture::source::{CaptureBackend, CapturedFrame, ReclaimedBuffer};
 use crate::plotter::{FrameInfo, PlotterHandle};
+use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
@@ -61,6 +62,7 @@ impl CaptureBackendBuilder for Builder {
     fn build(
         self: Box<Self>,
         env: CaptureEnv,
+        _sizer: SharedSizer,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         self.ctx.bind_to_thread()?;
         let capturer = NvCapture::new()?;

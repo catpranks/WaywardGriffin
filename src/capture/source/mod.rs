@@ -32,7 +32,6 @@ pub enum DeviceId {
 pub struct CaptureEnv {
     pub ph: PlotterHandle,
     pub global_state: GlobalState,
-    pub sizer: SharedSizer,
     pub device: Arc<Device>,
     pub allocator: Arc<StandardMemoryAllocator>,
 }
@@ -42,6 +41,7 @@ pub trait CaptureBackendBuilder: 'static {
     fn build(
         self: Box<Self>,
         env: CaptureEnv,
+        sizer: SharedSizer,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)>;
 }
 
