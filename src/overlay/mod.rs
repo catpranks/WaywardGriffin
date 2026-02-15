@@ -3,8 +3,7 @@ pub mod state;
 use crate::plotter::PlotterHandle;
 use anyhow::{Context as _, Result, anyhow};
 use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::ping::Ping;
-use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
+use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction, ping};
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
@@ -31,7 +30,7 @@ pub struct OverlayFrame {
     buffer: WlBuffer,
     frame_callbacks: Cell<Vec<WlCallback>>,
     start: Instant,
-    flush_ping: Ping,
+    flush_ping: ping::Ping,
 }
 
 impl OverlayFrame {
@@ -96,7 +95,7 @@ impl OverlayHandle {
     ) -> Result<Self> {
         let slot: OverlaySlot = Arc::new(Mutex::new(OverlayState::Inactive));
 
-        let (flush_ping, flush_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
+        let (flush_ping, flush_ping_source) = ping::make_ping()?;
 
         let display: Display<State> = Display::new().context("failed to create wayland display")?;
         let dh = display.handle();
@@ -138,7 +137,7 @@ fn run(
     display: Display<State>,
     mut state: State,
     listening_socket: ListeningSocketSource,
-    flush_ping_source: smithay::reexports::calloop::ping::PingSource,
+    flush_ping_source: ping::PingSource,
 ) -> Result<()> {
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
 

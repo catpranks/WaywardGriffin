@@ -12,7 +12,7 @@ use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
 use smithay::input::{SeatHandler, SeatState};
-use smithay::reexports::calloop::ping::Ping;
+use smithay::reexports::calloop::ping;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_seat;
@@ -66,7 +66,7 @@ pub struct State {
     pub image_cache: HashMap<Dmabuf, Arc<Image>>,
 
     pub slot: OverlaySlot,
-    pub flush_ping: Ping,
+    pub flush_ping: ping::Ping,
     pub toplevels: Vec<ToplevelSurface>,
     pub size: Size<i32, Logical>,
     start: Instant,
@@ -88,7 +88,7 @@ impl State {
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
         slot: OverlaySlot,
-        flush_ping: Ping,
+        flush_ping: ping::Ping,
     ) -> Result<Self> {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
