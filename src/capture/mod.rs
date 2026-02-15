@@ -3,7 +3,7 @@ pub mod source;
 
 use crate::capture::source::{CapturedFrame, DeviceId};
 use crate::display::DisplayCtx;
-use crate::overlay::OverlayFrame;
+use crate::overlay::{OverlayFrame, OverlayState};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use clap::Args;
@@ -183,7 +183,7 @@ pub struct Renderer {
 
     frame_idx: usize,
     in_flight: Vec<InFlight>,
-    current_frames: Vec<Option<Rc<CapturedFrame>>>,
+    current_frame: Option<Rc<CapturedFrame>>,
     images: Vec<Arc<Framebuffer>>,
     textured_pipeline: Arc<GraphicsPipeline>,
     border_pipeline: Arc<GraphicsPipeline>,
@@ -434,7 +434,7 @@ impl Renderer {
             needs_recreate: false,
             frame_idx: 0,
             in_flight,
-            current_frames: vec![None],
+            current_frame: None,
             images: Self::build_framebuffers(render_pass.clone(), swapchain_images)?,
             textured_pipeline,
             border_pipeline,
@@ -581,21 +581,20 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn render(
-        &mut self,
-        mut new: Option<CapturedFrame>,
-        overlay: Option<OverlayFrame>,
-    ) -> Result<()> {
+    pub fn render(&mut self, mut new: Option<CapturedFrame>, overlay: OverlayState) -> Result<()> {
         let has_new_frame = new.is_some();
         let info = new.as_mut().and_then(|f| f.info.take());
-        let old_frame = new.and_then(|f| self.current_frames[0].replace(Rc::new(f)));
-        let Some(frame) = self.current_frames[0].clone() else {
+        let old_frame = new.and_then(|f| self.current_frame.replace(Rc::new(f)));
+        let Some(current_frame) = self.current_frame.clone() else {
             return self.blank();
         };
-        let image = frame.image.clone();
+        let image = current_frame.image.clone();
 
-        let has_new_overlay = overlay.is_some();
-        let old_overlay = overlay.and_then(|ol| self.current_overlay.replace(Rc::new(ol)));
+        let (has_new_overlay, old_overlay) = match overlay {
+            OverlayState::Frame(ol) => (true, self.current_overlay.replace(Rc::new(ol))),
+            OverlayState::Pending => (false, None),
+            OverlayState::Inactive => (false, self.current_overlay.take()),
+        };
 
         let frame_size = image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
@@ -613,7 +612,7 @@ impl Renderer {
         if let Some(ref old) = old_frame {
             ifl.frames.push(old.clone());
         }
-        ifl.frames.push(frame);
+        ifl.frames.push(current_frame);
         ifl.overlays.clear();
         if let Some(ref old) = old_overlay {
             ifl.overlays.push(old.clone());

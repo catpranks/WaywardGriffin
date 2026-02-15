@@ -64,8 +64,6 @@ C code in `src/c/nvcapture.c` compiled via build.rs (cc crate).
 - [x] Wayland clipboard
 - [ ] Input injector (libei)
 - [x] Input injector (virtual keyboard/pointer)
-- [ ] struct: (old (optional captured frame, map layer no -> some/none/not applicable overlay frame)
-- [ ] audit the thread prepare->spawn pattern for consistency
-- [ ] dissolve overlay State::new perhaps
+- [x] audit the thread prepare->spawn pattern for consistency
 - [ ] overlay compositor modifiers
 - [ ] overlay compositor resizing

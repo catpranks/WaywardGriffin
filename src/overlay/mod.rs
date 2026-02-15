@@ -73,7 +73,16 @@ impl Drop for OverlayFrame {
     }
 }
 
-pub type OverlaySlot = Arc<Mutex<Option<OverlayFrame>>>;
+pub enum OverlayState {
+    /// New frame from overlay compositor.
+    Frame(OverlayFrame),
+    /// Toplevels exist but no new frame since last take.
+    Pending,
+    /// No toplevels connected.
+    Inactive,
+}
+
+pub type OverlaySlot = Arc<Mutex<OverlayState>>;
 
 pub struct OverlayHandle {
     slot: OverlaySlot,
@@ -85,7 +94,7 @@ impl OverlayHandle {
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
     ) -> Result<Self> {
-        let slot: OverlaySlot = Arc::new(Mutex::new(None));
+        let slot: OverlaySlot = Arc::new(Mutex::new(OverlayState::Inactive));
 
         let (flush_ping, flush_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
 
@@ -115,8 +124,13 @@ impl OverlayHandle {
         Ok(OverlayHandle { slot })
     }
 
-    pub fn take(&self) -> Option<OverlayFrame> {
-        self.slot.lock().unwrap().take()
+    pub fn take(&self) -> OverlayState {
+        let mut guard = self.slot.lock().unwrap();
+        match &*guard {
+            OverlayState::Frame(_) => std::mem::replace(&mut *guard, OverlayState::Pending),
+            OverlayState::Pending => OverlayState::Pending,
+            OverlayState::Inactive => OverlayState::Inactive,
+        }
     }
 }
 

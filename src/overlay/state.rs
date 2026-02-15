@@ -1,6 +1,6 @@
 use crate::utils::{create_drm_modifier_image, fourcc_to_vk_format};
 
-use super::{OverlayFrame, OverlaySlot};
+use super::{OverlayFrame, OverlaySlot, OverlayState};
 use anyhow::{Context as _, Result, ensure};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
@@ -283,7 +283,7 @@ impl CompositorHandler for State {
                             start: self.start,
                             flush_ping: self.flush_ping.clone(),
                         };
-                        *self.slot.lock().unwrap() = Some(frame);
+                        *self.slot.lock().unwrap() = OverlayState::Frame(frame);
                     }
                     Err(_) => {
                         warn!("non-dmabuf buffer (shm?) ignored");
@@ -337,10 +337,17 @@ impl XdgShellHandler for State {
         surface.send_configure();
         debug!("new overlay toplevel (total: {})", self.toplevels.len() + 1);
         self.toplevels.push(surface);
+        let mut guard = self.slot.lock().unwrap();
+        if matches!(*guard, OverlayState::Inactive) {
+            *guard = OverlayState::Pending;
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.toplevels.retain(|t| t != &surface);
+        if self.toplevels.is_empty() {
+            *self.slot.lock().unwrap() = OverlayState::Inactive;
+        }
         debug!(
             "overlay toplevel destroyed (remaining: {})",
             self.toplevels.len()

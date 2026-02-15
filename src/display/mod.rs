@@ -200,12 +200,12 @@ impl CompositorHandler for App {
             self.renderer.blank().unwrap();
             return;
         }
-        let frame = self.backend.capture().unwrap();
-        if frame.is_none() {
+        let capture = self.backend.capture().unwrap();
+        if capture.is_none() {
             self.dc.ph.skip();
         }
         let overlay = self.overlay_handle.take();
-        self.renderer.render(frame, overlay).unwrap();
+        self.renderer.render(capture, overlay).unwrap();
     }
 
     fn surface_enter(
