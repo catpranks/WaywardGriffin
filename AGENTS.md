@@ -66,4 +66,4 @@ C code in `src/c/nvcapture.c` compiled via build.rs (cc crate).
 - [x] Input injector (virtual keyboard/pointer)
 - [x] audit the thread prepare->spawn pattern for consistency
 - [x] overlay compositor modifiers
-- [ ] overlay compositor resizing
+- [x] overlay compositor resizing

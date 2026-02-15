@@ -1,6 +1,7 @@
 pub mod state;
 
 use crate::plotter::PlotterHandle;
+use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result, anyhow};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction, ping};
@@ -92,6 +93,7 @@ impl OverlayHandle {
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
         ph: PlotterHandle,
+        sizer: SharedSizer,
     ) -> Result<Self> {
         let slot: OverlaySlot = Arc::new(Mutex::new(OverlayState::Inactive));
 
@@ -99,7 +101,7 @@ impl OverlayHandle {
 
         let display: Display<State> = Display::new().context("failed to create wayland display")?;
         let dh = display.handle();
-        let state = State::new(dh, device, allocator, slot.clone(), flush_ping)?;
+        let state = State::new(dh, device, allocator, slot.clone(), flush_ping, sizer)?;
 
         let listening_socket =
             ListeningSocketSource::with_name("waygriff-0").context("failed to bind socket")?;
@@ -176,6 +178,7 @@ fn run(
 
     loop {
         event_loop.dispatch(None, &mut state)?;
+        state.check_resize();
         state.display_handle.flush_clients()?;
     }
 }

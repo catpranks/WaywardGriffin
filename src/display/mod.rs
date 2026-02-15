@@ -427,6 +427,7 @@ pub fn run(
         renderer.device.clone(),
         renderer.allocator.clone(),
         ph.clone(),
+        sizer.clone(),
     )?;
 
     let env = CaptureEnv {

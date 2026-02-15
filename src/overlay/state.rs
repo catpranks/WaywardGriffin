@@ -1,6 +1,7 @@
 use crate::utils::{create_drm_modifier_image, fourcc_to_vk_format};
 
 use super::{OverlayFrame, OverlaySlot, OverlayState};
+use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result, ensure};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
@@ -68,6 +69,7 @@ pub struct State {
     pub slot: OverlaySlot,
     pub flush_ping: ping::Ping,
     pub toplevels: Vec<ToplevelSurface>,
+    pub sizer: SharedSizer,
     pub size: Size<i32, Logical>,
     start: Instant,
 }
@@ -89,6 +91,7 @@ impl State {
         allocator: Arc<StandardMemoryAllocator>,
         slot: OverlaySlot,
         flush_ping: ping::Ping,
+        sizer: SharedSizer,
     ) -> Result<Self> {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
@@ -155,9 +158,36 @@ impl State {
             slot,
             flush_ping,
             toplevels: Vec::new(),
-            size: Size::from((1280, 720)),
+            sizer: sizer.clone(),
+            size: {
+                let s = sizer.load();
+                if s.source_size != (0, 0) {
+                    Size::from((s.source_size.0 as i32, s.source_size.1 as i32))
+                } else {
+                    Size::from((1280, 720))
+                }
+            },
             start: Instant::now(),
         })
+    }
+
+    pub fn check_resize(&mut self) {
+        let s = self.sizer.load();
+        let source = s.source_size;
+        if source == (0, 0) {
+            return;
+        }
+        let new_size = Size::from((source.0 as i32, source.1 as i32));
+        if new_size == self.size {
+            return;
+        }
+        self.size = new_size;
+        for surface in &self.toplevels {
+            surface.with_pending_state(|state| {
+                state.size = Some(new_size);
+            });
+            surface.send_configure();
+        }
     }
 
     fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> Result<Arc<Image>> {
