@@ -10,8 +10,8 @@ use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_callback};
 use smithay::wayland::drm_syncobj::DrmSyncPoint;
 use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
-use std::fs::File;
 use std::cell::Cell;
+use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
@@ -112,8 +112,7 @@ pub fn spawn(
         .name("overlay".into())
         .spawn(move || {
             ph.fatal(
-                run(display, state, listening_socket, flush_ping_source)
-                    .context("overlay thread"),
+                run(display, state, listening_socket, flush_ping_source).context("overlay thread"),
             );
         })
         .unwrap();

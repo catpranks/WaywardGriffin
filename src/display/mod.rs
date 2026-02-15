@@ -2,8 +2,8 @@ mod input;
 
 use crate::capture::Renderer;
 use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
-use crate::overlay::{self, OverlayHandle};
 use crate::display::input::InputMsg;
+use crate::overlay::{self, OverlayHandle};
 use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
@@ -423,8 +423,11 @@ pub fn run(
         dc.clone(),
         sizer.clone(),
     )?;
-    let overlay_handle =
-        overlay::spawn(renderer.device.clone(), renderer.allocator.clone(), ph.clone())?;
+    let overlay_handle = overlay::spawn(
+        renderer.device.clone(),
+        renderer.allocator.clone(),
+        ph.clone(),
+    )?;
 
     let env = CaptureEnv {
         ph,
