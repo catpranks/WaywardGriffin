@@ -125,7 +125,7 @@ impl ApplicationHandler for App {
                 self.scene.fill(
                     Fill::NonZero,
                     Affine::IDENTITY,
-                    Color::new([1.0, 0.0, 0.0, 1.0]),
+                    Color::new([0.5, 0.0, 0.0, 0.5]),
                     None,
                     &Rect::new(x, y, x + 60.0, y + 60.0),
                 );

@@ -38,7 +38,7 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::warn;
 use vulkano::device::Device;
 use vulkano::image::Image;
 use vulkano::image::ImageUsage;
@@ -100,16 +100,28 @@ impl State {
         let minor = props.render_minor.context("no render_minor on device")? as u64;
 
         let dev_t = nix::sys::stat::makedev(major, minor);
-        let formats = vec![
-            Format {
-                code: Fourcc::Argb8888,
-                modifier: Modifier::Linear,
-            },
-            Format {
-                code: Fourcc::Xrgb8888,
-                modifier: Modifier::Linear,
-            },
-        ];
+        let phys = device.physical_device();
+        let format_props = phys
+            .format_properties(vulkano::format::Format::B8G8R8A8_SRGB)
+            .context("format_properties for B8G8R8A8_SRGB")?;
+        let modifiers: Vec<Modifier> = format_props
+            .drm_format_modifier_properties
+            .iter()
+            .filter(|p| {
+                p.drm_format_modifier_plane_count == 1
+                    && p.drm_format_modifier_tiling_features
+                        .intersects(vulkano::format::FormatFeatures::SAMPLED_IMAGE)
+            })
+            .map(|p| Modifier::from(p.drm_format_modifier))
+            .collect();
+        let formats: Vec<Format> = [Fourcc::Argb8888, Fourcc::Xrgb8888]
+            .into_iter()
+            .flat_map(|code| {
+                modifiers
+                    .iter()
+                    .map(move |&modifier| Format { code, modifier })
+            })
+            .collect();
         let feedback = DmabufFeedbackBuilder::new(dev_t, formats)
             .build()
             .context("failed to build dmabuf feedback")?;
@@ -220,14 +232,6 @@ impl State {
                 .map_err(|(e, _, _)| e)?,
         );
 
-        debug!(
-            w = size.w,
-            h = size.h,
-            format = ?fmt.code,
-            modifier = format!("{modifier:#x}"),
-            "imported dmabuf into vulkano image"
-        );
-
         self.image_cache.insert(dmabuf.clone(), image.clone());
         Ok(image)
     }
@@ -300,9 +304,7 @@ impl BufferHandler for State {
     fn buffer_destroyed(&mut self, buffer: &wl_buffer::WlBuffer) {
         if let Ok(dmabuf) = get_dmabuf(buffer)
             && self.image_cache.remove(dmabuf).is_some()
-        {
-            debug!("evicted cached image for destroyed buffer");
-        }
+        {}
     }
 }
 
@@ -335,7 +337,6 @@ impl XdgShellHandler for State {
             state.states.set(xdg_toplevel::State::Activated);
         });
         surface.send_configure();
-        debug!("new overlay toplevel (total: {})", self.toplevels.len() + 1);
         self.toplevels.push(surface);
         let mut guard = self.slot.lock().unwrap();
         if matches!(*guard, OverlayState::Inactive) {
@@ -348,10 +349,6 @@ impl XdgShellHandler for State {
         if self.toplevels.is_empty() {
             *self.slot.lock().unwrap() = OverlayState::Inactive;
         }
-        debug!(
-            "overlay toplevel destroyed (remaining: {})",
-            self.toplevels.len()
-        );
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
