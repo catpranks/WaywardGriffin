@@ -80,45 +80,44 @@ pub struct OverlayHandle {
 }
 
 impl OverlayHandle {
+    pub fn new(
+        device: Arc<Device>,
+        allocator: Arc<StandardMemoryAllocator>,
+        ph: PlotterHandle,
+    ) -> Result<Self> {
+        let slot: OverlaySlot = Arc::new(Mutex::new(None));
+
+        let (flush_ping, flush_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
+
+        let display: Display<State> = Display::new().context("failed to create wayland display")?;
+        let dh = display.handle();
+        let state = State::new(dh, device, allocator, slot.clone(), flush_ping)?;
+
+        let listening_socket =
+            ListeningSocketSource::with_name("waygriff-0").context("failed to bind socket")?;
+        let socket_name = listening_socket
+            .socket_name()
+            .to_str()
+            .context("socket name not utf-8")?
+            .to_owned();
+        info!(socket = %socket_name, "overlay compositor listening");
+
+        let ph = ph.clone();
+        std::thread::Builder::new()
+            .name("overlay".into())
+            .spawn(move || {
+                ph.fatal(
+                    run(display, state, listening_socket, flush_ping_source)
+                        .context("overlay thread"),
+                );
+            })?;
+
+        Ok(OverlayHandle { slot })
+    }
+
     pub fn take(&self) -> Option<OverlayFrame> {
         self.slot.lock().unwrap().take()
     }
-}
-
-pub fn spawn(
-    device: Arc<Device>,
-    allocator: Arc<StandardMemoryAllocator>,
-    ph: PlotterHandle,
-) -> Result<OverlayHandle> {
-    let slot: OverlaySlot = Arc::new(Mutex::new(None));
-
-    let (flush_ping, flush_ping_source) =
-        smithay::reexports::calloop::ping::make_ping().context("failed to create flush ping")?;
-
-    let display: Display<State> = Display::new().context("failed to create wayland display")?;
-    let dh = display.handle();
-    let state = State::new(dh, device, allocator, slot.clone(), flush_ping)?;
-
-    let listening_socket =
-        ListeningSocketSource::with_name("waygriff-0").context("failed to bind socket")?;
-    let socket_name = listening_socket
-        .socket_name()
-        .to_str()
-        .context("socket name not utf-8")?
-        .to_owned();
-    info!(socket = %socket_name, "overlay compositor listening");
-
-    let ph = ph.clone();
-    std::thread::Builder::new()
-        .name("overlay".into())
-        .spawn(move || {
-            ph.fatal(
-                run(display, state, listening_socket, flush_ping_source).context("overlay thread"),
-            );
-        })
-        .unwrap();
-
-    Ok(OverlayHandle { slot })
 }
 
 fn run(

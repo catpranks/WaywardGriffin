@@ -99,8 +99,7 @@ impl CaptureBackendBuilder for Builder {
                             .context(format!("capture thread ({:?})", self.backend)),
                     );
                 }
-            })
-            .unwrap();
+            })?;
 
         Ok((Box::new(Backend { slot, ping_tx }), bridge))
     }

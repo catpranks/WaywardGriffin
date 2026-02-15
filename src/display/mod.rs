@@ -3,7 +3,7 @@ mod input;
 use crate::capture::Renderer;
 use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
 use crate::display::input::InputMsg;
-use crate::overlay::{self, OverlayHandle};
+use crate::overlay::OverlayHandle;
 use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
@@ -423,7 +423,7 @@ pub fn run(
         dc.clone(),
         sizer.clone(),
     )?;
-    let overlay_handle = overlay::spawn(
+    let overlay_handle = OverlayHandle::new(
         renderer.device.clone(),
         renderer.allocator.clone(),
         ph.clone(),
@@ -439,27 +439,17 @@ pub fn run(
     let (backend, bridge) = backend_builder.build(env)?;
 
     let (input_resize_tx, input_resize_rx) = calloop_channel::channel();
-    let input_conn = conn.clone();
-    let input_globals = globals.clone();
-    let input_surface = surface.clone();
-    let input_sizer = sizer.clone();
-    std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || {
-            if let Err(e) = input::run(
-                input_conn,
-                input_globals,
-                input_surface,
-                global_state,
-                input_sizer,
-                bridge,
-                opts.confine,
-                input_resize_rx,
-            ) {
-                info!("input thread error: {e:#}");
-            }
-        })
-        .unwrap();
+    input::spawn(
+        conn.clone(),
+        globals.clone(),
+        surface.clone(),
+        global_state,
+        sizer.clone(),
+        bridge,
+        opts.confine,
+        input_resize_rx,
+        dc.ph.clone(),
+    )?;
 
     let mut app = App {
         loop_handle: loop_handle.clone(),

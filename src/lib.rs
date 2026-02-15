@@ -86,8 +86,7 @@ pub fn run() -> Result<()> {
             ph.fatal(
                 display::run(opts2, global_state, ph.clone(), sizer2).context("display thread"),
             );
-        })
-        .unwrap();
+        })?;
     plotter.run(opts.tdelay)
 }
 

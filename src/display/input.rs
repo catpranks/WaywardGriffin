@@ -1,7 +1,8 @@
 use crate::GlobalState;
 use crate::capture::input::InputBridge;
+use crate::plotter::PlotterHandle;
 use crate::sizer::SharedSizer;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use copypasta::ClipboardProvider as _;
 use copypasta::wayland_clipboard::{
     self, Clipboard as WaylandClipboard, Primary as WaylandPrimary,
@@ -615,7 +616,7 @@ delegate_shm!(InputApp);
 delegate_simple!(InputApp, ZwpKeyboardShortcutsInhibitManagerV1, 1);
 
 #[allow(clippy::too_many_arguments)]
-pub fn run(
+pub fn spawn(
     conn: Connection,
     globals: Arc<smithay_client_toolkit::reexports::client::globals::GlobalList>,
     surface: WlSurface,
@@ -624,6 +625,7 @@ pub fn run(
     bridge: Box<dyn InputBridge>,
     confined: bool,
     resize_rx: Channel<InputMsg>,
+    ph: PlotterHandle,
 ) -> Result<()> {
     let (wl_primary, wl_clipboard) = unsafe {
         wayland_clipboard::create_clipboards_from_external(conn.display().id().as_ptr() as *mut _)
@@ -647,9 +649,6 @@ pub fn run(
         }
     };
     let cursor_surface = compositor_state.create_surface(&qh);
-
-    let mut event_loop: EventLoop<InputApp> = EventLoop::try_new()?;
-    let loop_handle = event_loop.handle();
 
     let mut app = InputApp {
         qh: qh.clone(),
@@ -688,6 +687,24 @@ pub fn run(
 
     // Discover seats
     event_queue.roundtrip(&mut app)?;
+
+    std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || {
+            ph.fatal(run(conn, event_queue, app, resize_rx).context("input thread"));
+        })?;
+
+    Ok(())
+}
+
+fn run(
+    conn: Connection,
+    event_queue: EventQueue<InputApp>,
+    mut app: InputApp,
+    resize_rx: Channel<InputMsg>,
+) -> Result<()> {
+    let mut event_loop: EventLoop<InputApp> = EventLoop::try_new()?;
+    let loop_handle = event_loop.handle();
 
     loop_handle
         .insert_source(resize_rx, |event, _, app| match event {
