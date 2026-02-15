@@ -3,6 +3,7 @@ pub mod state;
 use crate::plotter::PlotterHandle;
 use anyhow::{Context as _, Result, anyhow};
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_callback};
@@ -28,6 +29,7 @@ pub struct OverlayFrame {
     buffer: wl_buffer::WlBuffer,
     frame_callbacks: Vec<wl_callback::WlCallback>,
     start: Instant,
+    flush_ping: Ping,
 }
 
 impl OverlayFrame {
@@ -41,6 +43,7 @@ impl OverlayFrame {
     /// Send frame callbacks to the client, indicating it's a good time to render.
     pub fn presented(&mut self) {
         self.send_frame_callbacks();
+        self.flush_ping.ping();
     }
 
     /// Export the acquire point as a Vulkan semaphore for GPU-side waiting.
@@ -64,6 +67,7 @@ impl Drop for OverlayFrame {
         }
         self.buffer.release();
         self.send_frame_callbacks();
+        self.flush_ping.ping();
     }
 }
 
@@ -86,9 +90,12 @@ pub fn spawn(
 ) -> Result<OverlayHandle> {
     let slot: OverlaySlot = Arc::new(Mutex::new(None));
 
+    let (flush_ping, flush_ping_source) =
+        smithay::reexports::calloop::ping::make_ping().context("failed to create flush ping")?;
+
     let display: Display<State> = Display::new().context("failed to create wayland display")?;
     let dh = display.handle();
-    let state = State::new(dh, device, allocator, slot.clone())?;
+    let state = State::new(dh, device, allocator, slot.clone(), flush_ping)?;
 
     let listening_socket =
         ListeningSocketSource::with_name("waygriff-0").context("failed to bind socket")?;
@@ -103,7 +110,10 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("overlay".into())
         .spawn(move || {
-            ph.fatal(run(display, state, listening_socket).context("overlay thread"));
+            ph.fatal(
+                run(display, state, listening_socket, flush_ping_source)
+                    .context("overlay thread"),
+            );
         })
         .unwrap();
 
@@ -114,8 +124,14 @@ fn run(
     display: Display<State>,
     mut state: State,
     listening_socket: ListeningSocketSource,
+    flush_ping_source: smithay::reexports::calloop::ping::PingSource,
 ) -> Result<()> {
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+
+    event_loop
+        .handle()
+        .insert_source(flush_ping_source, |_, _, _| {})
+        .map_err(|e| anyhow!("{}", e.error))?;
 
     event_loop
         .handle()

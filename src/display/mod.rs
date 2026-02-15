@@ -2,6 +2,7 @@ mod input;
 
 use crate::capture::Renderer;
 use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
+use crate::overlay::{self, OverlayHandle};
 use crate::display::input::InputMsg;
 use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
@@ -83,6 +84,7 @@ struct App {
     dc: DisplayCtx,
     backend: Box<dyn CaptureBackend>,
     renderer: Renderer,
+    overlay_handle: OverlayHandle,
     input_resize_tx: calloop_channel::Sender<InputMsg>,
 
     // Wayland State
@@ -202,7 +204,8 @@ impl CompositorHandler for App {
         if frame.is_none() {
             self.dc.ph.skip();
         }
-        self.renderer.render(frame).unwrap();
+        let overlay = self.overlay_handle.take();
+        self.renderer.render(frame, overlay).unwrap();
     }
 
     fn surface_enter(
@@ -420,6 +423,9 @@ pub fn run(
         dc.clone(),
         sizer.clone(),
     )?;
+    let overlay_handle =
+        overlay::spawn(renderer.device.clone(), renderer.allocator.clone(), ph.clone())?;
+
     let env = CaptureEnv {
         ph,
         global_state: global_state.clone(),
@@ -458,6 +464,7 @@ pub fn run(
         dc,
         backend,
         renderer,
+        overlay_handle,
         input_resize_tx,
 
         // Wayland State

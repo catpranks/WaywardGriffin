@@ -3,6 +3,7 @@ pub mod source;
 
 use crate::capture::source::{CapturedFrame, DeviceId};
 use crate::display::DisplayCtx;
+use crate::overlay::OverlayFrame;
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
 use clap::Args;
@@ -46,6 +47,7 @@ use vulkano::pipeline::{
     PipelineShaderStageCreateInfo,
 };
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::shader::EntryPoint;
 use vulkano::swapchain::{
     AcquireNextImageInfo, AcquiredImage, ColorSpace, CompositeAlpha, PresentInfo, PresentMode,
     SemaphorePresentInfo, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
@@ -70,9 +72,14 @@ pub struct CaptureOpts {
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
+struct TexturedPushConstants {
+    opaque: u32,
+}
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 struct BorderPushConstants {
     time: f32,
-    show_border: u32,
     content_width: f32,
     content_height: f32,
 }
@@ -96,7 +103,7 @@ mod vs {
     }
 }
 
-mod fs {
+mod fs_textured {
     vulkano_shaders::shader! {
         ty: "fragment",
         src: r"
@@ -109,31 +116,49 @@ mod fs {
             layout(set = 0, binding = 1) uniform texture2D tex;
 
             layout(push_constant) uniform PushConstants {
+                uint opaque;
+            } pc;
+
+            void main() {
+                f_color = texture(sampler2D(tex, s), tex_coords);
+                if (pc.opaque != 0u) {
+                    f_color.a = 1.0;
+                }
+            }
+        ",
+    }
+}
+
+mod fs_border {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: r"
+            #version 450
+
+            layout(location = 0) in vec2 tex_coords;
+            layout(location = 0) out vec4 f_color;
+
+            layout(push_constant) uniform PushConstants {
                 float time;
-                uint show_border;
                 float content_width;
                 float content_height;
             } pc;
 
             void main() {
-                f_color = texture(sampler2D(tex, s), tex_coords);
-                f_color.a = 1.0;
+                float sine_val = (sin(pc.time * 2.0) + 1.0) / 2.0;
+                float border_width_px = 15.0 + sine_val * 10.0;
+                float alpha = (5.0 + sine_val * 150.0) / 255.0;
 
-                if (pc.show_border != 0u) {
-                    float sine_val = (sin(pc.time * 2.0) + 1.0) / 2.0;
-                    float border_width_px = 15.0 + sine_val * 10.0;
-                    float alpha = (5.0 + sine_val * 150.0) / 255.0;
+                float px = tex_coords.x * pc.content_width;
+                float py = tex_coords.y * pc.content_height;
 
-                    float px = tex_coords.x * pc.content_width;
-                    float py = tex_coords.y * pc.content_height;
+                float edge_dist = min(min(px, pc.content_width - px),
+                                      min(py, pc.content_height - py));
 
-                    float edge_dist = min(min(px, pc.content_width - px),
-                                          min(py, pc.content_height - py));
-
-                    if (edge_dist < border_width_px) {
-                        vec3 teal = vec3(0.0, 0.78, 0.78);
-                        f_color.rgb = mix(f_color.rgb, teal, alpha);
-                    }
+                if (edge_dist < border_width_px) {
+                    f_color = vec4(0.0, 0.78, 0.78, alpha);
+                } else {
+                    f_color = vec4(0.0);
                 }
             }
         ",
@@ -146,6 +171,8 @@ struct InFlight {
     fence: Arc<Fence>,
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
     frames: Vec<Rc<CapturedFrame>>,
+    overlays: Vec<Rc<OverlayFrame>>,
+    overlay_acquire: Option<Arc<Semaphore>>,
 }
 
 pub struct Renderer {
@@ -158,13 +185,16 @@ pub struct Renderer {
     in_flight: Vec<InFlight>,
     current_frames: Vec<Option<Rc<CapturedFrame>>>,
     images: Vec<Arc<Framebuffer>>,
-    pipeline: Arc<GraphicsPipeline>,
+    textured_pipeline: Arc<GraphicsPipeline>,
+    border_pipeline: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
     render_pass: Arc<RenderPass>,
     swapchain: Arc<Swapchain>,
 
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+
+    current_overlay: Option<Rc<OverlayFrame>>,
 
     pub allocator: Arc<StandardMemoryAllocator>,
     queue: Arc<Queue>,
@@ -297,44 +327,58 @@ impl Renderer {
             },
         )?;
         let vs = vs::load(device.clone())?.entry_point("main").unwrap();
-        let fs = fs::load(device.clone())?.entry_point("main").unwrap();
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs),
-            PipelineShaderStageCreateInfo::new(fs),
-        ];
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
 
-        let pipeline = GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(VertexInputState::default()),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
+        let make_pipeline = |vs: &EntryPoint, fs_entry| -> Result<Arc<GraphicsPipeline>> {
+            let stages = [
+                PipelineShaderStageCreateInfo::new(vs.clone()),
+                PipelineShaderStageCreateInfo::new(fs_entry),
+            ];
+            let layout = PipelineLayout::new(
+                device.clone(),
+                PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                    .into_pipeline_layout_create_info(device.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+            let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+            Ok(GraphicsPipeline::new(
+                device.clone(),
+                None,
+                GraphicsPipelineCreateInfo {
+                    stages: stages.into_iter().collect(),
+                    vertex_input_state: Some(VertexInputState::default()),
+                    input_assembly_state: Some(InputAssemblyState {
+                        topology: PrimitiveTopology::TriangleList,
                         ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(subpass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
+                    }),
+                    viewport_state: Some(ViewportState::default()),
+                    rasterization_state: Some(RasterizationState::default()),
+                    multisample_state: Some(MultisampleState::default()),
+                    color_blend_state: Some(ColorBlendState::with_attachment_states(
+                        subpass.num_color_attachments(),
+                        ColorBlendAttachmentState {
+                            blend: Some(AttachmentBlend::alpha()),
+                            ..Default::default()
+                        },
+                    )),
+                    dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                    subpass: Some(subpass.into()),
+                    ..GraphicsPipelineCreateInfo::layout(layout)
+                },
+            )?)
+        };
+
+        let textured_pipeline = make_pipeline(
+            &vs,
+            fs_textured::load(device.clone())?
+                .entry_point("main")
+                .unwrap(),
+        )?;
+        let border_pipeline = make_pipeline(
+            &vs,
+            fs_border::load(device.clone())?
+                .entry_point("main")
+                .unwrap(),
         )?;
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
@@ -354,7 +398,7 @@ impl Renderer {
             },
         )?;
 
-        let in_flight = (0..3)
+        let in_flight = (0..2)
             .map(|_| {
                 let acquire = Arc::new(Semaphore::new(
                     device.clone(),
@@ -377,6 +421,8 @@ impl Renderer {
                     fence,
                     last_command_buffer: None,
                     frames: vec![],
+                    overlays: vec![],
+                    overlay_acquire: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -390,10 +436,12 @@ impl Renderer {
             in_flight,
             current_frames: vec![None],
             images: Self::build_framebuffers(render_pass.clone(), swapchain_images)?,
-            pipeline,
+            textured_pipeline,
+            border_pipeline,
             sampler,
             render_pass,
             swapchain,
+            current_overlay: None,
             command_buffer_allocator,
             descriptor_set_allocator,
             allocator,
@@ -467,6 +515,9 @@ impl Renderer {
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
+        ifl.frames.clear();
+        ifl.overlays.clear();
+        ifl.overlay_acquire = None;
 
         let AcquiredImage {
             image_index,
@@ -530,16 +581,24 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn render(&mut self, new: Option<CapturedFrame>) -> Result<()> {
-        let info = new.and_then(|mut frame| {
-            let info = frame.info.take();
-            self.current_frames[0] = Some(Rc::new(frame));
-            info
-        });
-        let Some(frame) = self.current_frames[0].as_ref().cloned() else {
+    pub fn render(
+        &mut self,
+        mut new: Option<CapturedFrame>,
+        overlay: Option<OverlayFrame>,
+    ) -> Result<()> {
+        let has_new_frame = new.is_some();
+        let info = new.as_mut().and_then(|f| f.info.take());
+        let old_frame = new.and_then(|f| self.current_frames[0].replace(Rc::new(f)));
+        let Some(frame) = self.current_frames[0].clone() else {
             return self.blank();
         };
         let image = frame.image.clone();
+
+        let has_new_overlay = overlay.is_some();
+        let old_overlay = overlay.and_then(|mut ol| {
+            ol.presented();
+            self.current_overlay.replace(Rc::new(ol))
+        });
 
         let frame_size = image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
@@ -553,7 +612,28 @@ impl Renderer {
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
-        ifl.frames = vec![frame];
+        ifl.frames.clear();
+        if let Some(ref old) = old_frame {
+            ifl.frames.push(old.clone());
+        }
+        ifl.frames.push(frame);
+        ifl.overlays.clear();
+        if let Some(ref old) = old_overlay {
+            ifl.overlays.push(old.clone());
+        }
+        if let Some(ref ol) = self.current_overlay {
+            ifl.overlays.push(ol.clone());
+        }
+
+        let overlay_acquire = if has_new_overlay {
+            self.current_overlay
+                .as_ref()
+                .map(|ol| ol.acquire_semaphore(&self.device))
+                .transpose()?
+        } else {
+            None
+        };
+        ifl.overlay_acquire = overlay_acquire.clone();
 
         let AcquiredImage {
             image_index,
@@ -581,29 +661,102 @@ impl Renderer {
             },
         )?;
         unsafe {
+            // Release old capture image to external (if replaced)
+            if let Some(ref old) = old_frame {
+                cmd.pipeline_barrier(&DependencyInfo {
+                    image_memory_barriers: smallvec![ImageMemoryBarrier {
+                        old_layout: ImageLayout::ShaderReadOnlyOptimal,
+                        new_layout: ImageLayout::General,
+                        src_stages: PipelineStages::FRAGMENT_SHADER,
+                        src_access: AccessFlags::SHADER_SAMPLED_READ,
+                        dst_stages: PipelineStages::BOTTOM_OF_PIPE,
+                        dst_access: AccessFlags::empty(),
+                        queue_family_ownership_transfer: Some(
+                            QueueFamilyOwnershipTransfer::ExclusiveToExternal { src_index: qfi },
+                        ),
+                        subresource_range: ImageSubresourceRange {
+                            aspects: ImageAspects::COLOR,
+                            mip_levels: 0..1,
+                            array_layers: 0..1,
+                        },
+                        ..ImageMemoryBarrier::image(old.image.clone())
+                    }],
+                    ..Default::default()
+                })?;
+            }
+            // Release old overlay image to external (if replaced)
+            if let Some(ref old) = old_overlay {
+                cmd.pipeline_barrier(&DependencyInfo {
+                    image_memory_barriers: smallvec![ImageMemoryBarrier {
+                        old_layout: ImageLayout::ShaderReadOnlyOptimal,
+                        new_layout: ImageLayout::General,
+                        src_stages: PipelineStages::FRAGMENT_SHADER,
+                        src_access: AccessFlags::SHADER_SAMPLED_READ,
+                        dst_stages: PipelineStages::BOTTOM_OF_PIPE,
+                        dst_access: AccessFlags::empty(),
+                        queue_family_ownership_transfer: Some(
+                            QueueFamilyOwnershipTransfer::ExclusiveToExternal { src_index: qfi },
+                        ),
+                        subresource_range: ImageSubresourceRange {
+                            aspects: ImageAspects::COLOR,
+                            mip_levels: 0..1,
+                            array_layers: 0..1,
+                        },
+                        ..ImageMemoryBarrier::image(old.image.clone())
+                    }],
+                    ..Default::default()
+                })?;
+            }
+            // Acquire new capture image from external
+            if has_new_frame {
+                cmd.pipeline_barrier(&DependencyInfo {
+                    image_memory_barriers: smallvec![ImageMemoryBarrier {
+                        old_layout: ImageLayout::General,
+                        new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                        src_stages: PipelineStages::TOP_OF_PIPE,
+                        src_access: AccessFlags::empty(),
+                        dst_stages: PipelineStages::FRAGMENT_SHADER,
+                        dst_access: AccessFlags::SHADER_SAMPLED_READ,
+                        queue_family_ownership_transfer: Some(
+                            QueueFamilyOwnershipTransfer::ExclusiveFromExternal { dst_index: qfi },
+                        ),
+                        subresource_range: ImageSubresourceRange {
+                            aspects: ImageAspects::COLOR,
+                            mip_levels: 0..1,
+                            array_layers: 0..1,
+                        },
+                        ..ImageMemoryBarrier::image(image.clone())
+                    }],
+                    ..Default::default()
+                })?;
+            }
+            // Acquire new overlay image from external
+            if has_new_overlay && let Some(ref overlay) = self.current_overlay {
+                cmd.pipeline_barrier(&DependencyInfo {
+                    image_memory_barriers: smallvec![ImageMemoryBarrier {
+                        old_layout: ImageLayout::General,
+                        new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                        src_stages: PipelineStages::TOP_OF_PIPE,
+                        src_access: AccessFlags::empty(),
+                        dst_stages: PipelineStages::FRAGMENT_SHADER,
+                        dst_access: AccessFlags::SHADER_SAMPLED_READ,
+                        queue_family_ownership_transfer: Some(
+                            QueueFamilyOwnershipTransfer::ExclusiveFromExternal { dst_index: qfi },
+                        ),
+                        subresource_range: ImageSubresourceRange {
+                            aspects: ImageAspects::COLOR,
+                            mip_levels: 0..1,
+                            array_layers: 0..1,
+                        },
+                        ..ImageMemoryBarrier::image(overlay.image.clone())
+                    }],
+                    ..Default::default()
+                })?;
+            }
+            // Transition swapchain for rendering
             cmd.pipeline_barrier(&DependencyInfo {
                 image_memory_barriers: smallvec![ImageMemoryBarrier {
-                    old_layout: ImageLayout::General,
-                    new_layout: ImageLayout::ShaderReadOnlyOptimal,
-                    src_stages: PipelineStages::TOP_OF_PIPE,
-                    src_access: AccessFlags::empty(),
-                    dst_stages: PipelineStages::FRAGMENT_SHADER,
-                    dst_access: AccessFlags::SHADER_SAMPLED_READ,
-                    queue_family_ownership_transfer: Some(
-                        QueueFamilyOwnershipTransfer::ExclusiveFromExternal { dst_index: qfi },
-                    ),
-                    subresource_range: ImageSubresourceRange {
-                        aspects: ImageAspects::COLOR,
-                        mip_levels: 0..1,
-                        array_layers: 0..1,
-                    },
-                    ..ImageMemoryBarrier::image(image.clone())
-                }],
-                ..Default::default()
-            })?;
-            cmd.pipeline_barrier(&DependencyInfo {
-                image_memory_barriers: smallvec![ImageMemoryBarrier {
-                    old_layout: ImageLayout::PresentSrc,
+                    old_layout: ImageLayout::Undefined,
                     new_layout: ImageLayout::ColorAttachmentOptimal,
                     src_stages: PipelineStages::TOP_OF_PIPE,
                     src_access: AccessFlags::empty(),
@@ -618,6 +771,7 @@ impl Renderer {
                 }],
                 ..Default::default()
             })?;
+
             cmd.begin_render_pass(
                 &RenderPassBeginInfo {
                     clear_values: vec![Some([0.0, 0.0, 0.0, 0.0].into())],
@@ -625,7 +779,7 @@ impl Renderer {
                 },
                 &SubpassBeginInfo::default(),
             )?;
-            cmd.bind_pipeline_graphics(&self.pipeline)?;
+            cmd.bind_pipeline_graphics(&self.textured_pipeline)?;
             let content = sizer.render_sizing.content;
             cmd.set_viewport(
                 0,
@@ -635,13 +789,15 @@ impl Renderer {
                     depth_range: 0.0..=1.0,
                 }],
             )?;
+
+            // Draw 1: Base image (opaque)
             cmd.bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout(),
+                self.textured_pipeline.layout(),
                 0,
                 &[DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
-                    self.pipeline.layout().set_layouts()[0].clone(),
+                    self.textured_pipeline.layout().set_layouts()[0].clone(),
                     [
                         WriteDescriptorSet::sampler(0, self.sampler.clone()),
                         WriteDescriptorSet::image_view(1, ImageView::new_default(image.clone())?),
@@ -651,19 +807,60 @@ impl Renderer {
                 .as_raw()],
                 &[],
             )?;
-            let push_constants = BorderPushConstants {
-                time: self.start_time.elapsed().as_secs_f32(),
-                show_border: if self.dc.global_state.load().confine {
-                    0
-                } else {
-                    1
-                },
-                content_width: content.width as f32,
-                content_height: content.height as f32,
-            };
-            cmd.push_constants(self.pipeline.layout(), 0, &push_constants)?;
+            cmd.push_constants(
+                self.textured_pipeline.layout(),
+                0,
+                &TexturedPushConstants { opaque: 1 },
+            )?;
             cmd.draw(3, 1, 0, 0)?;
+
+            // Draw 2: Overlay (alpha-blended)
+            if let Some(ref overlay) = self.current_overlay {
+                cmd.bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.textured_pipeline.layout(),
+                    0,
+                    &[DescriptorSet::new(
+                        self.descriptor_set_allocator.clone(),
+                        self.textured_pipeline.layout().set_layouts()[0].clone(),
+                        [
+                            WriteDescriptorSet::sampler(0, self.sampler.clone()),
+                            WriteDescriptorSet::image_view(
+                                1,
+                                ImageView::new_default(overlay.image.clone())?,
+                            ),
+                        ],
+                        [],
+                    )?
+                    .as_raw()],
+                    &[],
+                )?;
+                cmd.push_constants(
+                    self.textured_pipeline.layout(),
+                    0,
+                    &TexturedPushConstants { opaque: 0 },
+                )?;
+                cmd.draw(3, 1, 0, 0)?;
+            }
+
+            // Draw 3: Border (procedural)
+            if !self.dc.global_state.load().confine {
+                cmd.bind_pipeline_graphics(&self.border_pipeline)?;
+                cmd.push_constants(
+                    self.border_pipeline.layout(),
+                    0,
+                    &BorderPushConstants {
+                        time: self.start_time.elapsed().as_secs_f32(),
+                        content_width: content.width as f32,
+                        content_height: content.height as f32,
+                    },
+                )?;
+                cmd.draw(3, 1, 0, 0)?;
+            }
+
             cmd.end_render_pass(&Default::default())?;
+
+            // Transition swapchain back to present
             cmd.pipeline_barrier(&DependencyInfo {
                 image_memory_barriers: smallvec![ImageMemoryBarrier {
                     old_layout: ImageLayout::ColorAttachmentOptimal,
@@ -681,26 +878,6 @@ impl Renderer {
                 }],
                 ..Default::default()
             })?;
-            cmd.pipeline_barrier(&DependencyInfo {
-                image_memory_barriers: smallvec![ImageMemoryBarrier {
-                    old_layout: ImageLayout::ShaderReadOnlyOptimal,
-                    new_layout: ImageLayout::General,
-                    src_stages: PipelineStages::FRAGMENT_SHADER,
-                    src_access: AccessFlags::SHADER_SAMPLED_READ,
-                    dst_stages: PipelineStages::BOTTOM_OF_PIPE,
-                    dst_access: AccessFlags::empty(),
-                    queue_family_ownership_transfer: Some(
-                        QueueFamilyOwnershipTransfer::ExclusiveToExternal { src_index: qfi },
-                    ),
-                    subresource_range: ImageSubresourceRange {
-                        aspects: ImageAspects::COLOR,
-                        mip_levels: 0..1,
-                        array_layers: 0..1,
-                    },
-                    ..ImageMemoryBarrier::image(image)
-                }],
-                ..Default::default()
-            })?;
         }
         let command_buffer = Arc::new(unsafe { cmd.end() }?);
 
@@ -708,12 +885,17 @@ impl Renderer {
 
         ifl.last_command_buffer = Some(command_buffer as Arc<dyn Send + Sync>);
 
-        let render_semaphore = [ifl.acquire.handle()];
+        let mut wait_semaphores = vec![ifl.acquire.handle()];
+        let mut wait_stages = vec![ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        if let Some(ref sem) = overlay_acquire {
+            wait_semaphores.push(sem.handle());
+            wait_stages.push(ash::vk::PipelineStageFlags::FRAGMENT_SHADER);
+        }
         let present_semaphore = [ifl.present.handle()];
         let submit_info = ash::vk::SubmitInfo::default()
             .command_buffers(&command_buffer_handle)
-            .wait_semaphores(&render_semaphore)
-            .wait_dst_stage_mask(&[ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
             .signal_semaphores(&present_semaphore);
 
         if let Some(mut info) = info {

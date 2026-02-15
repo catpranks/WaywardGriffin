@@ -12,6 +12,7 @@ use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
 use smithay::input::{SeatHandler, SeatState};
+use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_seat;
@@ -64,6 +65,7 @@ pub struct State {
     pub image_cache: HashMap<Dmabuf, Arc<Image>>,
 
     pub slot: OverlaySlot,
+    pub flush_ping: Ping,
     pub toplevels: Vec<ToplevelSurface>,
     pub size: Size<i32, Logical>,
     start: Instant,
@@ -85,6 +87,7 @@ impl State {
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
         slot: OverlaySlot,
+        flush_ping: Ping,
     ) -> Result<Self> {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
@@ -137,6 +140,7 @@ impl State {
             image_cache: HashMap::new(),
 
             slot,
+            flush_ping,
             toplevels: Vec::new(),
             size: Size::from((1280, 720)),
             start: Instant::now(),
@@ -276,9 +280,9 @@ impl CompositorHandler for State {
                             buffer,
                             frame_callbacks,
                             start: self.start,
+                            flush_ping: self.flush_ping.clone(),
                         };
                         let extent = frame.image.extent();
-                        debug!(w = extent[0], h = extent[1], "overlay frame committed");
                         *self.slot.lock().unwrap() = Some(frame);
                     }
                     Err(_) => {
