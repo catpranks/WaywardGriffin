@@ -11,6 +11,7 @@ use smithay::wayland::drm_syncobj::DrmSyncPoint;
 use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
 use std::fs::File;
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
@@ -27,21 +28,21 @@ pub struct OverlayFrame {
     acquire_point: DrmSyncPoint,
     release_point: DrmSyncPoint,
     buffer: wl_buffer::WlBuffer,
-    frame_callbacks: Vec<wl_callback::WlCallback>,
+    frame_callbacks: Cell<Vec<wl_callback::WlCallback>>,
     start: Instant,
     flush_ping: Ping,
 }
 
 impl OverlayFrame {
-    fn send_frame_callbacks(&mut self) {
+    fn send_frame_callbacks(&self) {
         let time_ms = self.start.elapsed().as_millis() as u32;
-        for cb in self.frame_callbacks.drain(..) {
+        for cb in self.frame_callbacks.take() {
             cb.done(time_ms);
         }
     }
 
     /// Send frame callbacks to the client, indicating it's a good time to render.
-    pub fn presented(&mut self) {
+    pub fn presented(&self) {
         self.send_frame_callbacks();
         self.flush_ping.ping();
     }

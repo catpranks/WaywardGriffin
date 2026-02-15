@@ -32,6 +32,7 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
@@ -278,11 +279,10 @@ impl CompositorHandler for State {
                             acquire_point,
                             release_point,
                             buffer,
-                            frame_callbacks,
+                            frame_callbacks: Cell::new(frame_callbacks),
                             start: self.start,
                             flush_ping: self.flush_ping.clone(),
                         };
-                        let extent = frame.image.extent();
                         *self.slot.lock().unwrap() = Some(frame);
                     }
                     Err(_) => {

@@ -595,10 +595,7 @@ impl Renderer {
         let image = frame.image.clone();
 
         let has_new_overlay = overlay.is_some();
-        let old_overlay = overlay.and_then(|mut ol| {
-            ol.presented();
-            self.current_overlay.replace(Rc::new(ol))
-        });
+        let old_overlay = overlay.and_then(|ol| self.current_overlay.replace(Rc::new(ol)));
 
         let frame_size = image.extent();
         let frame_size = (frame_size[0], frame_size[1]);
@@ -925,6 +922,10 @@ impl Renderer {
                 .unwrap()
                 .context("present")
         })?;
+
+        if has_new_overlay && let Some(ref overlay) = self.current_overlay {
+            overlay.presented();
+        }
 
         self.frame_idx += 1;
         if is_suboptimal || present_suboptimal {
