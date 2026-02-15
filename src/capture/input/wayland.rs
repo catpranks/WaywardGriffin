@@ -13,8 +13,7 @@ use smithay_client_toolkit::reexports::client::{
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use std::collections::HashMap;
-use std::io::Read as _;
-use std::io::Write as _;
+use std::io::{PipeReader, Read as _, Write as _};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsFd;
 use std::sync::{Arc, Mutex};
@@ -140,7 +139,7 @@ impl WaylandInput {
     }
 
     /// Queue receive request while caller holds the clipboard lock.
-    fn start_receive(&self, offer: &ExtDataControlOfferV1) -> Option<std::io::PipeReader> {
+    fn start_receive(&self, offer: &ExtDataControlOfferV1) -> Option<PipeReader> {
         let (reader, writer) = std::io::pipe().ok()?;
         offer.receive(TEXT_MIME.to_string(), writer.as_fd());
         drop(writer);
@@ -148,7 +147,7 @@ impl WaylandInput {
         Some(reader)
     }
 
-    fn finish_receive(mut reader: std::io::PipeReader) -> Option<String> {
+    fn finish_receive(mut reader: PipeReader) -> Option<String> {
         let mut buf = String::new();
         reader.read_to_string(&mut buf).ok()?;
         Some(buf)

@@ -1,9 +1,9 @@
 use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
-use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
+use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{delegate_dmabuf, delegate_registry, registry_handlers};
 
@@ -51,7 +51,7 @@ impl DmabufHandler for State {
 
     fn dmabuf_feedback(
         &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _proxy: &ZwpLinuxDmabufFeedbackV1,
         feedback: DmabufFeedback,
@@ -61,7 +61,7 @@ impl DmabufHandler for State {
 
     fn created(
         &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _params: &ZwpLinuxBufferParamsV1,
         _buffer: WlBuffer,
@@ -70,19 +70,13 @@ impl DmabufHandler for State {
 
     fn failed(
         &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _params: &ZwpLinuxBufferParamsV1,
     ) {
     }
 
-    fn released(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &QueueHandle<Self>,
-        _buffer: &WlBuffer,
-    ) {
-    }
+    fn released(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _buffer: &WlBuffer) {}
 }
 
 delegate_registry!(State);

@@ -7,6 +7,7 @@ pub mod plotter;
 pub mod sizer;
 mod utils;
 
+use crate::capture::CaptureOpts;
 use crate::capture::source::BackendType;
 use crate::plotter::{Plotter, PlotterHandle};
 use crate::sizer::{SharedSizer, Sizer};
@@ -14,6 +15,7 @@ use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -23,7 +25,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 struct Opts {
     /// Delay between TUI frames
     #[arg(long, value_parser = humantime::parse_duration)]
-    tdelay: Option<std::time::Duration>,
+    tdelay: Option<Duration>,
 
     /// confine from start
     #[arg(long)]
@@ -34,7 +36,7 @@ struct Opts {
     nocapture: bool,
 
     #[command(flatten)]
-    capture_opts: capture::CaptureOpts,
+    capture_opts: CaptureOpts,
 }
 
 pub fn run() -> Result<()> {

@@ -213,7 +213,7 @@ impl CompositorHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &WlSurface,
-        _output: &wl_output::WlOutput,
+        _output: &WlOutput,
     ) {
     }
 
@@ -222,7 +222,7 @@ impl CompositorHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &WlSurface,
-        _output: &wl_output::WlOutput,
+        _output: &WlOutput,
     ) {
     }
 }

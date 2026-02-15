@@ -6,7 +6,8 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::Display;
-use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_callback};
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::wayland::drm_syncobj::DrmSyncPoint;
 use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
@@ -27,8 +28,8 @@ pub struct OverlayFrame {
     pub image: Arc<Image>,
     acquire_point: DrmSyncPoint,
     release_point: DrmSyncPoint,
-    buffer: wl_buffer::WlBuffer,
-    frame_callbacks: Cell<Vec<wl_callback::WlCallback>>,
+    buffer: WlBuffer,
+    frame_callbacks: Cell<Vec<WlCallback>>,
     start: Instant,
     flush_ping: Ping,
 }
