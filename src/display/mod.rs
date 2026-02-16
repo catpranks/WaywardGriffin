@@ -8,17 +8,21 @@ use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel};
+use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
+use smithay_client_toolkit::reexports::calloop::{
+    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
+};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::backend::ObjectId;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
+use smithay_client_toolkit::reexports::client::protocol::wl_callback;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -44,9 +48,12 @@ use smithay_client_toolkit::{
     delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 use std::collections::VecDeque;
+use std::io::Write as _;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
@@ -79,6 +86,7 @@ impl DisplayCtx {
 }
 
 struct App {
+    conn: Connection,
     loop_handle: LoopHandle<'static, App>,
     sizer: SharedSizer,
     dc: DisplayCtx,
@@ -115,6 +123,19 @@ impl App {
             .rcu(|s| s.with_window_size(self.size, self.scale120));
 
         let _ = self.input_resize_tx.send(InputMsg::Resize);
+    }
+
+    fn handle_screenshot(&mut self, stream: UnixStream) -> Result<()> {
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let mut stream = std::io::BufWriter::new(stream);
+        info!("grabbing screenshot");
+        let snap = self.renderer.screenshot().context("renderer screenshot")?;
+        stream.write_all(&snap.width.to_le_bytes())?;
+        stream.write_all(&snap.height.to_le_bytes())?;
+        stream.write_all(&snap.stride.to_le_bytes())?;
+        stream.write_all(&snap.data)?;
+        stream.flush()?;
+        Ok(())
     }
 
     fn sched_resize(&mut self) {
@@ -319,6 +340,18 @@ impl Dispatch<WpViewport, ()> for App {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        _event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<wp_presentation::WpPresentation, ()> for App {
     fn event(
         _state: &mut Self,
@@ -452,6 +485,7 @@ pub fn run(
     )?;
 
     let mut app = App {
+        conn: conn.clone(),
         loop_handle: loop_handle.clone(),
         sizer,
         dc,
@@ -492,8 +526,34 @@ pub fn run(
     }
 
     WaylandSource::new(conn, event_queue)
-        .insert(loop_handle)
+        .insert(loop_handle.clone())
         .unwrap();
+
+    let snap_path = snap_socket_path()?;
+    let _ = std::fs::remove_file(&snap_path);
+    let listener = UnixListener::bind(&snap_path)?;
+    listener.set_nonblocking(true)?;
+    info!("screenshot socket: {}", snap_path.display());
+    loop_handle.insert_source(
+        Generic::new(listener, Interest::READ, Mode::Level),
+        |_readiness, listener, app| {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    match app.handle_screenshot(stream) {
+                        Ok(()) => (),
+                        Err(e) => warn!("screenshot failed: {e:?}"),
+                    }
+                    // Ping compositor to force a dispatch cycle — the input
+                    // thread may have read and queued our frame callback while
+                    // we were blocked.
+                    let _ = app.conn.display().sync(&app.dc.qh, ());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => warn!("screenshot accept failed: {e}"),
+            }
+            Ok(PostAction::Continue)
+        },
+    )?;
 
     loop {
         event_loop.dispatch(None, &mut app)?;
@@ -501,4 +561,9 @@ pub fn run(
             return res;
         }
     }
+}
+
+fn snap_socket_path() -> Result<PathBuf> {
+    let dir = std::env::var("XDG_RUNTIME_DIR")?;
+    Ok(PathBuf::from(dir).join("waygriff-0.snap"))
 }

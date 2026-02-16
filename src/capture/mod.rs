@@ -5,7 +5,7 @@ use crate::capture::source::{CapturedFrame, DeviceId};
 use crate::display::DisplayCtx;
 use crate::overlay::{OverlayFrame, OverlayState};
 use crate::sizer::{SharedSizer, Sizer};
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use smallvec::smallvec;
 use smithay_client_toolkit::compositor::Region;
@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferBeginInfo, CommandBufferLevel,
@@ -31,7 +32,8 @@ use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreate
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
-use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
@@ -43,7 +45,7 @@ use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
@@ -82,6 +84,13 @@ struct BorderPushConstants {
     time: f32,
     content_width: f32,
     content_height: f32,
+}
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct ScreenshotPushConstants {
+    width: u32,
+    height: u32,
 }
 
 mod vs {
@@ -124,6 +133,47 @@ mod fs_textured {
                 if (pc.opaque != 0u) {
                     f_color.a = 1.0;
                 }
+            }
+        ",
+    }
+}
+
+mod cs_screenshot {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+            #version 450
+
+            layout(local_size_x = 16, local_size_y = 16) in;
+
+            layout(set = 0, binding = 0) uniform sampler s;
+            layout(set = 0, binding = 1) uniform texture2D tex;
+
+            layout(set = 0, binding = 2) buffer OutputBuf {
+                uint data[];
+            } out_buf;
+
+            layout(push_constant) uniform PushConstants {
+                uint width;
+                uint height;
+            } pc;
+
+            vec3 linear_to_srgb(vec3 c) {
+                vec3 lo = c * 12.92;
+                vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+                return mix(lo, hi, greaterThan(c, vec3(0.0031308)));
+            }
+
+            void main() {
+                uint x = gl_GlobalInvocationID.x;
+                uint y = gl_GlobalInvocationID.y;
+                if (x >= pc.width || y >= pc.height) return;
+
+                vec2 uv = (vec2(x, y) + 0.5) / vec2(pc.width, pc.height);
+                vec4 color = texture(sampler2D(tex, s), uv);
+                color.rgb = linear_to_srgb(color.rgb);
+                uvec4 c = clamp(uvec4(color * 255.0 + 0.5), uvec4(0), uvec4(255));
+                out_buf.data[y * pc.width + x] = c.b | (c.g << 8u) | (c.r << 16u) | (255u << 24u);
             }
         ",
     }
@@ -187,6 +237,7 @@ pub struct Renderer {
     images: Vec<Arc<Framebuffer>>,
     textured_pipeline: Arc<GraphicsPipeline>,
     border_pipeline: Arc<GraphicsPipeline>,
+    screenshot_pipeline: Arc<ComputePipeline>,
     sampler: Arc<Sampler>,
     render_pass: Arc<RenderPass>,
     swapchain: Arc<Swapchain>,
@@ -380,6 +431,26 @@ impl Renderer {
                 .entry_point("main")
                 .unwrap(),
         )?;
+        let screenshot_cs = cs_screenshot::load(device.clone())?
+            .entry_point("main")
+            .unwrap();
+        let screenshot_layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&[
+                PipelineShaderStageCreateInfo::new(screenshot_cs.clone()),
+            ])
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+        )?;
+        let screenshot_pipeline = ComputePipeline::new(
+            device.clone(),
+            None,
+            ComputePipelineCreateInfo::stage_layout(
+                PipelineShaderStageCreateInfo::new(screenshot_cs),
+                screenshot_layout,
+            ),
+        )?;
+
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
             Default::default(),
@@ -438,6 +509,7 @@ impl Renderer {
             images: Self::build_framebuffers(render_pass.clone(), swapchain_images)?,
             textured_pipeline,
             border_pipeline,
+            screenshot_pipeline,
             sampler,
             render_pass,
             swapchain,
@@ -933,4 +1005,103 @@ impl Renderer {
         }
         Ok(())
     }
+
+    pub fn screenshot(&mut self) -> Result<ScreenshotData> {
+        let Some(ref current_frame) = self.current_frame else {
+            bail!("no current frame");
+        };
+        let image = current_frame.image.clone();
+        let extent = image.extent();
+        let (width, height) = (extent[0], extent[1]);
+        let stride = width * 4;
+
+        // Wait for all in-flight GPU work so the image is idle
+        for ifl in &self.in_flight {
+            ifl.fence.wait(None)?;
+        }
+
+        let staging = Buffer::new_slice::<u32>(
+            self.allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+            (width as u64) * (height as u64),
+        )?;
+
+        let descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.screenshot_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::sampler(0, self.sampler.clone()),
+                WriteDescriptorSet::image_view(1, ImageView::new_default(image)?),
+                WriteDescriptorSet::buffer(2, staging.clone()),
+            ],
+            [],
+        )?;
+
+        let qfi = self.queue.queue_family_index();
+        let mut cmd = RecordingCommandBuffer::new(
+            self.command_buffer_allocator.clone(),
+            qfi,
+            CommandBufferLevel::Primary,
+            CommandBufferBeginInfo {
+                usage: CommandBufferUsage::OneTimeSubmit,
+                ..Default::default()
+            },
+        )?;
+        unsafe {
+            cmd.bind_pipeline_compute(&self.screenshot_pipeline)?;
+            cmd.bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                self.screenshot_pipeline.layout(),
+                0,
+                &[descriptor_set.as_raw()],
+                &[],
+            )?;
+            cmd.push_constants(
+                self.screenshot_pipeline.layout(),
+                0,
+                &ScreenshotPushConstants { width, height },
+            )?;
+            cmd.dispatch([width.div_ceil(16), height.div_ceil(16), 1])?;
+        }
+        let command_buffer = Arc::new(unsafe { cmd.end() }?);
+
+        let fence = Fence::new(self.device.clone(), FenceCreateInfo::default())?;
+        let cb_handle = vec![command_buffer.handle()];
+        let submit_info = ash::vk::SubmitInfo::default().command_buffers(&cb_handle);
+        self.queue.with(|_guard| unsafe {
+            (self.device.fns().v1_0.queue_submit)(
+                self.queue.handle(),
+                1,
+                &submit_info as *const _,
+                fence.handle(),
+            )
+            .result()
+            .context("screenshot queue_submit")
+        })?;
+        fence.wait(None)?;
+        drop(command_buffer);
+        let data = bytemuck::cast_slice(&staging.read()?).to_vec();
+
+        Ok(ScreenshotData {
+            width,
+            height,
+            stride,
+            data,
+        })
+    }
+}
+
+pub struct ScreenshotData {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data: Vec<u8>,
 }
