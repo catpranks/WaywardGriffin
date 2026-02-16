@@ -31,7 +31,7 @@ use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{
     delegate_dmabuf, delegate_output, delegate_registry, registry_handlers,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsFd as _;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -102,7 +102,7 @@ impl CaptureBackendBuilder for Builder {
         sizer: SharedSizer,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         let bridge = Box::new(WaylandInput::new(&self.display, sizer, env.ph.clone())?);
-        let slot: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<VecDeque<CapturedFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
         let (ping_tx, ping_rx) = calloop_channel::channel();
         let dmabuf_modifiers = feedback_format_modifiers(&self.feedback);
 
@@ -131,14 +131,14 @@ impl CaptureBackendBuilder for Builder {
 }
 
 pub struct Backend {
-    slot: Arc<Mutex<Option<CapturedFrame>>>,
+    slot: Arc<Mutex<VecDeque<CapturedFrame>>>,
     ping_tx: calloop_channel::Sender<()>,
 }
 
 impl CaptureBackend for Backend {
     fn capture(&mut self) -> Result<Option<CapturedFrame>> {
         let _ = self.ping_tx.send(());
-        let frame = self.slot.lock().unwrap().take();
+        let frame = self.slot.lock().unwrap().pop_front();
         Ok(frame)
     }
 }
@@ -162,7 +162,7 @@ struct State {
     frame_state: Option<FrameState>,
     pool: Vec<Buffer>,
 
-    slot: Arc<Mutex<Option<CapturedFrame>>>,
+    slot: Arc<Mutex<VecDeque<CapturedFrame>>>,
     reclaim_tx: mpsc::Sender<ReclaimedBuffer>,
     reclaim_rx: mpsc::Receiver<ReclaimedBuffer>,
 
@@ -229,11 +229,12 @@ impl State {
             reclaim_tx: self.reclaim_tx.clone(),
         };
         {
-            let mut slot = self.slot.lock().unwrap();
-            if slot.is_some() {
+            let mut queue = self.slot.lock().unwrap();
+            if queue.len() >= 2 {
                 self.ph.capture_miss();
+                queue.pop_front();
             }
-            *slot = Some(frame);
+            queue.push_back(frame);
         }
 
         self.issue_capture();
@@ -324,7 +325,7 @@ fn run(
     display: &str,
     backend: BackendType,
     dmabuf_modifiers: HashMap<u32, Vec<u64>>,
-    slot: Arc<Mutex<Option<CapturedFrame>>>,
+    slot: Arc<Mutex<VecDeque<CapturedFrame>>>,
     ping_rx: Channel<()>,
 ) -> Result<()> {
     let CaptureEnv {
