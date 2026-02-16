@@ -47,13 +47,18 @@ impl State {
             }
         }
         if buf.is_none() {
+            let modifiers = self
+                .dmabuf_modifiers
+                .get(&format)
+                .cloned()
+                .unwrap_or_else(|| vec![0]);
             buf = Some(Buffer::new(
                 self.device.clone(),
                 self.allocator.as_ref(),
                 &self.dmabuf_state,
                 &self.qh,
                 format,
-                vec![0],
+                modifiers,
                 width,
                 height,
             )?);

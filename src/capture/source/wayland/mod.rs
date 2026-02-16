@@ -31,6 +31,7 @@ use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::{
     delegate_dmabuf, delegate_output, delegate_registry, registry_handlers,
 };
+use std::collections::HashMap;
 use std::os::fd::AsFd as _;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -68,6 +69,24 @@ impl Builder {
     }
 }
 
+/// Build a format → modifiers map from dmabuf feedback tranches.
+/// Only includes tranches for the main device.
+fn feedback_format_modifiers(feedback: &DmabufFeedback) -> HashMap<u32, Vec<u64>> {
+    let table = feedback.format_table();
+    let main_dev = feedback.main_device();
+    let mut map: HashMap<u32, Vec<u64>> = HashMap::new();
+    for tranche in feedback.tranches() {
+        if tranche.device != main_dev {
+            continue;
+        }
+        for &idx in &tranche.formats {
+            let entry = &table[idx as usize];
+            map.entry(entry.format).or_default().push(entry.modifier);
+        }
+    }
+    map
+}
+
 impl CaptureBackendBuilder for Builder {
     fn device_id(&self) -> Result<DeviceId> {
         let dev = self.feedback.main_device();
@@ -85,6 +104,7 @@ impl CaptureBackendBuilder for Builder {
         let bridge = Box::new(WaylandInput::new(&self.display, sizer, env.ph.clone())?);
         let slot: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
         let (ping_tx, ping_rx) = calloop_channel::channel();
+        let dmabuf_modifiers = feedback_format_modifiers(&self.feedback);
 
         std::thread::Builder::new()
             .name("capture-wayland".into())
@@ -93,8 +113,15 @@ impl CaptureBackendBuilder for Builder {
                 move || {
                     let ph = env.ph.clone();
                     ph.fatal(
-                        run(env, &self.display, self.backend, slot, ping_rx)
-                            .context(format!("capture thread ({:?})", self.backend)),
+                        run(
+                            env,
+                            &self.display,
+                            self.backend,
+                            dmabuf_modifiers,
+                            slot,
+                            ping_rx,
+                        )
+                        .context(format!("capture thread ({:?})", self.backend)),
                     );
                 }
             })?;
@@ -129,6 +156,8 @@ struct State {
     image_copy: Option<ImageCopyState>,
     qh: QueueHandle<State>,
     output: Option<WlOutput>,
+    /// Format → modifiers from dmabuf feedback (used by screencopy path).
+    dmabuf_modifiers: HashMap<u32, Vec<u64>>,
 
     frame_state: Option<FrameState>,
     pool: Vec<Buffer>,
@@ -294,6 +323,7 @@ fn run(
     env: CaptureEnv,
     display: &str,
     backend: BackendType,
+    dmabuf_modifiers: HashMap<u32, Vec<u64>>,
     slot: Arc<Mutex<Option<CapturedFrame>>>,
     ping_rx: Channel<()>,
 ) -> Result<()> {
@@ -336,6 +366,7 @@ fn run(
         image_copy: None,
         qh: qh.clone(),
         output: None,
+        dmabuf_modifiers,
 
         frame_state: None,
         pool: Vec::new(),
