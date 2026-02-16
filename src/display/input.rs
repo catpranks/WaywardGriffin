@@ -7,10 +7,12 @@ use copypasta::ClipboardProvider as _;
 use copypasta::wayland_clipboard::{
     self, Clipboard as WaylandClipboard, Primary as WaylandPrimary,
 };
+use reis::calloop::{EisListenerSource, EisRequestSource, EisRequestSourceEvent};
+use reis::request::{DeviceCapability as EisDeviceCapability, EisRequest};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel, Channel};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, PostAction};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
@@ -43,7 +45,7 @@ use smithay_client_toolkit::{
     delegate_simple,
 };
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
@@ -716,8 +718,89 @@ fn run(
         .map_err(|e| anyhow!("{}", e.error))?;
 
     WaylandSource::new(conn, event_queue)
-        .insert(loop_handle)
+        .insert(loop_handle.clone())
         .unwrap();
+
+    // EIS server for receiving relative motion from EI clients
+    let eis_path = std::path::PathBuf::from(
+        std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?,
+    )
+    .join("waygriff-0.ei");
+    let _ = std::fs::remove_file(&eis_path);
+    let eis_listener = reis::eis::Listener::bind(&eis_path)?;
+    info!("EIS listening on {}", eis_path.display());
+
+    let eis_loop_handle = loop_handle.clone();
+    let eis_seat_caps = EisDeviceCapability::Pointer.into();
+    loop_handle
+        .insert_source(
+            EisListenerSource::new(eis_listener),
+            move |context, _, _app: &mut InputApp| {
+                let source = EisRequestSource::new(context, 1);
+
+                struct ContextState {
+                    _seat: Option<reis::request::Seat>,
+                    pointer_device: Option<reis::request::Device>,
+                    sequence: u32,
+                }
+
+                let mut ctx = ContextState {
+                    _seat: None,
+                    pointer_device: None,
+                    sequence: 0,
+                };
+
+                if let Err(e) = eis_loop_handle.insert_source(
+                    source,
+                    move |event, connection, app: &mut InputApp| {
+                        match event {
+                            Ok(EisRequestSourceEvent::Connected) => {
+                                let _ = ctx
+                                    ._seat
+                                    .insert(connection.add_seat(Some("default"), eis_seat_caps));
+                            }
+                            Ok(EisRequestSourceEvent::Request(EisRequest::Bind(bind))) => {
+                                if ctx.pointer_device.is_none()
+                                    && bind.capabilities.contains(EisDeviceCapability::Pointer)
+                                {
+                                    let device = bind.seat.add_device(
+                                        Some("pointer"),
+                                        reis::eis::device::DeviceType::Virtual,
+                                        eis_seat_caps & bind.capabilities,
+                                        |_| {},
+                                    );
+                                    device.resumed();
+                                    if connection.context_type()
+                                        == reis::eis::handshake::ContextType::Receiver
+                                    {
+                                        ctx.sequence += 1;
+                                        device.start_emulating(ctx.sequence);
+                                    }
+                                    ctx.pointer_device = Some(device);
+                                }
+                            }
+                            Ok(EisRequestSourceEvent::Request(EisRequest::PointerMotion(
+                                motion,
+                            ))) => {
+                                app.bridge
+                                    .mouse_delta(motion.dx as f64, motion.dy as f64)
+                                    .unwrap();
+                            }
+                            Ok(EisRequestSourceEvent::Request(EisRequest::Disconnect)) | Err(_) => {
+                                return Ok(PostAction::Remove);
+                            }
+                            _ => {}
+                        }
+                        let _ = connection.flush();
+                        Ok(PostAction::Continue)
+                    },
+                ) {
+                    warn!("failed to register EIS client: {}", e.error);
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow!("{}", e.error))?;
 
     loop {
         event_loop.dispatch(None, &mut app)?;
