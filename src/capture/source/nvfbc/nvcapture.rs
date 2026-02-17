@@ -87,7 +87,6 @@ impl NvCapture {
         Ok(NvCapture { handle })
     }
 
-    #[allow(dead_code)]
     pub fn release_thread(&self) -> Result<()> {
         let status = unsafe { nvcapture_release_thread(self.handle) };
         if status != NVFBC_SUCCESS {
@@ -96,7 +95,6 @@ impl NvCapture {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn bind_thread(&self) -> Result<()> {
         let status = unsafe { nvcapture_bind_thread(self.handle) };
         if status != NVFBC_SUCCESS {
@@ -130,10 +128,9 @@ impl NvCapture {
     }
 }
 
-// SAFETY: NvCapture is an opaque C FFI handle (*mut NvCaptureHandle).
-// The NVFBC API is thread-safe: the handle is created on one thread and
-// can be moved to another (with bind_to_thread). Only one thread uses
-// it at a time (the render thread).
+// SAFETY: The NVFBC handle requires release_thread() before moving and
+// bind_thread() after. This is handled by the nvfbc Backend: build()
+// releases, first capture() binds. Only one thread uses it at a time.
 unsafe impl Send for NvCapture {}
 
 impl Drop for NvCapture {

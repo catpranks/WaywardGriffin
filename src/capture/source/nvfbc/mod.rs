@@ -66,12 +66,14 @@ impl CaptureBackendBuilder for Builder {
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
         self.ctx.bind_to_thread()?;
         let capturer = NvCapture::new()?;
+        capturer.release_thread()?;
         let bridge = Box::new(XInput::new(&self.display)?);
         let (reclaim_tx, reclaim_rx) = mpsc::channel();
         Ok((
             Box::new(Backend {
                 ctx: self.ctx,
                 capturer,
+                bound: false,
                 ph: env.ph,
                 global_state: env.global_state,
                 device: env.device,
@@ -88,6 +90,7 @@ impl CaptureBackendBuilder for Builder {
 pub struct Backend {
     ctx: Arc<CudaContext>,
     capturer: NvCapture,
+    bound: bool,
     ph: PlotterHandle,
     global_state: GlobalState,
     device: Arc<Device>,
@@ -99,6 +102,11 @@ pub struct Backend {
 
 impl CaptureBackend for Backend {
     fn capture(&mut self) -> Result<Option<CapturedFrame>> {
+        if !self.bound {
+            self.ctx.bind_to_thread()?;
+            self.capturer.bind_thread()?;
+            self.bound = true;
+        }
         let stream_ptr = std::ptr::null_mut();
         let start = Instant::now();
         let (dptr, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
