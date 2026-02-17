@@ -45,13 +45,13 @@ pub trait CaptureBackendBuilder: 'static {
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)>;
 }
 
-pub trait CaptureBackend: 'static {
+pub trait CaptureBackend: Send + 'static {
     fn capture(&mut self) -> Result<Option<CapturedFrame>>;
 }
 
 pub struct CapturedFrame {
     pub image: Arc<Image>,
-    pub backend_data: Option<Box<dyn Any + Send>>,
+    pub backend_data: Option<Box<dyn Any + Send + Sync>>,
     pub info: Option<FrameInfo>,
     pub reclaim_tx: mpsc::Sender<ReclaimedBuffer>,
 }
@@ -67,7 +67,7 @@ impl Drop for CapturedFrame {
 
 pub struct ReclaimedBuffer {
     pub image: Arc<Image>,
-    pub backend_data: Box<dyn Any + Send>,
+    pub backend_data: Box<dyn Any + Send + Sync>,
 }
 
 pub fn create_backend_builder(opts: &CaptureOpts) -> Result<Box<dyn CaptureBackendBuilder>> {

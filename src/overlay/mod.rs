@@ -11,7 +11,6 @@ use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::wayland::drm_syncobj::DrmSyncPoint;
 use smithay::wayland::socket::ListeningSocketSource;
 use state::State;
-use std::cell::Cell;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -29,7 +28,7 @@ pub struct OverlayFrame {
     acquire_point: DrmSyncPoint,
     release_point: DrmSyncPoint,
     buffer: WlBuffer,
-    frame_callbacks: Cell<Vec<WlCallback>>,
+    frame_callbacks: Mutex<Vec<WlCallback>>,
     start: Instant,
     flush_ping: ping::Ping,
 }
@@ -37,7 +36,7 @@ pub struct OverlayFrame {
 impl OverlayFrame {
     fn send_frame_callbacks(&self) {
         let time_ms = self.start.elapsed().as_millis() as u32;
-        for cb in self.frame_callbacks.take() {
+        for cb in std::mem::take(&mut *self.frame_callbacks.lock().unwrap()) {
             cb.done(time_ms);
         }
     }

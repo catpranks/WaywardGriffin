@@ -1,9 +1,9 @@
 pub mod input;
 pub mod source;
 
-use crate::capture::source::{CapturedFrame, DeviceId};
+use crate::capture::source::{CaptureBackend, CapturedFrame, DeviceId};
 use crate::display::DisplayCtx;
-use crate::overlay::{OverlayFrame, OverlayState};
+use crate::overlay::{OverlayFrame, OverlayHandle, OverlayState};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
@@ -11,10 +11,12 @@ use smallvec::smallvec;
 use smithay_client_toolkit::compositor::Region;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy as _};
 use source::BackendType;
-use std::rc::Rc;
+use std::io::Write as _;
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::info;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
@@ -220,8 +222,8 @@ struct InFlight {
     present: Arc<Semaphore>,
     fence: Arc<Fence>,
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
-    frames: Vec<Rc<CapturedFrame>>,
-    overlays: Vec<Rc<OverlayFrame>>,
+    frames: Vec<Arc<CapturedFrame>>,
+    overlays: Vec<Arc<OverlayFrame>>,
     overlay_acquire: Option<Arc<Semaphore>>,
 }
 
@@ -233,7 +235,7 @@ pub struct Renderer {
 
     frame_idx: usize,
     in_flight: Vec<InFlight>,
-    current_frame: Option<Rc<CapturedFrame>>,
+    current_frame: Option<Arc<CapturedFrame>>,
     images: Vec<Arc<Framebuffer>>,
     textured_pipeline: Arc<GraphicsPipeline>,
     border_pipeline: Arc<GraphicsPipeline>,
@@ -245,7 +247,7 @@ pub struct Renderer {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
-    current_overlay: Option<Rc<OverlayFrame>>,
+    current_overlay: Option<Arc<OverlayFrame>>,
 
     pub allocator: Arc<StandardMemoryAllocator>,
     queue: Arc<Queue>,
@@ -656,14 +658,14 @@ impl Renderer {
     pub fn render(&mut self, mut new: Option<CapturedFrame>, overlay: OverlayState) -> Result<()> {
         let has_new_frame = new.is_some();
         let info = new.as_mut().and_then(|f| f.info.take());
-        let old_frame = new.and_then(|f| self.current_frame.replace(Rc::new(f)));
+        let old_frame = new.and_then(|f| self.current_frame.replace(Arc::new(f)));
         let Some(current_frame) = self.current_frame.clone() else {
             return self.blank();
         };
         let image = current_frame.image.clone();
 
         let (has_new_overlay, old_overlay) = match overlay {
-            OverlayState::Frame(ol) => (true, self.current_overlay.replace(Rc::new(ol))),
+            OverlayState::Frame(ol) => (true, self.current_overlay.replace(Arc::new(ol))),
             OverlayState::Pending => (false, None),
             OverlayState::Inactive => (false, self.current_overlay.take()),
         };
@@ -1104,4 +1106,80 @@ pub struct ScreenshotData {
     pub height: u32,
     pub stride: u32,
     pub data: Vec<u8>,
+}
+
+pub enum RenderMsg {
+    Frame,
+    Screenshot(UnixStream),
+}
+
+pub fn spawn(
+    conn: Connection,
+    dc: DisplayCtx,
+    renderer: Renderer,
+    backend: Box<dyn CaptureBackend>,
+    overlay_handle: OverlayHandle,
+    render_rx: mpsc::Receiver<RenderMsg>,
+) -> Result<()> {
+    let ph = dc.ph.clone();
+    std::thread::Builder::new()
+        .name("render".into())
+        .spawn(move || {
+            ph.fatal(
+                render_loop(conn, dc, renderer, backend, overlay_handle, render_rx)
+                    .context("render thread"),
+            );
+        })?;
+    Ok(())
+}
+
+fn render_loop(
+    conn: Connection,
+    dc: DisplayCtx,
+    mut renderer: Renderer,
+    mut backend: Box<dyn CaptureBackend>,
+    overlay_handle: OverlayHandle,
+    render_rx: mpsc::Receiver<RenderMsg>,
+) -> Result<()> {
+    loop {
+        let msg = match render_rx.recv() {
+            Ok(msg) => msg,
+            Err(mpsc::RecvError) => return Ok(()),
+        };
+        match msg {
+            RenderMsg::Frame => {
+                dc.request_frame();
+                if !dc.global_state.load().capture {
+                    renderer.blank()?;
+                    continue;
+                }
+                let capture = backend.capture()?;
+                if capture.is_none() {
+                    dc.ph.skip();
+                }
+                let overlay = overlay_handle.take();
+                renderer.render(capture, overlay)?;
+            }
+            RenderMsg::Screenshot(stream) => {
+                stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+                let mut stream = std::io::BufWriter::new(stream);
+                info!("grabbing screenshot");
+                match renderer.screenshot().context("renderer screenshot") {
+                    Ok(snap) => {
+                        if let Err(e) = stream
+                            .write_all(&snap.width.to_le_bytes())
+                            .and_then(|_| stream.write_all(&snap.height.to_le_bytes()))
+                            .and_then(|_| stream.write_all(&snap.stride.to_le_bytes()))
+                            .and_then(|_| stream.write_all(&snap.data))
+                            .and_then(|_| stream.flush())
+                        {
+                            warn!("screenshot write failed: {e:?}");
+                        }
+                    }
+                    Err(e) => warn!("screenshot failed: {e:?}"),
+                }
+                dc.sync(&conn);
+            }
+        }
+    }
 }

@@ -1,14 +1,14 @@
 mod input;
 
-use crate::capture::Renderer;
-use crate::capture::source::{CaptureBackend, CaptureEnv, create_backend_builder};
+use crate::capture::source::{CaptureEnv, create_backend_builder};
+use crate::capture::{RenderMsg, Renderer};
 use crate::display::input::InputMsg;
 use crate::overlay::OverlayHandle;
 use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -48,10 +48,9 @@ use smithay_client_toolkit::{
     delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 use std::collections::VecDeque;
-use std::io::Write as _;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -72,6 +71,15 @@ pub struct DisplayCtx {
 }
 
 impl DisplayCtx {
+    pub fn request_frame(&self) {
+        self.surface.frame(&self.qh, self.surface.clone());
+    }
+
+    // TODO: hack for loops off of the same connection. Remove after dissolving input thread
+    pub fn sync(&self, conn: &Connection) {
+        let _ = conn.display().sync(&self.qh, ());
+    }
+
     pub fn request_feedback(&self, info: FrameInfo) {
         let fb = self.presentation.feedback(&self.surface, &self.qh, ());
         let mut deque = self.pending_feedback.lock().unwrap();
@@ -86,13 +94,10 @@ impl DisplayCtx {
 }
 
 struct App {
-    conn: Connection,
     loop_handle: LoopHandle<'static, App>,
     sizer: SharedSizer,
     dc: DisplayCtx,
-    backend: Box<dyn CaptureBackend>,
-    renderer: Renderer,
-    overlay_handle: OverlayHandle,
+    render_tx: mpsc::Sender<RenderMsg>,
     input_resize_tx: calloop_channel::Sender<InputMsg>,
 
     // Wayland State
@@ -123,19 +128,6 @@ impl App {
             .rcu(|s| s.with_window_size(self.size, self.scale120));
 
         let _ = self.input_resize_tx.send(InputMsg::Resize);
-    }
-
-    fn handle_screenshot(&mut self, stream: UnixStream) -> Result<()> {
-        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        let mut stream = std::io::BufWriter::new(stream);
-        info!("grabbing screenshot");
-        let snap = self.renderer.screenshot().context("renderer screenshot")?;
-        stream.write_all(&snap.width.to_le_bytes())?;
-        stream.write_all(&snap.height.to_le_bytes())?;
-        stream.write_all(&snap.stride.to_le_bytes())?;
-        stream.write_all(&snap.data)?;
-        stream.flush()?;
-        Ok(())
     }
 
     fn sched_resize(&mut self) {
@@ -169,7 +161,7 @@ impl WindowHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _window: &Window,
         configure: WindowConfigure,
         _serial: u32,
@@ -181,9 +173,7 @@ impl WindowHandler for App {
         if self.first_configure {
             self.first_configure = false;
             self.handle_resize();
-
-            self.dc.surface.frame(qh, self.dc.surface.clone());
-            self.renderer.blank().unwrap();
+            let _ = self.render_tx.send(RenderMsg::Frame);
         } else {
             self.sched_resize();
         }
@@ -212,21 +202,11 @@ impl CompositorHandler for App {
     fn frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _surface: &WlSurface,
         _time: u32,
     ) {
-        self.dc.surface.frame(qh, self.dc.surface.clone());
-        if !self.dc.global_state.load().capture {
-            self.renderer.blank().unwrap();
-            return;
-        }
-        let capture = self.backend.capture().unwrap();
-        if capture.is_none() {
-            self.dc.ph.skip();
-        }
-        let overlay = self.overlay_handle.take();
-        self.renderer.render(capture, overlay).unwrap();
+        let _ = self.render_tx.send(RenderMsg::Frame);
     }
 
     fn surface_enter(
@@ -484,14 +464,21 @@ pub fn run(
         dc.ph.clone(),
     )?;
 
+    let (render_tx, render_rx) = mpsc::channel();
+    crate::capture::spawn(
+        conn.clone(),
+        dc.clone(),
+        renderer,
+        backend,
+        overlay_handle,
+        render_rx,
+    )?;
+
     let mut app = App {
-        conn: conn.clone(),
         loop_handle: loop_handle.clone(),
         sizer,
         dc,
-        backend,
-        renderer,
-        overlay_handle,
+        render_tx,
         input_resize_tx,
 
         // Wayland State
@@ -539,14 +526,7 @@ pub fn run(
         |_readiness, listener, app| {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    match app.handle_screenshot(stream) {
-                        Ok(()) => (),
-                        Err(e) => warn!("screenshot failed: {e:?}"),
-                    }
-                    // Ping compositor to force a dispatch cycle — the input
-                    // thread may have read and queued our frame callback while
-                    // we were blocked.
-                    let _ = app.conn.display().sync(&app.dc.qh, ());
+                    let _ = app.render_tx.send(RenderMsg::Screenshot(stream));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => warn!("screenshot accept failed: {e}"),

@@ -130,6 +130,12 @@ impl NvCapture {
     }
 }
 
+// SAFETY: NvCapture is an opaque C FFI handle (*mut NvCaptureHandle).
+// The NVFBC API is thread-safe: the handle is created on one thread and
+// can be moved to another (with bind_to_thread). Only one thread uses
+// it at a time (the render thread).
+unsafe impl Send for NvCapture {}
+
 impl Drop for NvCapture {
     fn drop(&mut self) {
         if !self.handle.is_null() {

@@ -7,18 +7,19 @@ Local display proxy: captures frames from a source display (X11 via NVFBC, or Wa
 | Thread | Entry | Does |
 |--------|-------|------|
 | Main | `lib.rs:run()` | Runs plotter TUI |
-| Display | `display/mod.rs:run()` | Wayland window, surface, compositor events, capture polling, Vulkan render |
+| Display | `display/mod.rs:run()` | Wayland window, surface, compositor events, forwards frame callbacks to render thread |
+| Render | `capture/mod.rs:render_loop()` | Capture polling, Vulkan render, surface commit, screenshots |
 | Input | `display/input.rs:run()` | Keyboard/pointer/clipboard on destination compositor |
 | Capture (Wayland only) | `capture/source/wayland/mod.rs:run()` | screencopy/imagecopy loop, puts frames in a mutex slot |
 | WaylandInputDispatch (Wayland capture only) | internal thread in `capture/input/wayland.rs` | Clipboard dispatch on source compositor |
 
-NVFBC has no separate capture thread — `Backend::capture()` is called synchronously from the display thread's frame callback.
+NVFBC has no separate capture thread — `Backend::capture()` is called synchronously from the render thread.
 
-Communication: Wayland capture uses `calloop_channel` for display→capture pings and `Mutex<Option<CapturedFrame>>` slot for capture→display. Lock-free `ArcSwap<GlobalStateInner>` for shared state.
+Communication: Display→Render via `mpsc::channel<RenderMsg>` (frame signals, screenshot requests). Wayland capture uses `calloop_channel` for render→capture pings and `Mutex<Option<CapturedFrame>>` slot for capture→render. Lock-free `ArcSwap<GlobalStateInner>` for shared state.
 
 ## Key files
 
-- `capture/mod.rs` - `Renderer` (Vulkan pipeline, render, present; runs on display thread)
+- `capture/mod.rs` - `Renderer` (Vulkan pipeline, render, present), render thread entry point
 - `capture/source/mod.rs` - `create_backend_builder`, `DeviceId`, `BackendType`
 - `capture/source/nvfbc/` - NVFBC capture, CUDA→Vulkan DMA-BUF, buffer pool
 - `capture/source/wayland/mod.rs` - Wayland capture orchestration, calloop event loop, DMA-BUF buffer management
