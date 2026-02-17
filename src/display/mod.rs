@@ -2,7 +2,6 @@ mod input;
 
 use crate::capture::source::{CaptureEnv, create_backend_builder};
 use crate::capture::{RenderMsg, Renderer};
-use crate::display::input::InputMsg;
 use crate::overlay::OverlayHandle;
 use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
@@ -12,7 +11,6 @@ use anyhow::{Result, anyhow, bail};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
@@ -38,6 +36,7 @@ use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_vie
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay_client_toolkit::registry::SimpleGlobal;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::SeatState;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
@@ -75,11 +74,6 @@ impl DisplayCtx {
         self.surface.frame(&self.qh, self.surface.clone());
     }
 
-    // TODO: hack for loops off of the same connection. Remove after dissolving input thread
-    pub fn sync(&self, conn: &Connection) {
-        let _ = conn.display().sync(&self.qh, ());
-    }
-
     pub fn request_feedback(&self, info: FrameInfo) {
         let fb = self.presentation.feedback(&self.surface, &self.qh, ());
         let mut deque = self.pending_feedback.lock().unwrap();
@@ -93,12 +87,12 @@ impl DisplayCtx {
     }
 }
 
-struct App {
+pub struct App {
     loop_handle: LoopHandle<'static, App>,
     sizer: SharedSizer,
     dc: DisplayCtx,
     render_tx: mpsc::Sender<RenderMsg>,
-    input_resize_tx: calloop_channel::Sender<InputMsg>,
+    pub input: input::InputState,
 
     // Wayland State
     registry_state: RegistryState,
@@ -127,7 +121,7 @@ impl App {
         self.sizer
             .rcu(|s| s.with_window_size(self.size, self.scale120));
 
-        let _ = self.input_resize_tx.send(InputMsg::Resize);
+        self.input.handle_resize(&self.dc, &self.sizer);
     }
 
     fn sched_resize(&mut self) {
@@ -283,7 +277,7 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 impl Dispatch<WpFractionalScaleV1, ()> for App {
@@ -397,7 +391,6 @@ pub fn run(
     let conn = Connection::connect_to_env()?;
 
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
-    let globals = Arc::new(globals);
     let qh = event_queue.handle();
 
     let xdg_shell = XdgShell::bind(&globals, &qh)?;
@@ -445,41 +438,23 @@ pub fn run(
 
     let env = CaptureEnv {
         ph,
-        global_state: global_state.clone(),
+        global_state,
         device: renderer.device.clone(),
         allocator: renderer.allocator.clone(),
     };
     let (backend, bridge) = backend_builder.build(env, sizer.clone())?;
 
-    let (input_resize_tx, input_resize_rx) = calloop_channel::channel();
-    input::spawn(
-        conn.clone(),
-        globals.clone(),
-        surface.clone(),
-        global_state,
-        sizer.clone(),
-        bridge,
-        opts.confine,
-        input_resize_rx,
-        dc.ph.clone(),
-    )?;
+    let input = input::InputState::new(&conn, &globals, &dc, bridge, opts.confine, &loop_handle)?;
 
     let (render_tx, render_rx) = mpsc::channel();
-    crate::capture::spawn(
-        conn.clone(),
-        dc.clone(),
-        renderer,
-        backend,
-        overlay_handle,
-        render_rx,
-    )?;
+    crate::capture::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
 
     let mut app = App {
         loop_handle: loop_handle.clone(),
         sizer,
         dc,
         render_tx,
-        input_resize_tx,
+        input,
 
         // Wayland State
         registry_state: RegistryState::new(&globals),

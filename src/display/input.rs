@@ -1,6 +1,4 @@
-use crate::GlobalState;
 use crate::capture::input::InputBridge;
-use crate::plotter::PlotterHandle;
 use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result, anyhow};
 use copypasta::ClipboardProvider as _;
@@ -9,19 +7,14 @@ use copypasta::wayland_clipboard::{
 };
 use reis::calloop::{EisListenerSource, EisRequestSource, EisRequestSourceEvent};
 use reis::request::{DeviceCapability as EisDeviceCapability, EisRequest};
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
-use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::channel::{self as calloop_channel, Channel};
-use smithay_client_toolkit::reexports::calloop::{EventLoop, PostAction};
-use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
+use smithay_client_toolkit::compositor::Region;
+use smithay_client_toolkit::reexports::calloop::{LoopHandle, PostAction};
+use smithay_client_toolkit::reexports::client::globals::GlobalList;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
-use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
-use smithay_client_toolkit::reexports::client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
-};
+use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1;
 use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1;
 use smithay_client_toolkit::registry::SimpleGlobal;
@@ -40,12 +33,12 @@ use smithay_client_toolkit::seat::relative_pointer::{
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
-    delegate_pointer_constraints, delegate_relative_pointer, delegate_seat, delegate_shm,
-    delegate_simple,
+    delegate_keyboard, delegate_pointer, delegate_pointer_constraints, delegate_relative_pointer,
+    delegate_seat, delegate_shm, delegate_simple,
 };
-use std::sync::Arc;
 use tracing::{info, warn};
+
+use super::{App, DisplayCtx};
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
@@ -54,21 +47,8 @@ use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::
 use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
 use smithay_client_toolkit::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 
-pub enum InputMsg {
-    Resize,
-}
-
-pub struct InputApp {
-    qh: QueueHandle<InputApp>,
-
-    // Shared state
-    surface: WlSurface,
-    global_state: GlobalState,
-    sizer: SharedSizer,
-
-    // Wayland globals (own bindings)
-    compositor_state: CompositorState,
-    output_state: OutputState,
+pub struct InputState {
+    // Wayland globals (input-specific)
     shm_state: Shm,
     seat_state: SeatState,
     relative_pointer_state: RelativePointerState,
@@ -84,7 +64,6 @@ pub struct InputApp {
     shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
 
     // Internal state
-    res: Option<Result<()>>,
     modifiers: Modifiers,
     pointer_serial: u32,
     confinement_region: Option<Region>,
@@ -100,8 +79,8 @@ pub struct InputApp {
     bridge: Box<dyn InputBridge>,
 }
 
-impl InputApp {
-    fn set_confined(&mut self, conn: &Connection, confined: bool) {
+impl InputState {
+    fn set_confined(&mut self, dc: &DisplayCtx, conn: &Connection, confined: bool) {
         if self.confined == confined {
             return;
         }
@@ -123,13 +102,13 @@ impl InputApp {
             }
         }
 
-        self.update_confine();
-        self.update_shortcut_inhibitor();
-        self.global_state.rcu(|s| s.with_confine(self.confined));
+        self.update_confine(dc);
+        self.update_shortcut_inhibitor(dc);
+        dc.global_state.rcu(|s| s.with_confine(self.confined));
         self.update_cursor(conn);
     }
 
-    fn update_shortcut_inhibitor(&mut self) {
+    fn update_shortcut_inhibitor(&mut self, dc: &DisplayCtx) {
         let Some(ref manager) = self.shortcuts_inhibit_manager else {
             return;
         };
@@ -139,9 +118,9 @@ impl InputApp {
             }
             if let Some(seat) = self.seat_state.seats().next() {
                 self.shortcuts_inhibitor = Some(manager.get().unwrap().inhibit_shortcuts(
-                    &self.surface,
+                    &dc.surface,
                     &seat,
-                    &self.qh,
+                    &dc.qh,
                     (),
                 ));
             }
@@ -164,40 +143,43 @@ impl InputApp {
         }
     }
 
-    fn update_confine(&mut self) -> Option<()> {
+    fn update_confine(&mut self, dc: &DisplayCtx) {
         if !self.confined {
             if let Some(p) = self.confined_pointer.take() {
                 p.destroy();
             }
-            return None;
+            return;
         }
-        let pointer = self.pointer.as_ref()?;
-        let region = self.confinement_region.as_ref()?;
+        let Some(pointer) = self.pointer.as_ref() else {
+            return;
+        };
+        let Some(region) = self.confinement_region.as_ref() else {
+            return;
+        };
         if let Some(p) = self.confined_pointer.as_mut() {
             p.set_region(Some(region.wl_region()));
         } else {
-            self.confined_pointer = self.confined.then_some(
+            self.confined_pointer = Some(
                 self.pointer_constraints_state
                     .confine_pointer(
-                        &self.surface,
+                        &dc.surface,
                         pointer.pointer(),
                         Some(region.wl_region()),
                         zwp_pointer_constraints_v1::Lifetime::Persistent,
-                        &self.qh,
+                        &dc.qh,
                     )
                     .unwrap(),
             );
         }
-        None
     }
 
-    fn handle_resize(&mut self) {
-        let sizer = self.sizer.load();
+    pub fn handle_resize(&mut self, dc: &DisplayCtx, sizer: &SharedSizer) {
+        let sizer = sizer.load();
         if !sizer.ready() {
             return;
         }
         let rect = sizer.window_sizing.content;
-        let region = Region::new(&self.compositor_state).expect("Failed to create region");
+        let region = Region::new(&dc.compositor_state).expect("Failed to create region");
         region.add(
             rect.x as i32,
             rect.y as i32,
@@ -205,70 +187,151 @@ impl InputApp {
             rect.height as i32,
         );
         self.confinement_region = Some(region);
-        self.update_confine();
+        self.update_confine(dc);
+    }
+
+    pub fn new(
+        conn: &Connection,
+        globals: &GlobalList,
+        dc: &DisplayCtx,
+        bridge: Box<dyn InputBridge>,
+        confined: bool,
+        loop_handle: &LoopHandle<'static, App>,
+    ) -> Result<InputState> {
+        let (wl_primary, wl_clipboard) = unsafe {
+            wayland_clipboard::create_clipboards_from_external(
+                conn.display().id().as_ptr() as *mut _
+            )
+        };
+        let qh = &dc.qh;
+
+        let shm_state = Shm::bind(globals, qh)?;
+        let seat_state = SeatState::new(globals, qh);
+        let relative_pointer_state = RelativePointerState::bind(globals, qh);
+        let pointer_constraints_state = PointerConstraintsState::bind(globals, qh);
+        let shortcuts_inhibit_manager = match SimpleGlobal::bind(globals, qh) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                info!(
+                    "zwp_keyboard_shortcuts_inhibit_manager_v1 not available, grab won't inhibit compositor shortcuts"
+                );
+                None
+            }
+        };
+        let cursor_surface = dc.compositor_state.create_surface(qh);
+
+        // EIS server for receiving relative motion from EI clients
+        let eis_path = std::path::PathBuf::from(
+            std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?,
+        )
+        .join("waygriff-0.ei");
+        let _ = std::fs::remove_file(&eis_path);
+        let eis_listener = reis::eis::Listener::bind(&eis_path)?;
+        info!("EIS listening on {}", eis_path.display());
+
+        let eis_loop_handle = loop_handle.clone();
+        let eis_seat_caps = EisDeviceCapability::Pointer.into();
+        loop_handle
+            .insert_source(
+                EisListenerSource::new(eis_listener),
+                move |context, _, _app: &mut App| {
+                    let source = EisRequestSource::new(context, 1);
+
+                    struct ContextState {
+                        _seat: Option<reis::request::Seat>,
+                        pointer_device: Option<reis::request::Device>,
+                        sequence: u32,
+                    }
+
+                    let mut ctx = ContextState {
+                        _seat: None,
+                        pointer_device: None,
+                        sequence: 0,
+                    };
+
+                    if let Err(e) = eis_loop_handle.insert_source(
+                        source,
+                        move |event, connection, app: &mut App| {
+                            match event {
+                                Ok(EisRequestSourceEvent::Connected) => {
+                                    let _ = ctx._seat.insert(
+                                        connection.add_seat(Some("default"), eis_seat_caps),
+                                    );
+                                }
+                                Ok(EisRequestSourceEvent::Request(EisRequest::Bind(bind))) => {
+                                    if ctx.pointer_device.is_none()
+                                        && bind.capabilities.contains(EisDeviceCapability::Pointer)
+                                    {
+                                        let device = bind.seat.add_device(
+                                            Some("pointer"),
+                                            reis::eis::device::DeviceType::Virtual,
+                                            eis_seat_caps & bind.capabilities,
+                                            |_| {},
+                                        );
+                                        device.resumed();
+                                        if connection.context_type()
+                                            == reis::eis::handshake::ContextType::Receiver
+                                        {
+                                            ctx.sequence += 1;
+                                            device.start_emulating(ctx.sequence);
+                                        }
+                                        ctx.pointer_device = Some(device);
+                                    }
+                                }
+                                Ok(EisRequestSourceEvent::Request(EisRequest::PointerMotion(
+                                    motion,
+                                ))) => {
+                                    app.input
+                                        .bridge
+                                        .mouse_delta(motion.dx as f64, motion.dy as f64)
+                                        .unwrap();
+                                }
+                                Ok(EisRequestSourceEvent::Request(EisRequest::Disconnect))
+                                | Err(_) => {
+                                    return Ok(PostAction::Remove);
+                                }
+                                _ => {}
+                            }
+                            let _ = connection.flush();
+                            Ok(PostAction::Continue)
+                        },
+                    ) {
+                        warn!("failed to register EIS client: {}", e.error);
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|e| anyhow!("{}", e.error))?;
+
+        Ok(InputState {
+            shm_state,
+            seat_state,
+            relative_pointer_state,
+            pointer_constraints_state,
+            shortcuts_inhibit_manager,
+
+            cursor_surface,
+            keyboard: None,
+            pointer: None,
+            relative_pointer: None,
+            confined_pointer: None,
+            shortcuts_inhibitor: None,
+
+            modifiers: Modifiers::default(),
+            pointer_serial: 0,
+            confinement_region: None,
+            confined,
+            force_relative: false,
+            cursor_over_surface: false,
+
+            wl_primary,
+            wl_clipboard,
+            bridge,
+        })
     }
 }
 
-// CompositorHandler is required for delegate_compositor! but we don't care about
-// surface events on the input queue — we only need CompositorState for Region creation.
-impl CompositorHandler for InputApp {
-    fn scale_factor_changed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
-        _new_factor: i32,
-    ) {
-    }
-
-    fn transform_changed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
-        _new_transform: wl_output::Transform,
-    ) {
-    }
-
-    fn frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
-        _time: u32,
-    ) {
-    }
-
-    fn surface_enter(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
-        _output: &WlOutput,
-    ) {
-    }
-
-    fn surface_leave(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
-        _output: &WlOutput,
-    ) {
-    }
-}
-
-impl OutputHandler for InputApp {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-}
-
-impl PointerConstraintsHandler for InputApp {
+impl PointerConstraintsHandler for App {
     fn confined(
         &mut self,
         _conn: &Connection,
@@ -310,7 +373,7 @@ impl PointerConstraintsHandler for InputApp {
     }
 }
 
-impl RelativePointerHandler for InputApp {
+impl RelativePointerHandler for App {
     fn relative_pointer_motion(
         &mut self,
         _conn: &Connection,
@@ -319,19 +382,19 @@ impl RelativePointerHandler for InputApp {
         _pointer: &WlPointer,
         event: RelativeMotionEvent,
     ) {
-        if self.global_state.load().cursor_visible && !self.force_relative {
+        if self.dc.global_state.load().cursor_visible && !self.input.force_relative {
             return;
         }
-        if !self.confined {
+        if !self.input.confined {
             return;
         }
         let sizer = self.sizer.load();
         let (x, y) = sizer.window_to_source_delta(event.delta);
-        self.bridge.mouse_delta(x, y).unwrap();
+        self.input.bridge.mouse_delta(x, y).unwrap();
     }
 }
 
-impl PointerHandler for InputApp {
+impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
         conn: &Connection,
@@ -341,41 +404,41 @@ impl PointerHandler for InputApp {
     ) {
         use PointerEventKind::*;
         for event in events {
-            if event.surface != self.surface {
+            if event.surface != self.dc.surface {
                 continue;
             }
             match event.kind {
                 Enter { serial, .. } => {
-                    self.pointer_serial = serial;
-                    self.cursor_over_surface = true;
-                    self.update_cursor(conn);
+                    self.input.pointer_serial = serial;
+                    self.input.cursor_over_surface = true;
+                    self.input.update_cursor(conn);
                 }
                 Leave { .. } => {
-                    self.cursor_over_surface = false;
-                    self.update_cursor(conn);
+                    self.input.cursor_over_surface = false;
+                    self.input.update_cursor(conn);
                 }
                 Motion { .. } => {
                     if let Some((sx, sy)) = self
                         .sizer
                         .load()
                         .window_to_source((event.position.0 as u32, event.position.1 as u32))
-                        && self.global_state.load().cursor_visible
-                        && !self.force_relative
-                        && self.confined
+                        && self.dc.global_state.load().cursor_visible
+                        && !self.input.force_relative
+                        && self.input.confined
                     {
-                        self.bridge.mouse_absolute(sx, sy).unwrap();
+                        self.input.bridge.mouse_absolute(sx, sy).unwrap();
                     }
                 }
                 Press { button, .. } => {
-                    if self.confined {
-                        self.bridge.mouse_press(button).unwrap();
+                    if self.input.confined {
+                        self.input.bridge.mouse_press(button).unwrap();
                     }
                 }
                 Release { button, .. } => {
-                    if button == BTN_LEFT && !self.confined {
-                        self.set_confined(conn, true);
-                    } else if self.confined {
-                        self.bridge.mouse_release(button).unwrap();
+                    if button == BTN_LEFT && !self.input.confined {
+                        self.input.set_confined(&self.dc, conn, true);
+                    } else if self.input.confined {
+                        self.input.bridge.mouse_release(button).unwrap();
                     }
                 }
                 Axis {
@@ -383,8 +446,9 @@ impl PointerHandler for InputApp {
                     vertical,
                     ..
                 } => {
-                    if self.confined {
-                        self.bridge
+                    if self.input.confined {
+                        self.input
+                            .bridge
                             .scroll(
                                 horizontal.absolute,
                                 vertical.absolute,
@@ -393,7 +457,8 @@ impl PointerHandler for InputApp {
                             )
                             .unwrap();
                         if horizontal.stop || vertical.stop {
-                            self.bridge
+                            self.input
+                                .bridge
                                 .scroll_stop(horizontal.stop, vertical.stop)
                                 .unwrap();
                         }
@@ -404,7 +469,7 @@ impl PointerHandler for InputApp {
     }
 }
 
-impl KeyboardHandler for InputApp {
+impl KeyboardHandler for App {
     fn enter(
         &mut self,
         _: &Connection,
@@ -436,11 +501,11 @@ impl KeyboardHandler for InputApp {
         if event.keysym == Keysym::Super_L {
             return;
         }
-        if self.modifiers.logo {
+        if self.input.modifiers.logo {
             return;
         }
-        if self.confined {
-            self.bridge.key_press(event.raw_code).unwrap();
+        if self.input.confined {
+            self.input.bridge.key_press(event.raw_code).unwrap();
         }
     }
 
@@ -465,25 +530,27 @@ impl KeyboardHandler for InputApp {
         if event.keysym == Keysym::Super_L {
             return;
         }
-        if self.modifiers.logo {
+        if self.input.modifiers.logo {
             match event.keysym {
                 Keysym::Escape => {
-                    self.set_confined(conn, !self.confined);
+                    let confined = !self.input.confined;
+                    self.input.set_confined(&self.dc, conn, confined);
                 }
                 Keysym::r => {
-                    self.force_relative = !self.force_relative;
-                    self.global_state
-                        .rcu(|s| s.with_force_relative(self.force_relative));
+                    self.input.force_relative = !self.input.force_relative;
+                    self.dc
+                        .global_state
+                        .rcu(|s| s.with_force_relative(self.input.force_relative));
                 }
                 Keysym::c => {
-                    self.global_state.rcu(|s| s.with_capture(!s.capture));
+                    self.dc.global_state.rcu(|s| s.with_capture(!s.capture));
                 }
                 _ => {}
             }
             return;
         }
-        if self.confined {
-            self.bridge.key_release(event.raw_code).unwrap();
+        if self.input.confined {
+            self.input.bridge.key_release(event.raw_code).unwrap();
         }
     }
     fn update_modifiers(
@@ -496,10 +563,11 @@ impl KeyboardHandler for InputApp {
         raw_modifiers: RawModifiers,
         layout: u32,
     ) {
-        self.modifiers = modifiers;
-        if self.confined {
+        self.input.modifiers = modifiers;
+        if self.input.confined {
             const MOD4_MASK: u32 = 1 << 6;
-            self.bridge
+            self.input
+                .bridge
                 .update_modifiers(
                     raw_modifiers.depressed & !MOD4_MASK,
                     raw_modifiers.latched & !MOD4_MASK,
@@ -511,9 +579,9 @@ impl KeyboardHandler for InputApp {
     }
 }
 
-impl SeatHandler for InputApp {
+impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
+        &mut self.input.seat_state
     }
 
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
@@ -525,32 +593,35 @@ impl SeatHandler for InputApp {
         seat: WlSeat,
         cap: Capability,
     ) {
-        if cap == Capability::Pointer && self.pointer.is_none() {
+        if cap == Capability::Pointer && self.input.pointer.is_none() {
             let themed_pointer = self
+                .input
                 .seat_state
                 .get_pointer_with_theme(
                     qh,
                     &seat,
-                    self.shm_state.wl_shm(),
-                    self.cursor_surface.clone(),
+                    self.input.shm_state.wl_shm(),
+                    self.input.cursor_surface.clone(),
                     ThemeSpec::default(),
                 )
                 .expect("Failed to create themed pointer");
 
-            self.relative_pointer = Some(
-                self.relative_pointer_state
+            self.input.relative_pointer = Some(
+                self.input
+                    .relative_pointer_state
                     .get_relative_pointer(themed_pointer.pointer(), qh)
                     .expect("Failed to create relative pointer"),
             );
-            self.pointer = Some(themed_pointer);
-            self.update_confine();
+            self.input.pointer = Some(themed_pointer);
+            self.input.update_confine(&self.dc);
         }
-        if cap == Capability::Keyboard && self.keyboard.is_none() {
+        if cap == Capability::Keyboard && self.input.keyboard.is_none() {
             let keyboard = self
+                .input
                 .seat_state
                 .get_keyboard(qh, &seat, None)
                 .expect("Failed to create keyboard");
-            self.keyboard = Some(keyboard);
+            self.input.keyboard = Some(keyboard);
         }
     }
 
@@ -561,13 +632,13 @@ impl SeatHandler for InputApp {
         _: WlSeat,
         cap: Capability,
     ) {
-        if cap == Capability::Keyboard && self.keyboard.is_some() {
-            self.keyboard.take().unwrap().release();
+        if cap == Capability::Keyboard && self.input.keyboard.is_some() {
+            self.input.keyboard.take().unwrap().release();
         }
-        if cap == Capability::Pointer && self.pointer.is_some() {
-            self.pointer.take().unwrap().pointer().release();
-            self.relative_pointer.take().unwrap().destroy();
-            if let Some(confined) = self.confined_pointer.take() {
+        if cap == Capability::Pointer && self.input.pointer.is_some() {
+            self.input.pointer.take().unwrap().pointer().release();
+            self.input.relative_pointer.take().unwrap().destroy();
+            if let Some(confined) = self.input.confined_pointer.take() {
                 confined.destroy();
             }
         }
@@ -576,13 +647,13 @@ impl SeatHandler for InputApp {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
 }
 
-impl ShmHandler for InputApp {
+impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm_state
+        &mut self.input.shm_state
     }
 }
 
-impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for InputApp {
+impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
     fn event(
         state: &mut Self,
         _proxy: &ZwpKeyboardShortcutsInhibitorV1,
@@ -594,218 +665,23 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for InputApp {
         match event {
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {}
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
-                state.set_confined(conn, false);
+                state.input.set_confined(&state.dc, conn, false);
             }
             _ => {}
         }
     }
 }
 
-impl AsMut<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>> for InputApp {
+impl AsMut<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>> for App {
     fn as_mut(&mut self) -> &mut SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1> {
-        self.shortcuts_inhibit_manager.as_mut().unwrap()
+        self.input.shortcuts_inhibit_manager.as_mut().unwrap()
     }
 }
 
-delegate_compositor!(InputApp);
-delegate_output!(InputApp);
-delegate_seat!(InputApp);
-delegate_pointer!(InputApp);
-delegate_relative_pointer!(InputApp);
-delegate_keyboard!(InputApp);
-delegate_pointer_constraints!(InputApp);
-delegate_shm!(InputApp);
-delegate_simple!(InputApp, ZwpKeyboardShortcutsInhibitManagerV1, 1);
-
-#[allow(clippy::too_many_arguments)]
-pub fn spawn(
-    conn: Connection,
-    globals: Arc<smithay_client_toolkit::reexports::client::globals::GlobalList>,
-    surface: WlSurface,
-    global_state: GlobalState,
-    sizer: SharedSizer,
-    bridge: Box<dyn InputBridge>,
-    confined: bool,
-    resize_rx: Channel<InputMsg>,
-    ph: PlotterHandle,
-) -> Result<()> {
-    let (wl_primary, wl_clipboard) = unsafe {
-        wayland_clipboard::create_clipboards_from_external(conn.display().id().as_ptr() as *mut _)
-    };
-    let mut event_queue: EventQueue<InputApp> = conn.new_event_queue();
-    let qh = event_queue.handle();
-
-    let compositor_state = CompositorState::bind(&globals, &qh)?;
-    let output_state = OutputState::new(&globals, &qh);
-    let shm_state = Shm::bind(&globals, &qh)?;
-    let seat_state = SeatState::new(&globals, &qh);
-    let relative_pointer_state = RelativePointerState::bind(&globals, &qh);
-    let pointer_constraints_state = PointerConstraintsState::bind(&globals, &qh);
-    let shortcuts_inhibit_manager = match SimpleGlobal::bind(&globals, &qh) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            info!(
-                "zwp_keyboard_shortcuts_inhibit_manager_v1 not available, grab won't inhibit compositor shortcuts"
-            );
-            None
-        }
-    };
-    let cursor_surface = compositor_state.create_surface(&qh);
-
-    let mut app = InputApp {
-        qh: qh.clone(),
-
-        surface,
-        global_state,
-        sizer,
-
-        compositor_state,
-        output_state,
-        shm_state,
-        seat_state,
-        relative_pointer_state,
-        pointer_constraints_state,
-        shortcuts_inhibit_manager,
-
-        cursor_surface,
-        keyboard: None,
-        pointer: None,
-        relative_pointer: None,
-        confined_pointer: None,
-        shortcuts_inhibitor: None,
-
-        res: None,
-        modifiers: Modifiers::default(),
-        pointer_serial: 0,
-        confinement_region: None,
-        confined,
-        force_relative: false,
-        cursor_over_surface: false,
-
-        wl_primary,
-        wl_clipboard,
-        bridge,
-    };
-
-    // Discover seats
-    event_queue.roundtrip(&mut app)?;
-
-    std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || {
-            ph.fatal(run(conn, event_queue, app, resize_rx).context("input thread"));
-        })?;
-
-    Ok(())
-}
-
-fn run(
-    conn: Connection,
-    event_queue: EventQueue<InputApp>,
-    mut app: InputApp,
-    resize_rx: Channel<InputMsg>,
-) -> Result<()> {
-    let mut event_loop: EventLoop<InputApp> = EventLoop::try_new()?;
-    let loop_handle = event_loop.handle();
-
-    loop_handle
-        .insert_source(resize_rx, |event, _, app| match event {
-            calloop_channel::Event::Msg(InputMsg::Resize) => app.handle_resize(),
-            calloop_channel::Event::Closed => {
-                app.res = Some(Ok(()));
-            }
-        })
-        .map_err(|e| anyhow!("{}", e.error))?;
-
-    WaylandSource::new(conn, event_queue)
-        .insert(loop_handle.clone())
-        .unwrap();
-
-    // EIS server for receiving relative motion from EI clients
-    let eis_path = std::path::PathBuf::from(
-        std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?,
-    )
-    .join("waygriff-0.ei");
-    let _ = std::fs::remove_file(&eis_path);
-    let eis_listener = reis::eis::Listener::bind(&eis_path)?;
-    info!("EIS listening on {}", eis_path.display());
-
-    let eis_loop_handle = loop_handle.clone();
-    let eis_seat_caps = EisDeviceCapability::Pointer.into();
-    loop_handle
-        .insert_source(
-            EisListenerSource::new(eis_listener),
-            move |context, _, _app: &mut InputApp| {
-                let source = EisRequestSource::new(context, 1);
-
-                struct ContextState {
-                    _seat: Option<reis::request::Seat>,
-                    pointer_device: Option<reis::request::Device>,
-                    sequence: u32,
-                }
-
-                let mut ctx = ContextState {
-                    _seat: None,
-                    pointer_device: None,
-                    sequence: 0,
-                };
-
-                if let Err(e) = eis_loop_handle.insert_source(
-                    source,
-                    move |event, connection, app: &mut InputApp| {
-                        match event {
-                            Ok(EisRequestSourceEvent::Connected) => {
-                                let _ = ctx
-                                    ._seat
-                                    .insert(connection.add_seat(Some("default"), eis_seat_caps));
-                            }
-                            Ok(EisRequestSourceEvent::Request(EisRequest::Bind(bind))) => {
-                                if ctx.pointer_device.is_none()
-                                    && bind.capabilities.contains(EisDeviceCapability::Pointer)
-                                {
-                                    let device = bind.seat.add_device(
-                                        Some("pointer"),
-                                        reis::eis::device::DeviceType::Virtual,
-                                        eis_seat_caps & bind.capabilities,
-                                        |_| {},
-                                    );
-                                    device.resumed();
-                                    if connection.context_type()
-                                        == reis::eis::handshake::ContextType::Receiver
-                                    {
-                                        ctx.sequence += 1;
-                                        device.start_emulating(ctx.sequence);
-                                    }
-                                    ctx.pointer_device = Some(device);
-                                }
-                            }
-                            Ok(EisRequestSourceEvent::Request(EisRequest::PointerMotion(
-                                motion,
-                            ))) => {
-                                app.bridge
-                                    .mouse_delta(motion.dx as f64, motion.dy as f64)
-                                    .unwrap();
-                            }
-                            Ok(EisRequestSourceEvent::Request(EisRequest::Disconnect)) | Err(_) => {
-                                return Ok(PostAction::Remove);
-                            }
-                            _ => {}
-                        }
-                        let _ = connection.flush();
-                        Ok(PostAction::Continue)
-                    },
-                ) {
-                    warn!("failed to register EIS client: {}", e.error);
-                }
-                Ok(PostAction::Continue)
-            },
-        )
-        .map_err(|e| anyhow!("{}", e.error))?;
-
-    loop {
-        event_loop.dispatch(None, &mut app)?;
-        if let Some(res) = app.res {
-            return res;
-        }
-    }
-}
+delegate_seat!(App);
+delegate_pointer!(App);
+delegate_relative_pointer!(App);
+delegate_keyboard!(App);
+delegate_pointer_constraints!(App);
+delegate_shm!(App);
+delegate_simple!(App, ZwpKeyboardShortcutsInhibitManagerV1, 1);

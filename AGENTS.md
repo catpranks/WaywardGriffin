@@ -7,15 +7,14 @@ Local display proxy: captures frames from a source display (X11 via NVFBC, or Wa
 | Thread | Entry | Does |
 |--------|-------|------|
 | Main | `lib.rs:run()` | Runs plotter TUI |
-| Display | `display/mod.rs:run()` | Wayland window, surface, compositor events, forwards frame callbacks to render thread |
+| Display | `display/mod.rs:run()` | Wayland window, surface, compositor events, input (keyboard/pointer/clipboard), forwards frame callbacks to render thread |
 | Render | `capture/mod.rs:render_loop()` | Capture polling, Vulkan render, surface commit, screenshots |
-| Input | `display/input.rs:run()` | Keyboard/pointer/clipboard on destination compositor |
 | Capture (Wayland only) | `capture/source/wayland/mod.rs:run()` | screencopy/imagecopy loop, puts frames in a mutex slot |
 | WaylandInputDispatch (Wayland capture only) | internal thread in `capture/input/wayland.rs` | Clipboard dispatch on source compositor |
 
 NVFBC has no separate capture thread — `Backend::capture()` is called synchronously from the render thread.
 
-Communication: Display→Render via `mpsc::channel<RenderMsg>` (frame signals, screenshot requests). Wayland capture uses `calloop_channel` for render→capture pings and `Mutex<Option<CapturedFrame>>` slot for capture→render. Lock-free `ArcSwap<GlobalStateInner>` for shared state.
+Communication: Display→Render via `mpsc::channel<RenderMsg>` (frame signals, screenshot requests). Wayland capture uses `calloop_channel` for render→capture pings and `Mutex<Option<CapturedFrame>>` slot for capture→render. Lock-free `ArcSwap<GlobalStateInner>` for shared state. Input handling runs on the display thread's event loop (same `App` state, `InputState` sub-struct in `display/input.rs`).
 
 ## Key files
 
@@ -30,7 +29,7 @@ Communication: Display→Render via `mpsc::channel<RenderMsg>` (frame signals, s
 - `capture/input/xinput.rs` - X11 XTest input + clipboard via copypasta
 - `capture/input/wayland.rs` - Wayland virtual keyboard/pointer input + clipboard via ext-data-control
 - `sizer.rs` - Coordinate transforms between source/window/render space
-- `display/input.rs` - Input thread: shortcuts (Super+Escape confine, Super+R force relative, Super+C capture toggle), pointer/keyboard forwarding
+- `display/input.rs` - Input state and handlers on display thread: shortcuts (Super+Escape confine, Super+R force relative, Super+C capture toggle), pointer/keyboard forwarding, EIS server
 
 ## Data flow (NVFBC)
 

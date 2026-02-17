@@ -1114,7 +1114,6 @@ pub enum RenderMsg {
 }
 
 pub fn spawn(
-    conn: Connection,
     dc: DisplayCtx,
     renderer: Renderer,
     backend: Box<dyn CaptureBackend>,
@@ -1126,7 +1125,7 @@ pub fn spawn(
         .name("render".into())
         .spawn(move || {
             ph.fatal(
-                render_loop(conn, dc, renderer, backend, overlay_handle, render_rx)
+                render_loop(dc, renderer, backend, overlay_handle, render_rx)
                     .context("render thread"),
             );
         })?;
@@ -1134,7 +1133,6 @@ pub fn spawn(
 }
 
 fn render_loop(
-    conn: Connection,
     dc: DisplayCtx,
     mut renderer: Renderer,
     mut backend: Box<dyn CaptureBackend>,
@@ -1178,7 +1176,6 @@ fn render_loop(
                     }
                     Err(e) => warn!("screenshot failed: {e:?}"),
                 }
-                dc.sync(&conn);
             }
         }
     }
