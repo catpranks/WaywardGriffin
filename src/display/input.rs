@@ -1,3 +1,5 @@
+use std::os::unix::net::UnixDatagram;
+
 use crate::capture::input::InputBridge;
 use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result, anyhow};
@@ -5,10 +7,9 @@ use copypasta::ClipboardProvider as _;
 use copypasta::wayland_clipboard::{
     self, Clipboard as WaylandClipboard, Primary as WaylandPrimary,
 };
-use reis::calloop::{EisListenerSource, EisRequestSource, EisRequestSourceEvent};
-use reis::request::{DeviceCapability as EisDeviceCapability, EisRequest};
 use smithay_client_toolkit::compositor::Region;
-use smithay_client_toolkit::reexports::calloop::{LoopHandle, PostAction};
+use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
@@ -36,7 +37,7 @@ use smithay_client_toolkit::{
     delegate_keyboard, delegate_pointer, delegate_pointer_constraints, delegate_relative_pointer,
     delegate_seat, delegate_shm, delegate_simple,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{App, DisplayCtx};
 
@@ -220,83 +221,37 @@ impl InputState {
         };
         let cursor_surface = dc.compositor_state.create_surface(qh);
 
-        // EIS server for receiving relative motion from EI clients
-        let eis_path = std::path::PathBuf::from(
+        // Input socket for receiving pointer deltas from external clients
+        // Protocol: 12-byte LE datagrams { type: u32, f32, f32 }
+        //   type 0 (pointer_motion): { 0u32, dx: f32, dy: f32 }
+        let input_path = std::path::PathBuf::from(
             std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?,
         )
-        .join("waygriff-0.ei");
-        let _ = std::fs::remove_file(&eis_path);
-        let eis_listener = reis::eis::Listener::bind(&eis_path)?;
-        info!("EIS listening on {}", eis_path.display());
+        .join("waygriff-0.sock");
+        let _ = std::fs::remove_file(&input_path);
+        let sock = UnixDatagram::bind(&input_path)?;
+        sock.set_nonblocking(true)?;
+        info!("input socket: {}", input_path.display());
 
-        let eis_loop_handle = loop_handle.clone();
-        let eis_seat_caps = EisDeviceCapability::Pointer.into();
         loop_handle
             .insert_source(
-                EisListenerSource::new(eis_listener),
-                move |context, _, _app: &mut App| {
-                    let source = EisRequestSource::new(context, 1);
-
-                    struct ContextState {
-                        _seat: Option<reis::request::Seat>,
-                        pointer_device: Option<reis::request::Device>,
-                        sequence: u32,
-                    }
-
-                    let mut ctx = ContextState {
-                        _seat: None,
-                        pointer_device: None,
-                        sequence: 0,
-                    };
-
-                    if let Err(e) = eis_loop_handle.insert_source(
-                        source,
-                        move |event, connection, app: &mut App| {
-                            match event {
-                                Ok(EisRequestSourceEvent::Connected) => {
-                                    let _ = ctx._seat.insert(
-                                        connection.add_seat(Some("default"), eis_seat_caps),
-                                    );
-                                }
-                                Ok(EisRequestSourceEvent::Request(EisRequest::Bind(bind))) => {
-                                    if ctx.pointer_device.is_none()
-                                        && bind.capabilities.contains(EisDeviceCapability::Pointer)
-                                    {
-                                        let device = bind.seat.add_device(
-                                            Some("pointer"),
-                                            reis::eis::device::DeviceType::Virtual,
-                                            eis_seat_caps & bind.capabilities,
-                                            |_| {},
-                                        );
-                                        device.resumed();
-                                        if connection.context_type()
-                                            == reis::eis::handshake::ContextType::Receiver
-                                        {
-                                            ctx.sequence += 1;
-                                            device.start_emulating(ctx.sequence);
-                                        }
-                                        ctx.pointer_device = Some(device);
-                                    }
-                                }
-                                Ok(EisRequestSourceEvent::Request(EisRequest::PointerMotion(
-                                    motion,
-                                ))) => {
-                                    app.input
-                                        .bridge
-                                        .mouse_delta(motion.dx as f64, motion.dy as f64)
-                                        .unwrap();
-                                }
-                                Ok(EisRequestSourceEvent::Request(EisRequest::Disconnect))
-                                | Err(_) => {
-                                    return Ok(PostAction::Remove);
-                                }
-                                _ => {}
+                Generic::new(sock, Interest::READ, Mode::Level),
+                |_readiness, sock, app: &mut App| {
+                    let mut buf = [0u8; 12];
+                    while let Ok(n) = sock.recv(&mut buf) {
+                        if n != 12 {
+                            continue;
+                        }
+                        let msg_type = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                        #[allow(clippy::single_match)]
+                        match msg_type {
+                            0 => {
+                                let dx = f32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                let dy = f32::from_le_bytes(buf[8..12].try_into().unwrap());
+                                app.input.bridge.mouse_delta(dx as f64, dy as f64).unwrap();
                             }
-                            let _ = connection.flush();
-                            Ok(PostAction::Continue)
-                        },
-                    ) {
-                        warn!("failed to register EIS client: {}", e.error);
+                            _ => {}
+                        }
                     }
                     Ok(PostAction::Continue)
                 },

@@ -29,7 +29,6 @@ nix = { version = "0.31.1", features = ["fs", "time"] }
 pollster = "0.4.0"
 ratatui = "0.30.0"
 ratatui-widgets = "0.3.0"
-reis = { version = "0.6.0", features = ["calloop"] }
 smallvec = "1.15.1"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "backend_drm"] }
 smithay-client-toolkit = "0.20.0"

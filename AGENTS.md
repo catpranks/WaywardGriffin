@@ -29,7 +29,7 @@ Communication: Display→Render via `mpsc::channel<RenderMsg>` (frame signals, s
 - `capture/input/xinput.rs` - X11 XTest input + clipboard via copypasta
 - `capture/input/wayland.rs` - Wayland virtual keyboard/pointer input + clipboard via ext-data-control
 - `sizer.rs` - Coordinate transforms between source/window/render space
-- `display/input.rs` - Input state and handlers on display thread: shortcuts (Super+Escape confine, Super+R force relative, Super+C capture toggle), pointer/keyboard forwarding, EIS server
+- `display/input.rs` - Input state and handlers on display thread: shortcuts (Super+Escape confine, Super+R force relative, Super+C capture toggle), pointer/keyboard forwarding, SOCK_DGRAM input socket
 
 ## Data flow (NVFBC)
 
@@ -62,7 +62,7 @@ C code in `src/c/nvcapture.c` compiled via build.rs (cc crate).
   - deprioritize DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 because wlroots adds them as fallbacks
 - [x] Safety render on timeout even without wakeup
 - [x] Wayland clipboard
-- [ ] Input injector (libei)
+- [x] Input injector (libei) — replaced with SOCK_DGRAM protocol
 - [x] Input injector (virtual keyboard/pointer)
 - [x] audit the thread prepare->spawn pattern for consistency
 - [x] overlay compositor modifiers
