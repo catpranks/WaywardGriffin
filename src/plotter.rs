@@ -173,6 +173,7 @@ struct App {
     log_scroll: usize,
     global_state: GlobalState,
     sizer: SharedSizer,
+    renders: VecDeque<Instant>,
     captures: VecDeque<Instant>,
     capture_misses: VecDeque<Instant>,
     skips: VecDeque<Instant>,
@@ -187,6 +188,7 @@ impl App {
             log_scroll: 0,
             global_state,
             sizer,
+            renders: VecDeque::new(),
             captures: VecDeque::new(),
             capture_misses: VecDeque::new(),
             skips: VecDeque::new(),
@@ -225,16 +227,15 @@ impl App {
             })
     }
 
-    fn timings_fps(&self) -> Option<f64> {
-        let now = self.timings.back()?;
-        let (count, oldest) = self
-            .timings
-            .iter()
-            .rev()
-            .take_while(|t| now.start.duration_since(t.start) <= Duration::from_secs(2))
-            .fold((0, now.start), |(n, _), t| (n + 1, t.start));
-        let seconds = now.start.duration_since(oldest).as_secs_f64();
-        (count > 1 && seconds > 1e-9).then(|| (count - 1) as f64 / seconds)
+    fn rate(&self, events: &VecDeque<Instant>) -> f64 {
+        if events.len() < 2 {
+            return 0.0;
+        }
+        let duration = events
+            .back()
+            .unwrap()
+            .duration_since(*events.front().unwrap());
+        (events.len() - 1) as f64 / duration.as_secs_f64().max(1e-9)
     }
 
     fn run(&mut self, rx: &mpsc::Receiver<PlotEvent>, mut terminal: DefaultTerminal) -> Result<()> {
@@ -250,6 +251,7 @@ impl App {
                     q.pop_front();
                 }
             };
+            trim_old(&mut self.renders);
             trim_old(&mut self.captures);
             trim_old(&mut self.capture_misses);
             trim_old(&mut self.skips);
@@ -289,6 +291,7 @@ impl App {
                         self.log_scroll = 0;
                     }
                     PlotEvent::Render(info) => {
+                        self.renders.push_back(info.start);
                         self.timings.push_back(info);
                     }
                     PlotEvent::Skip(t) => {
@@ -383,21 +386,12 @@ impl App {
 
         let (avg_wait, avg_obtain, avg_commit, avg_present) = self.timings_avg();
         let (min_present, max_present) = self.timings_present_min_max();
-        let render_fps = self.timings_fps().unwrap_or(0.0);
+        let render_fps = self.rate(&self.renders);
 
-        let capture_fps = if self.captures.len() < 2 {
-            0.0
-        } else {
-            let duration = self
-                .captures
-                .back()
-                .unwrap()
-                .duration_since(*self.captures.front().unwrap());
-            (self.captures.len() - 1) as f64 / duration.as_secs_f64().max(1e-9)
-        };
+        let capture_fps = self.rate(&self.captures);
 
-        let skip_count = self.skips.len();
-        let miss_count = self.capture_misses.len();
+        let skip_rate = self.rate(&self.skips);
+        let miss_rate = self.rate(&self.capture_misses);
 
         let state = self.global_state.load();
         let cursor_visible = self.timings.back().is_some_and(|t| t.cursor_visible);
@@ -417,11 +411,11 @@ impl App {
         let state_display = format!("[{}]", state_tags.join(" "));
 
         let status_text = format!(
-            "R{:.1} C{:.1} | S:{} M:{} {} | W:{:.2} O:{:.2} C:{:.2} P:{:.2} ({:.2}-{:.2})",
+            "R{:.1} C{:.1} | S:{:.1} M:{:.1} {} | W:{:.2} O:{:.2} C:{:.2} P:{:.2} ({:.2}-{:.2})",
             render_fps,
             capture_fps,
-            skip_count,
-            miss_count,
+            skip_rate,
+            miss_rate,
             state_display,
             avg_wait,
             avg_obtain,
