@@ -47,8 +47,8 @@ use smithay_client_toolkit::{
     delegate_xdg_shell, delegate_xdg_window, registry_handlers,
 };
 use std::collections::VecDeque;
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::os::linux::net::SocketAddrExt as _;
+use std::os::unix::net::{SocketAddr, UnixListener};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -491,11 +491,10 @@ pub fn run(
         .insert(loop_handle.clone())
         .unwrap();
 
-    let snap_path = snap_socket_path()?;
-    let _ = std::fs::remove_file(&snap_path);
-    let listener = UnixListener::bind(&snap_path)?;
+    let snap_addr = SocketAddr::from_abstract_name("waygriff-0.snap")?;
+    let listener = UnixListener::bind_addr(&snap_addr)?;
     listener.set_nonblocking(true)?;
-    info!("screenshot socket: {}", snap_path.display());
+    info!("screenshot socket: @waygriff-0.snap");
     loop_handle.insert_source(
         Generic::new(listener, Interest::READ, Mode::Level),
         |_readiness, listener, app| {
@@ -518,7 +517,3 @@ pub fn run(
     }
 }
 
-fn snap_socket_path() -> Result<PathBuf> {
-    let dir = std::env::var("XDG_RUNTIME_DIR")?;
-    Ok(PathBuf::from(dir).join("waygriff-0.snap"))
-}

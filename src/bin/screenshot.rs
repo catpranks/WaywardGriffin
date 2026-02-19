@@ -1,13 +1,8 @@
 use anyhow::{Context, Result};
 use image::RgbaImage;
 use std::io::Read;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-
-fn snap_socket_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR not set");
-    PathBuf::from(dir).join("waygriff-0.snap")
-}
+use std::os::linux::net::SocketAddrExt as _;
+use std::os::unix::net::{SocketAddr, UnixStream};
 
 fn read_u32_le(stream: &mut impl Read) -> Result<u32> {
     let mut buf = [0u8; 4];
@@ -16,9 +11,9 @@ fn read_u32_le(stream: &mut impl Read) -> Result<u32> {
 }
 
 fn main() -> Result<()> {
-    let path = snap_socket_path();
+    let addr = SocketAddr::from_abstract_name("waygriff-0.snap")?;
     let mut stream =
-        UnixStream::connect(&path).with_context(|| format!("connecting to {}", path.display()))?;
+        UnixStream::connect_addr(&addr).context("connecting to @waygriff-0.snap")?;
 
     let width = read_u32_le(&mut stream)?;
     let height = read_u32_le(&mut stream)?;

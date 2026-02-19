@@ -1,8 +1,9 @@
-use std::os::unix::net::UnixDatagram;
+use std::os::linux::net::SocketAddrExt as _;
+use std::os::unix::net::{SocketAddr, UnixDatagram};
 
 use crate::capture::input::InputBridge;
 use crate::sizer::SharedSizer;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use copypasta::ClipboardProvider as _;
 use copypasta::wayland_clipboard::{
     self, Clipboard as WaylandClipboard, Primary as WaylandPrimary,
@@ -224,14 +225,10 @@ impl InputState {
         // Input socket for receiving pointer deltas from external clients
         // Protocol: 12-byte LE datagrams { type: u32, f32, f32 }
         //   type 0 (pointer_motion): { 0u32, dx: f32, dy: f32 }
-        let input_path = std::path::PathBuf::from(
-            std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?,
-        )
-        .join("waygriff-0.sock");
-        let _ = std::fs::remove_file(&input_path);
-        let sock = UnixDatagram::bind(&input_path)?;
+        let addr = SocketAddr::from_abstract_name("waygriff-0.input")?;
+        let sock = UnixDatagram::bind_addr(&addr)?;
         sock.set_nonblocking(true)?;
-        info!("input socket: {}", input_path.display());
+        info!("input socket: @waygriff-0.input");
 
         loop_handle
             .insert_source(
