@@ -12,8 +12,7 @@ fn read_u32_le(stream: &mut impl Read) -> Result<u32> {
 
 fn main() -> Result<()> {
     let addr = SocketAddr::from_abstract_name("waygriff-0.snap")?;
-    let mut stream =
-        UnixStream::connect_addr(&addr).context("connecting to @waygriff-0.snap")?;
+    let mut stream = UnixStream::connect_addr(&addr).context("connecting to @waygriff-0.snap")?;
 
     let width = read_u32_le(&mut stream)?;
     let height = read_u32_le(&mut stream)?;

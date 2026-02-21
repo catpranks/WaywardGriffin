@@ -460,10 +460,10 @@ impl KeyboardHandler for App {
         if self.input.modifiers.logo {
             return;
         }
-        if self.input.confined {
-            if let Some(code) = self.input.config.transform_key(event.raw_code) {
-                self.input.bridge.key_press(code).unwrap();
-            }
+        if self.input.confined
+            && let Some(code) = self.input.config.transform_key(event.raw_code)
+        {
+            self.input.bridge.key_press(code).unwrap();
         }
     }
 
@@ -507,10 +507,10 @@ impl KeyboardHandler for App {
             }
             return;
         }
-        if self.input.confined {
-            if let Some(code) = self.input.config.transform_key(event.raw_code) {
-                self.input.bridge.key_release(code).unwrap();
-            }
+        if self.input.confined
+            && let Some(code) = self.input.config.transform_key(event.raw_code)
+        {
+            self.input.bridge.key_release(code).unwrap();
         }
     }
     fn update_modifiers(
