@@ -2,6 +2,8 @@ mod input;
 
 use crate::capture::source::{CaptureEnv, create_backend_builder};
 use crate::capture::{RenderMsg, Renderer};
+use crate::config::Config;
+use crate::display::input::InputState;
 use crate::overlay::OverlayHandle;
 use crate::plotter::{FrameInfo, PlotterHandle};
 use crate::sizer::SharedSizer;
@@ -92,7 +94,7 @@ pub struct App {
     sizer: SharedSizer,
     dc: DisplayCtx,
     render_tx: mpsc::Sender<RenderMsg>,
-    pub input: input::InputState,
+    pub input: InputState,
 
     // Wayland State
     registry_state: RegistryState,
@@ -385,6 +387,7 @@ pub fn run(
     global_state: GlobalState,
     ph: PlotterHandle,
     sizer: SharedSizer,
+    config: Config,
 ) -> Result<()> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
@@ -444,7 +447,15 @@ pub fn run(
     };
     let (backend, bridge) = backend_builder.build(env, sizer.clone())?;
 
-    let input = input::InputState::new(&conn, &globals, &dc, bridge, opts.confine, &loop_handle)?;
+    let input = InputState::new(
+        &conn,
+        &globals,
+        &dc,
+        bridge,
+        opts.confine,
+        &loop_handle,
+        config,
+    )?;
 
     let (render_tx, render_rx) = mpsc::channel();
     crate::capture::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
@@ -516,4 +527,3 @@ pub fn run(
         }
     }
 }
-

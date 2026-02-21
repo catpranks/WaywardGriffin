@@ -2,6 +2,7 @@ use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 
 use crate::capture::input::InputBridge;
+use crate::config::Config;
 use crate::sizer::SharedSizer;
 use anyhow::{Result, anyhow};
 use copypasta::ClipboardProvider as _;
@@ -79,6 +80,7 @@ pub struct InputState {
 
     // Source bridge (input injection + clipboard)
     bridge: Box<dyn InputBridge>,
+    config: Config,
 }
 
 impl InputState {
@@ -199,6 +201,7 @@ impl InputState {
         bridge: Box<dyn InputBridge>,
         confined: bool,
         loop_handle: &LoopHandle<'static, App>,
+        config: Config,
     ) -> Result<InputState> {
         let (wl_primary, wl_clipboard) = unsafe {
             wayland_clipboard::create_clipboards_from_external(
@@ -279,6 +282,7 @@ impl InputState {
             wl_primary,
             wl_clipboard,
             bridge,
+            config,
         })
     }
 }
@@ -457,7 +461,9 @@ impl KeyboardHandler for App {
             return;
         }
         if self.input.confined {
-            self.input.bridge.key_press(event.raw_code).unwrap();
+            if let Some(code) = self.input.config.transform_key(event.raw_code) {
+                self.input.bridge.key_press(code).unwrap();
+            }
         }
     }
 
@@ -502,7 +508,9 @@ impl KeyboardHandler for App {
             return;
         }
         if self.input.confined {
-            self.input.bridge.key_release(event.raw_code).unwrap();
+            if let Some(code) = self.input.config.transform_key(event.raw_code) {
+                self.input.bridge.key_release(code).unwrap();
+            }
         }
     }
     fn update_modifiers(

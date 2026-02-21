@@ -1,6 +1,7 @@
 #![allow(clippy::new_without_default)]
 
 mod capture;
+mod config;
 mod display;
 pub mod overlay;
 pub mod plotter;
@@ -9,6 +10,7 @@ mod utils;
 
 use crate::capture::CaptureOpts;
 use crate::capture::source::BackendType;
+use crate::config::Config;
 use crate::plotter::{Plotter, PlotterHandle};
 use crate::sizer::{SharedSizer, Sizer};
 use anyhow::{Context as _, Result};
@@ -16,9 +18,11 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use xdg::BaseDirectories;
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about, long_about = None)]
@@ -77,6 +81,17 @@ pub fn run() -> Result<()> {
         .with(filter)
         .with(fmt_layer)
         .init();
+    let config = {
+        let dirs = BaseDirectories::with_prefix("waygriff");
+        match dirs.find_config_file("config.toml") {
+            Some(path) => {
+                info!("loading config: {}", path.display());
+                Config::load(&path)?
+            }
+            None => Config::default(),
+        }
+    };
+
     let ph = plotter.handle();
     let opts2 = opts.clone();
     let sizer2 = sizer.clone();
@@ -84,7 +99,8 @@ pub fn run() -> Result<()> {
         .name("display".into())
         .spawn(move || {
             ph.fatal(
-                display::run(opts2, global_state, ph.clone(), sizer2).context("display thread"),
+                display::run(opts2, global_state, ph.clone(), sizer2, config)
+                    .context("display thread"),
             );
         })?;
     plotter.run(opts.tdelay)
