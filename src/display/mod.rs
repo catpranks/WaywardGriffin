@@ -458,7 +458,8 @@ pub fn run(
     )?;
 
     let (render_tx, render_rx) = mpsc::channel();
-    crate::capture::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
+    let render_thread =
+        crate::capture::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
 
     let mut app = App {
         loop_handle: loop_handle.clone(),
@@ -522,7 +523,11 @@ pub fn run(
 
     loop {
         event_loop.dispatch(None, &mut app)?;
-        if let Some(res) = app.res {
+        if app.res.is_some() {
+            let res = app.res.take().unwrap();
+            drop(app);
+            // vulkan swapchain borrows our connection
+            let _ = render_thread.join();
             return res;
         }
     }

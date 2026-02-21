@@ -1119,9 +1119,9 @@ pub fn spawn(
     backend: Box<dyn CaptureBackend>,
     overlay_handle: OverlayHandle,
     render_rx: mpsc::Receiver<RenderMsg>,
-) -> Result<()> {
+) -> Result<std::thread::JoinHandle<()>> {
     let ph = dc.ph.clone();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
             ph.fatal(
@@ -1129,7 +1129,7 @@ pub fn spawn(
                     .context("render thread"),
             );
         })?;
-    Ok(())
+    Ok(handle)
 }
 
 fn render_loop(
