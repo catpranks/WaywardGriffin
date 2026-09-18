@@ -11,6 +11,7 @@ use clap::{Args, ValueEnum};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::mpsc;
+use vulkano::buffer::Subbuffer;
 use vulkano::device::{Device, Queue};
 use vulkano::image::Image;
 use vulkano::memory::allocator::StandardMemoryAllocator;
@@ -63,7 +64,15 @@ pub trait CaptureBackend: Send + 'static {
     fn capture(&mut self) -> Result<Option<CapturedFrame>>;
 }
 
+/// Transfer view of the linear host image; its CapturedFrame owns the backing.
+pub struct HostBuffer {
+    pub bytes: Subbuffer<[u8]>,
+    /// Image row pitch in texels, for VkBufferImageCopy.
+    pub row_length: u32,
+}
+
 pub struct CapturedFrame {
+    pub host_buffer: Option<HostBuffer>,
     pub image: Arc<Image>,
     pub backend_data: Option<Box<dyn Any + Send + Sync>>,
     pub info: Option<FrameInfo>,

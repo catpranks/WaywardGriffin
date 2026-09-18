@@ -51,16 +51,16 @@ All abstract Unix sockets, one instance per machine for now (`waygriff-0`).
 |---|---|---|
 | Main | `lib.rs:run()` | Loads config, spawns everything, then runs the monitor (TUI or headless log/stats printer). |
 | Control | `control.rs:spawn()` | Accepts control socket connections, one thread each. Display-bound requests carry an ack channel and reply after the display thread applied them. |
-| Display | `display/mod.rs:run()` | Wayland window, compositor events, input handling (`display/input.rs`), control requests, snapshot socket accept. Forwards frame callbacks to the render thread. |
+| Display | `display/mod.rs:run()` | Wayland window, compositor events, input handling (`display/input.rs`), control requests, snapshot socket accept. Forwards frame callbacks and presentation timing to the render thread. |
 | Render | `render/mod.rs:render_loop()` | NVFBC frame arrivals or Wayland capture polling, Vulkan render, present, screenshots. NVFBC uses the RADV iGPU; Wayland backends retain DMA-BUF device selection. |
 | Overlay | `overlay/mod.rs` | Smithay-based Wayland server for the overlay surface. |
 | Capture (NVFBC) | `source/nvfbc/mod.rs` | Blocking grab and synchronous CUDA D2H into pinned host pages imported by RADV, publish the latest frame and wake render. |
 | Capture (Wayland backends only) | `source/wayland/mod.rs:run()` | screencopy/image-copy loop; frames land in a mutex slot. |
 | WaylandInputDispatch (Wayland backends only) | `bridge/wayland.rs` | Clipboard dispatch on the source compositor. |
 
-NVFBC captures on its own thread into one replaceable pending slot. The renderer takes the newest frame on arrival; Wayland frame callbacks remain diagnostic and do not pace NVFBC. A 50 ms maintenance redraw handles static sources, overlays, and capture-off state. Capture uses a 50 ms grab timeout and its thread is joined on shutdown. Wayland capture backends retain callback-driven polling.
+NVFBC captures on its own thread into one replaceable pending slot. The renderer permits one pending source presentation. For unscaled SDMA output with monotonic direct-scanout feedback it takes the newest frame 5 ms before the predicted next refresh; other NVFBC draws proceed on arrival/feedback. Wayland frame callbacks remain diagnostic and do not pace NVFBC. A 50 ms maintenance redraw handles static sources, overlays, and capture-off state. Capture uses a 50 ms grab timeout and its thread is joined on shutdown. Wayland capture backends retain callback-driven polling.
 
-Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, screenshot streams); control→display via calloop channel of `ControlReq`; shared flags in `ArcSwap<GlobalStateInner>` updated through `GlobalStateExt::update`; window/source geometry in `SharedSizer` (also `ArcSwap`). Stats flow render→monitor through `MonitorHandle` events; the monitor publishes a `stats::Snapshot` every 100 ms that the control thread serves.
+Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, presentation timing, screenshot streams); control→display via calloop channel of `ControlReq`; shared flags in `ArcSwap<GlobalStateInner>` updated through `GlobalStateExt::update`; window/source geometry in `SharedSizer` (also `ArcSwap`). Stats flow render→monitor through `MonitorHandle` events; the monitor publishes a `stats::Snapshot` every 100 ms that the control thread serves.
 
 ## Layout
 
@@ -72,10 +72,10 @@ Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, sc
 - `config.rs` - `~/.config/waygriff/config.toml` key block/remap (see `docs/key-filtering.md`).
 - `display/mod.rs` - Wayland client boilerplate (sctk 0.21: `delegate_dispatch2!` plus `Dispatch2` impls on marker types), window, presentation feedback.
 - `display/input.rs` - `InputState`: shortcuts (Super+Escape confine, Super+R force relative, Super+C capture toggle), pointer/keyboard forwarding, clipboard sync on confine toggle, input datagram socket.
-- `render/mod.rs` - `Renderer`: Vulkan device/swapchain, per-frame command buffer, overlay blend, border effect restricted to four edge scissors, screenshot compute. In-flight fences retain capture frames and descriptor sets. Barrier helpers at the bottom.
+- `render/mod.rs` - `Renderer`: Vulkan device/swapchain, SDMA upload for unscaled host captures, graphics command buffer, presentation deadlines, overlay blend, border effect restricted to four edge scissors, screenshot compute. In-flight fences retain capture frames and descriptor sets. Barrier helpers at the bottom.
 - `render/shaders.rs` - GLSL sources and push-constant structs.
 - `source/mod.rs` - `CaptureOpts`, `BackendType`, `CaptureBackend`/`CaptureBackendBuilder` traits, `CapturedFrame` (returns its buffer to the backend on drop).
-- `source/nvfbc/` - NVFBC via `src/c/nvcapture.c`, CUDA D2H, buffer pool. `host.rs` owns aligned CUDA-registered pages imported with `VK_EXT_external_memory_host` as linear sRGB images; it also performs their one-time transition to General before CUDA writes.
+- `source/nvfbc/` - NVFBC via `src/c/nvcapture.c`, CUDA D2H, buffer pool. `host.rs` owns aligned CUDA-registered pages imported with `VK_EXT_external_memory_host` as linear sRGB images with transfer-buffer aliases; it also performs their one-time transition to General before CUDA writes.
 - `source/wayland/` - screencopy and image-copy backends, dmabuf feedback probe.
 - `bridge/mod.rs` - `InputBridge` trait (inject input, get/set clipboards on the source).
 - `bridge/xinput.rs` - XTest injection + X clipboards.
@@ -88,10 +88,10 @@ Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, sc
 NVFBC:
 
 ```
-NVFBC → Nvidia device mem → CUDA D2H over PCIe → pinned system pages / RADV linear image → AMD fragment shader → AMD-native swapchain → Wayland / scanout
+NVFBC → Nvidia device mem → CUDA D2H over PCIe → pinned system pages / RADV buffer → AMD SDMA → AMD-native swapchain + overlay/border → Wayland / scanout
 ```
 
-Two frames in flight, Mailbox present mode. The NVFBC buffer is only valid until the next capture call, so the capture thread completes the copy before grabbing again. CUDA and RADV share the host backing without a CPU pixel copy. Host images stay in General; CUDA publication and Vulkan barriers order writes before sampling. Slots return to the pool only after renderer fences and frame references permit reuse. The renderer waits for GPU idle on shutdown. Allocation/driver constraints and measured limitations: `docs/cross-gpu.md`.
+Two reusable frame resource sets, Mailbox present mode, one pending NVFBC source presentation with a 50 ms recovery timeout. The NVFBC buffer is only valid until the next capture call, so the capture thread completes the copy before grabbing again. CUDA and RADV share the host backing without a CPU pixel copy. Host images stay in General; CUDA publication and Vulkan barriers order writes before copying or sampling. Unscaled captures use SDMA; scaling retains image sampling. A semaphore orders SDMA before graphics; the swapchain is shared concurrently between those queues. Slots return to the pool only after renderer fences and frame references permit reuse. The renderer waits for GPU idle on shutdown. Allocation/driver constraints and measured limitations: `docs/cross-gpu.md`.
 
 Wayland backends:
 
@@ -108,10 +108,11 @@ Nix flake with crane. `nix develop` gives a shell whose `LD_LIBRARY_PATH` carrie
 - Hyprland 0.56 with a Lua config. `hyprctl keyword` and legacy dispatch strings are rejected; use `hyprctl eval '<lua>'`. Window rules at exec time: `hl.exec_cmd("cmd", { workspace = "name:F1 silent", fullscreen = true })`. Stubs for the API ship in the Hyprland package under `share/hypr/stubs/hl.meta.lua`.
 - `HYPRLAND_INSTANCE_SIGNATURE` may be unset in agent shells; `waygriffctl` finds the newest `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`.
 - The exec'd command goes through `sh -c`, so shell-quote before Lua-quoting.
-- Workspace `F1` lives on the 4K@120 monitor. Use `render:direct_scanout=2` (auto). The NVFBC path sets content type `game`; its AMD-native swapchain has reached direct scanout with ZERO_COPY feedback. The former Nvidia WSI path was rejected by AMD KMS and setting 1 caused blocking modesets; see `.deeds/closed/5jgf2q.md`. Direct scanout is verified; an end-to-end latency improvement is still outstanding in `8kxgv6`.
+- Workspace `F1` lives on the 4K@120 monitor. Use `render:direct_scanout=2` (auto). The NVFBC path sets content type `game`; its AMD-native swapchain has reached direct scanout with ZERO_COPY feedback. The former Nvidia WSI path was rejected by AMD KMS and setting 1 caused blocking modesets; see `.deeds/closed/5jgf2q.md`. Pacing and measurements are explained in `docs/cross-gpu.md`.
 
 ## Gotchas
 
+- NVFBC enables `RADV_EXPERIMENTAL=transfer_queue` before thread startup. Mesa 26.2.2 requires it for SDMA; absent a dedicated queue, uploads fall back to graphics and deadline pacing is disabled. The 5 ms deadline budget is measured for this iGPU at 4K@120, not an adaptive GPU timer.
 - Capture and display are independent connections: the backend talks to the source (X11 or a Wayland compositor), the display thread talks to the destination compositor. Don't conflate them.
 - Nvidia WSI exports linear system-memory DMA-BUFs that AMD can import for composition but rejects for scanout. This does not imply sharing Nvidia optimal-tiled VRAM images with AMD; see `.deeds/closed/5jgf2q.md`.
 - `set_cursor` needs a pointer-enter serial; control-socket `set confine` before the pointer has entered must skip the cursor update.

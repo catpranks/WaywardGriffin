@@ -233,6 +233,10 @@ impl Capturer {
             cursor_visible: info.cursor_visible,
         };
         Ok(Some(CapturedFrame {
+            host_buffer: Some(crate::source::HostBuffer {
+                bytes: buf.transfer.clone(),
+                row_length: (buf.row_pitch / 4) as u32,
+            }),
             info: Some(info),
             image: buf.image.clone(),
             backend_data: Some(Box::new(buf)),

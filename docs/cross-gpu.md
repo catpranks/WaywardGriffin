@@ -1,14 +1,14 @@
 # A frame from Nvidia capture to AMD scanout
 
 Waygriff captures a game on the RTX 5090 through NVFBC, copies its pixels once
-into pinned system memory with CUDA, and samples those pages with the AMD iGPU.
-RADV renders the final image into its own Wayland swapchain. Hyprland can put
+into pinned system memory with CUDA, and uploads those pages into the AMD iGPU's
+native swapchain with its SDMA engine. RADV draws the overlay and border there. Hyprland can put
 that AMD-owned buffer directly on the display plane.
 
-Direct scanout is verified on this machine. Lower end-to-end latency is **not**
-yet demonstrated. These are separate results: removing an allocation restriction
-does not remove every scheduling delay between capture and the display.
-Measurements and the remaining work are tracked in `.deeds/8kxgv6.md`.
+Direct scanout removes an allocation restriction. Low latency additionally needs
+control over when a frame enters the compositor's page-flip schedule. Waygriff
+uses presentation feedback to choose a recent capture shortly before the next
+refresh; allocation, synchronization and pacing are explained separately below.
 
 ## Start with the bytes
 
@@ -26,11 +26,11 @@ across Nvidia's PCIe link.
 ```mermaid
 flowchart LR
     N["NVFBC capture<br/>Nvidia device memory"]
-    H["Pinned system pages<br/>CUDA destination = RADV texture backing"]
-    A["AMD-native swapchain image<br/>base + overlay + edge border"]
+    H["Pinned system pages<br/>CUDA destination = RADV buffer/texture backing"]
+    A["AMD-native swapchain image<br/>SDMA base + overlay + edge border"]
     D["AMD display plane"]
     N -->|"CUDA D2H · PCIe"| H
-    H -->|"RADV samples · memory fabric"| A
+    H -->|"AMD SDMA · memory fabric"| A
     A -->|"DMA-BUF + synchronization · Hyprland/KMS"| D
 ```
 
@@ -110,9 +110,10 @@ a Vulkan allocation. CUDA registers the allocation for device access; Vulkan
 imports it using `HOST_ALLOCATION_BIT_EXT`. No CPU pixel memcpy sits between
 CUDA's destination and RADV's input.
 
-The allocation obeys both the image's memory requirements and the device's
-`minImportedHostPointerAlignment`. The memory type must be compatible with both
-the image and `vkGetMemoryHostPointerPropertiesEXT`. Waygriff requires coherent,
+Each allocation backs both a linear image and a transfer-source buffer. It obeys
+both resources' size/alignment requirements and `minImportedHostPointerAlignment`.
+The memory type must be compatible with both resources and
+`vkGetMemoryHostPointerPropertiesEXT`; neither may require a dedicated allocation. Waygriff requires coherent,
 host-visible memory, and queries the linear image's row pitch and offset rather
 than assuming tightly packed rows. On the tested RADV device those were memory
 type 5, 4096-byte host alignment, row pitch 15360 and offset zero.
@@ -122,13 +123,15 @@ defines the import, alignment and lifetime rules.
 
 Vulkano 0.35 does not expose this import through `MemoryImportInfo`. The small
 host allocator therefore calls Vulkan's allocation/binding functions directly
-and wraps the image with `assume_bound()`. Its owner retains the raw memory
-handle and registered pages. Image references alone do not own that allocation;
+and wraps the image and buffer with `assume_bound()`. Its owner retains the raw
+memory handle and registered pages. Resource references alone do not own that
+allocation;
 the capture-slot owner must remain alive alongside them.
 
-The imported image is linear `B8G8R8A8_SRGB`. Sampling decodes sRGB and writing
-the sRGB swapchain encodes it again, preserving the established color path and
-linear-light overlay blending. The screenshot shader samples the same input and
+The imported image is linear `B8G8R8A8_SRGB`. For an unscaled full-window frame,
+SDMA copies the buffer alias directly into the swapchain: the sRGB bytes stay
+unchanged. For scaling, sampling decodes sRGB and the swapchain encodes it again.
+Both paths preserve linear-light overlay blending. The screenshot shader samples the same input and
 encodes its PNG bytes. Screenshots from `waygriffctl snap` show the source frame,
 not the composited overlay or border.
 
@@ -148,7 +151,8 @@ the source lifetime and publication of complete pixels. Registration and the
 copy operation are documented in the
 [CUDA Driver memory API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html).
 
-After publication, a host-write-to-shader-read barrier orders AMD's access.
+After publication, host-write-to-transfer-read or host-write-to-shader-read
+barriers order AMD's access.
 Coherence eliminates explicit mapped-memory cache flushes; it does not authorize
 CUDA to overwrite pages while AMD is still reading them. The renderer retains
 each capture slot until its submission fence completes, and also retains its
@@ -164,12 +168,12 @@ retain their external-ownership barriers.
 Raw Vulkano command recording does not retain descriptor sets. The renderer
 therefore keeps descriptors with its in-flight frames until the fence completes.
 On shutdown it waits for GPU idle before dropping resources. The destruction
-order is image, Vulkan memory, CUDA host registration, then pages. These are
+order is image and buffer, Vulkan memory, CUDA host registration, then pages. These are
 correctness requirements even when the display appears to work without them.
 
 ## The output is a different allocation
 
-The host capture image is an input texture. The output remains an ordinary
+The host capture slot is an input allocation. The output remains an ordinary
 AMD-native WSI allocation, whose placement and modifier RADV negotiates with
 Wayland. Importing host pages successfully is not itself proof that those pages
 can be displayed directly. Separating input and output lets each allocation
@@ -205,19 +209,69 @@ breathing width and alpha remain unchanged. The isolated strip pass measured
 about 0.03–0.04 ms. Normal play is confined and skips the border entirely.
 
 Direct sampling of the host image took roughly 3.8–4.2 ms of GPU execution
-without the border. An experimental dedicated SDMA upload reduced upload plus
-confined graphics work to roughly 1.3 ms, but required RADV's experimental
-transfer-queue exposure and did not establish lower presentation latency. It
-was removed, along with its buffer aliases, second queue and timing probes.
-The retained implementation uses the simpler sampling path.
+without the border. SDMA upload plus confined graphics takes roughly 1.3 ms.
+The buffer alias avoids an intermediate AMD texture and a second full-screen
+sampling pass. Its row length and offset come from the linear image layout.
+Vulkan permits consistent interpretation between a buffer and a linear image in
+`General`; see [memory aliasing](https://docs.vulkan.org/spec/latest/chapters/resources.html#resources-memory-aliasing).
+CUDA remains the sole writer of these pages, so the aliases only introduce two
+ways for AMD to read them.
 
-The faster experiment still reported roughly 13–18 ms source-to-presentation
-in short confined windows. Waiting for GPU completion before calling present
-did not cure it. A Wayland trace showed a ready commit receiving its frame
-callback at one refresh and its presentation feedback at the following refresh.
-This is evidence of delay beyond the measured draw; it does not identify the
-exact atomic-commit or kernel scheduling boundary. Faster GPU execution alone
-is not an end-to-end latency result.
+Mesa 26.2.2 exposes the dedicated queue only with
+`RADV_EXPERIMENTAL=transfer_queue`. Waygriff adds that flag before creating
+threads or initializing Vulkan, preserving other experimental flags. The
+[queue eligibility code](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.2.2/src/amd/vulkan/radv_physical_device.c#L109-123)
+also requires available SDMA, GFX9 or newer, and enabled compute/transfer queues.
+Mesa describes this queue as experimental and not yet fully specification
+compliant in its [environment-variable documentation](https://docs.mesa3d.org/envvars.html#radv-driver-environment-variables).
+This is an explicit driver dependency, not a portable performance guarantee.
+If no dedicated queue exists, the copy uses graphics and deadline pacing is disabled.
+
+The swapchain permits concurrent sharing between transfer and graphics queue
+families. SDMA waits for the acquired image, copies the capture and signals an
+upload semaphore; graphics waits for that semaphore before loading the image
+and drawing overlay/border. Its final fence covers both queues. Scaling and
+Wayland capture use the sampled path, clearing letterbox pixels first.
+
+## Why faster rendering needed different pacing
+
+Unrestricted submission left ready frames waiting in Hyprland's scanout schedule.
+A client-side trace imported WSI's exported DRM-syncobj timelines and waited for
+the acquire points without modifying them. Across 7,741 correlated frames, the
+acquire point became ready about 1.5 ms after surface commit. With unrestricted
+submission, ready-to-presentation averaged 12.54 ms in the compared window;
+with one outstanding presentation it averaged 6.41 ms. WSI readiness did not
+hide another full refresh in this trace.
+
+[Aquamarine's frame scheduler](https://github.com/hyprwm/aquamarine/blob/1a10fe26a9f7d989c359e6a9ea61aa2e44d06c36/src/backend/FrameScheduler.cpp#L5-L26)
+allows one pending page flip. A new ready surface while that flip is pending can
+be selected only after completion, then displayed on a subsequent refresh.
+That scheduling rule, the Hyprland eligibility path above, and the acquire trace
+explain why reducing GPU time alone did not fix latency. The trace observes
+client acquire readiness, callbacks and presentation; it does not instrument
+privileged kernel atomic-commit internals.
+
+Waygriff waits for each source presentation before submitting the next. After direct-scanout
+feedback on `CLOCK_MONOTONIC`, the render deadline is:
+
+```
+last presentation + reported refresh period - 5 ms
+```
+
+The capture thread keeps replacing its pending slot until that deadline. The
+renderer then takes the newest complete capture. Five milliseconds leaves room
+for measured SDMA/graphics work and CPU/WSI/compositor scheduling on this machine.
+It is a fixed budget for the tested unscaled SDMA path; unknown clocks, missing
+refresh periods, composition and the slower sampled path disable the deadline.
+A 50 ms maintenance fallback preserves resize, static-source and capture-toggle
+behavior when feedback stops, allowing a recovery submission even with pending
+feedback. Wayland capture still follows frame callbacks.
+
+Waiting for a capture newer than the last presentation was rejected: it can
+throw away the only frame that would meet the next deadline and halve cadence.
+Keeping the latest available image until a known render deadline avoids that
+prediction. A late CPU or GPU submission can still miss a refresh; the budget
+must be remeasured for a different device or a substantially heavier overlay.
 
 Source and destination clocks drift relative to each other. Two short samples
 can differ by several milliseconds without a code change, and a missed deadline
@@ -226,6 +280,32 @@ unconfined run to expose border cost, check feedback freshness, and record
 Hyprland's monitor state and modeset-log delta around each interval. The earlier
 failed-scanout modeset storm made otherwise plausible comparisons misleading.
 Timing boundaries are defined in [latency.md](latency.md).
+
+## Measured result
+
+The same HoN menu at 3840×2160@120, about 243 seconds per interval. These are
+means of snapshots taken every five seconds, excluding the first ten seconds;
+latencies cover each snapshot's last 600 displayed frames. The intervals span
+the source/output phase drift rather than selecting its most favorable window.
+
+| Path / state | Displayed Hz | Total ms | Submit→present ms | Obtain ms | ZERO_COPY |
+|---|---:|---:|---:|---:|---:|
+| Nvidia c8e1455f, confined | 118.457 | 14.012 | 13.439 | 0.356 | 0.000 |
+| AMD SDMA, confined | 118.880 | 10.146 | 5.031 | 0.967 | 1.000 |
+| AMD SDMA, unconfined strips | 118.076 | 10.202 | 5.118 | 0.985 | 1.000 |
+
+All three intervals kept the same monitor mode and had zero modeset-log growth
+(count 109998). AMD's `directScanoutTo` matched waygriff and ZERO_COPY stayed 1.
+Steady confined samples reached 120 Hz; occasional cadence dips occurred on both
+the old and new paths. The confined AMD total's rolling means ranged from 6.18
+to 14.17 ms, while submit→present stayed between 4.97 and 5.21 ms. The full-run
+mean meets the 12.5 ms latency target; this is not a per-frame upper bound.
+
+The small confined/unconfined total difference is consistent with the strip
+optimization, but asynchronous phase and scheduling noise prevent attributing
+that difference entirely to the border. The isolated GPU measurements above
+establish its cost more directly. These runs used a menu with no overlay;
+heavier gameplay or overlay work is the next useful workload to measure.
 
 The observations above used RTX 5090 / Nvidia 595.99.02, Ryzen 9 9950X3D
 RADV RAPHAEL_MENDOCINO / Mesa 26.2.2, Linux 7.2.6 and Hyprland v0.56.2 at

@@ -224,6 +224,7 @@ impl State {
 
         let Buffer { wl_buffer, image } = buf;
         let frame = CapturedFrame {
+            host_buffer: None,
             image,
             backend_data: Some(Box::new(wl_buffer)),
             info: Some(info),

@@ -40,8 +40,8 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
 ## GPU facts I learned
 
 The current NVFBC path uses CUDA D2H into pinned host pages, then renders and
-presents on the RADV iGPU. Direct scanout works; a latency improvement is still
-unproven. The [cross-GPU walkthrough](./docs/cross-gpu.md) explains the allocation,
+presents on the RADV iGPU. SDMA uploads unscaled frames into native scanout
+buffers; presentation feedback paces rendering close to the next refresh. The [cross-GPU walkthrough](./docs/cross-gpu.md) explains the allocation,
 synchronization and scanout constraints with probes and source references.
 
 - The CUDA buffer produced by an NVFBC capture is only valid until the next capture call.

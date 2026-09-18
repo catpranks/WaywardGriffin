@@ -1,4 +1,4 @@
-//! CUDA writes pinned system RAM; RADV samples the same pages as a linear image.
+//! CUDA writes pinned system RAM; RADV copies or samples the same pages.
 use anyhow::{Context as _, Result, ensure};
 use ash::vk;
 use cudarc::driver::{safe::CudaContext, sys as cuda};
@@ -7,6 +7,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::info;
 use vulkano::VulkanObject as _;
+use vulkano::buffer::sys::RawBuffer;
+use vulkano::buffer::{BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer,
@@ -20,9 +22,10 @@ use vulkano::sync::fence::{Fence, FenceCreateInfo};
 use vulkano::sync::{DependencyInfo, ImageMemoryBarrier, PipelineStages};
 
 pub(super) struct Buffer {
-    // Drop the image before its allocation. CapturedFrame/in-flight references
+    // Drop the image and buffer before their allocation. CapturedFrame/in-flight references
     // keep this whole slot alive until AMD's last read has completed.
     pub image: Arc<Image>,
+    pub transfer: Subbuffer<[u8]>,
     memory: HostMemory,
     pub row_pitch: u64,
     offset: usize,
@@ -46,13 +49,33 @@ impl Buffer {
         )?;
         let requirements = raw_image.memory_requirements()[0];
         let image_layout = raw_image.subresource_layout(ImageAspect::Color, 0, 0)?;
+        let raw_buffer = RawBuffer::new(
+            device.clone(),
+            BufferCreateInfo {
+                size: requirements.layout.size(),
+                usage: BufferUsage::TRANSFER_SRC,
+                external_memory_handle_types: ExternalMemoryHandleTypes::HOST_ALLOCATION,
+                ..Default::default()
+            },
+        )?;
+        let buffer_requirements = raw_buffer.memory_requirements();
+        ensure!(
+            !requirements.requires_dedicated_allocation
+                && !buffer_requirements.requires_dedicated_allocation,
+            "host aliases require shared memory"
+        );
         let alignment = device
             .physical_device()
             .properties()
             .min_imported_host_pointer_alignment
             .context("host import alignment")?
-            .max(requirements.layout.alignment().into()) as usize;
-        let allocation_size = (requirements.layout.size() as usize).next_multiple_of(alignment);
+            .max(requirements.layout.alignment().into())
+            .max(buffer_requirements.layout.alignment().into()) as usize;
+        let allocation_size = (requirements
+            .layout
+            .size()
+            .max(buffer_requirements.layout.size()) as usize)
+            .next_multiple_of(alignment);
         let pages = PinnedPages::new(ctx, allocation_size, alignment)?;
 
         let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
@@ -68,7 +91,9 @@ impl Buffer {
             )
             .result()?;
         }
-        let memory_type_bits = requirements.memory_type_bits & host_properties.memory_type_bits;
+        let memory_type_bits = requirements.memory_type_bits
+            & buffer_requirements.memory_type_bits
+            & host_properties.memory_type_bits;
         let memory_type_index = device
             .physical_device()
             .memory_properties()
@@ -89,12 +114,10 @@ impl Buffer {
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
             .host_pointer(pages.ptr.as_ptr().cast());
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(raw_image.handle());
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(allocation_size as u64)
             .memory_type_index(memory_type_index)
-            .push_next(&mut import)
-            .push_next(&mut dedicated);
+            .push_next(&mut import);
         let mut handle = vk::DeviceMemory::null();
         unsafe {
             (device.fns().v1_0.allocate_memory)(
@@ -132,12 +155,24 @@ impl Buffer {
             offset = image_layout.offset,
             "CUDA/RADV host slot"
         );
+        unsafe {
+            (memory.device.fns().v1_0.bind_buffer_memory)(
+                memory.device.handle(),
+                raw_buffer.handle(),
+                memory.handle,
+                0,
+            )
+            .result()?;
+        }
+        let transfer: Subbuffer<[u8]> = Arc::new(unsafe { raw_buffer.assume_bound() }).into();
+        let transfer = transfer.slice(image_layout.offset..);
         let image = Arc::new(unsafe { raw_image.assume_bound() });
         // External-memory images must start Undefined. Transition once *before*
         // CUDA writes pixels, so a discard-layout transition cannot lose a frame.
         initialize_layout(&queue, image.clone())?;
         Ok(Self {
             image,
+            transfer,
             memory,
             row_pitch: image_layout.row_pitch,
             offset: image_layout.offset as usize,

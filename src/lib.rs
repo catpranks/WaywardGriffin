@@ -64,6 +64,16 @@ pub fn run() -> Result<()> {
     match opts.capture_opts.backend {
         BackendType::Nvfbc => unsafe {
             std::env::set_var("DISPLAY", &opts.capture_opts.display);
+            // Mesa 26.2 keeps SDMA queues behind this flag. Set it before Vulkan
+            // initialization and before spawning threads; preserve other flags.
+            let mut experimental = std::env::var("RADV_EXPERIMENTAL").unwrap_or_default();
+            if !experimental.split(',').any(|flag| flag == "transfer_queue") {
+                if !experimental.is_empty() {
+                    experimental.push(',');
+                }
+                experimental.push_str("transfer_queue");
+                std::env::set_var("RADV_EXPERIMENTAL", experimental);
+            }
         },
         _ => unsafe {
             std::env::remove_var("DISPLAY");

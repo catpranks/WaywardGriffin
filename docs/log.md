@@ -169,3 +169,43 @@ No overlay, screenshot or build overlapped these windows. The border's GPU cost
 comes from the isolated timestamp probes, not subtraction of these phase-shifted
 end-to-end numbers. The final instance was stopped. Closed border issue jwydmn;
 the main latency objective remains open.
+
+## 2026-09-18: native AMD scanout latency follow-through
+
+The first host-sampling milestone enabled native scanout but missed the latency
+objective. The follow-through recovered the dedicated SDMA upload experiment,
+then traced WSI acquire timeline readiness from a client-only interposer. Acquire
+points became ready about 1.5 ms after commit; the extra refresh was downstream
+in the scanout schedule. Limiting source presentations removed the extra queue
+but required choosing a recent capture closer to the next refresh.
+
+Strict fresh-frame admission halved cadence in some source/output phases and
+was rejected. Free-running render deadlines restored cadence but allowed an
+extra queued refresh, so that experiment was rejected too. The retained design
+waits for presentation feedback, schedules rendering five milliseconds before
+the next reported refresh, and takes the latest complete capture at that time.
+It never discards the only available capture in anticipation of a future one.
+A 50 ms maintenance fallback handles static sources and missing feedback.
+
+The renderer uses a transfer-buffer alias of each imported host image. SDMA
+copies unscaled frames directly into the native swapchain; graphics loads the
+result and adds overlay/border. Scaled and Wayland captures retain sampling.
+Mesa 26.2.2 requires its experimental transfer-queue flag, enabled before thread
+startup. Temporary query pools, filesystem switches and alternate pipelines
+were removed. The owner-facing cross-GPU guide now covers these decisions and
+the scheduling evidence in addition to allocation provenance and KMS rules.
+
+Final four-minute comparison:
+
+| Path / state | Displayed Hz | Total ms | Submit→present ms | Obtain ms | ZERO_COPY |
+|---|---:|---:|---:|---:|---:|
+| Nvidia c8e1455f, confined | 118.457 | 14.012 | 13.439 | 0.356 | 0.000 |
+| AMD SDMA, confined | 118.880 | 10.146 | 5.031 | 0.967 | 1.000 |
+| AMD SDMA, unconfined strips | 118.076 | 10.202 | 5.118 | 0.985 | 1.000 |
+
+Mode count stayed 109998 throughout; native scanout was continuous in both AMD
+states. Source, overlay, border, letterboxing and capture-off PNGs were read.
+Capture resumed correctly and stopping while disabled completed normally.
+All-target release clippy, formatting, release build and three existing library
+tests passed. Wayland backends were compile-checked only. No retained compositor
+or power-policy changes. Final instance stopped.

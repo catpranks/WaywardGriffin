@@ -22,8 +22,8 @@ use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferBeginInfo, CommandBufferLevel,
-    CommandBufferSubmitInfo, CommandBufferUsage, RecordingCommandBuffer, RenderPassBeginInfo,
-    SemaphoreSubmitInfo, SubmitInfo, SubpassBeginInfo,
+    CommandBufferSubmitInfo, CommandBufferUsage, CopyBufferToImageInfo, RecordingCommandBuffer,
+    RenderPassBeginInfo, SemaphoreSubmitInfo, SubmitInfo, SubpassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
@@ -68,6 +68,8 @@ use vulkano::{VulkanLibrary, VulkanObject as _, single_pass_renderpass};
 struct InFlight {
     acquire: Arc<Semaphore>,
     present: Arc<Semaphore>,
+    uploaded: Arc<Semaphore>,
+    upload_command: Option<Arc<dyn Send + Sync>>,
     fence: Arc<Fence>,
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
     frames: Vec<Arc<CapturedFrame>>,
@@ -100,9 +102,11 @@ pub struct Renderer {
 
     pub allocator: Arc<StandardMemoryAllocator>,
     pub queue: Arc<Queue>,
+    transfer_queue: Arc<Queue>,
     pub device: Arc<Device>,
     _surface: Arc<Surface>,
     start_time: Instant,
+    scanout_pacing: bool,
 }
 
 impl Renderer {
@@ -182,14 +186,34 @@ impl Renderer {
             .map(|i| i as u32)
             .context("No graphics queue family found on the device")?;
 
+        let transfer_index = physical_device
+            .queue_family_properties()
+            .iter()
+            .position(|q| {
+                host_capture
+                    && q.queue_flags.contains(QueueFlags::TRANSFER)
+                    && !q
+                        .queue_flags
+                        .intersects(QueueFlags::GRAPHICS | QueueFlags::COMPUTE)
+            })
+            .map(|i| i as u32)
+            .unwrap_or(queue_family_index);
+        let mut queue_create_infos = vec![QueueCreateInfo {
+            queue_family_index,
+            ..Default::default()
+        }];
+        if transfer_index != queue_family_index {
+            queue_create_infos.push(QueueCreateInfo {
+                queue_family_index: transfer_index,
+                ..Default::default()
+            });
+        }
+        info!(queue_family_index, transfer_index, "queue families");
         let (device, mut queues) = Device::new(
             physical_device.clone(),
             DeviceCreateInfo {
                 enabled_extensions: device_extensions,
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
+                queue_create_infos,
                 enabled_features: DeviceFeatures {
                     timeline_semaphore: true,
                     ..Default::default()
@@ -198,6 +222,7 @@ impl Renderer {
             },
         )?;
         let queue = queues.next().unwrap();
+        let transfer_queue = queues.next().unwrap_or_else(|| queue.clone());
         let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
         let (swapchain, swapchain_images) = {
@@ -208,6 +233,14 @@ impl Renderer {
                 device.clone(),
                 surface.clone(),
                 SwapchainCreateInfo {
+                    image_sharing: if transfer_index != queue_family_index {
+                        vulkano::sync::Sharing::Concurrent(smallvec![
+                            queue_family_index,
+                            transfer_index
+                        ])
+                    } else {
+                        vulkano::sync::Sharing::Exclusive
+                    },
                     min_image_count: surface_capabilities.min_image_count.max(2),
                     image_format: Format::B8G8R8A8_SRGB,
                     image_color_space: ColorSpace::SrgbNonLinear,
@@ -226,7 +259,7 @@ impl Renderer {
                 color: {
                     format: swapchain.image_format(),
                     samples: 1,
-                    load_op: Clear,
+                    load_op: Load,
                     store_op: Store,
                 },
             },
@@ -347,6 +380,11 @@ impl Renderer {
                     },
                 )?);
                 Ok(InFlight {
+                    uploaded: Arc::new(Semaphore::new(
+                        device.clone(),
+                        SemaphoreCreateInfo::default(),
+                    )?),
+                    upload_command: None,
                     acquire,
                     present,
                     fence,
@@ -379,9 +417,11 @@ impl Renderer {
             descriptor_set_allocator,
             allocator,
             queue,
+            transfer_queue,
             device,
             _surface: surface,
             start_time: Instant::now(),
+            scanout_pacing: false,
         })
     }
 
@@ -408,7 +448,7 @@ impl Renderer {
     fn configure(&mut self, sizer: &Sizer) -> Result<()> {
         let [sw, sh] = self.swapchain.image_extent();
         if self.needs_recreate || (sw, sh) != sizer.render_size {
-            // Raw render commands do not retain the old framebuffers.
+            // Raw command buffers do not retain the old framebuffers.
             for frame in &self.in_flight {
                 frame.fence.wait(None)?;
             }
@@ -558,7 +598,7 @@ impl Renderer {
         if let Some(ref old) = old_frame {
             ifl.frames.push(old.clone());
         }
-        ifl.frames.push(current_frame);
+        ifl.frames.push(current_frame.clone());
         ifl.overlays.clear();
         if let Some(ref old) = old_overlay {
             ifl.overlays.push(old.clone());
@@ -597,6 +637,65 @@ impl Renderer {
             .image()
             .clone();
         let qfi = self.queue.queue_family_index();
+        let content = sizer.render_sizing.content;
+        let copy_base = current_frame.host_buffer.is_some()
+            && image.extent() == swapchain_image.extent()
+            && content.x == 0
+            && content.y == 0
+            && content.width == image.extent()[0]
+            && content.height == image.extent()[1];
+        // The 5 ms presentation budget is for the measured SDMA path. Scaling
+        // uses the slower sampled path and keeps immediate submission.
+        self.scanout_pacing = copy_base && self.transfer_queue.queue_family_index() != qfi;
+        let upload = if copy_base {
+            let mut upload = RecordingCommandBuffer::new(
+                self.command_buffer_allocator.clone(),
+                self.transfer_queue.queue_family_index(),
+                CommandBufferLevel::Primary,
+                CommandBufferBeginInfo {
+                    usage: CommandBufferUsage::OneTimeSubmit,
+                    ..Default::default()
+                },
+            )?;
+            unsafe {
+                upload.pipeline_barrier(&DependencyInfo {
+                    memory_barriers: smallvec![vulkano::sync::MemoryBarrier {
+                        src_stages: PipelineStages::HOST,
+                        src_access: AccessFlags::HOST_WRITE,
+                        dst_stages: PipelineStages::ALL_TRANSFER,
+                        dst_access: AccessFlags::TRANSFER_READ,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })?;
+                upload.pipeline_barrier(&color_barrier(
+                    swapchain_image.clone(),
+                    ImageLayout::Undefined,
+                    ImageLayout::TransferDstOptimal,
+                    (PipelineStages::TOP_OF_PIPE, AccessFlags::empty()),
+                    (PipelineStages::ALL_TRANSFER, AccessFlags::TRANSFER_WRITE),
+                    None,
+                ))?;
+                let host = current_frame.host_buffer.as_ref().unwrap();
+                let mut copy = CopyBufferToImageInfo::buffer_image(
+                    host.bytes.clone(),
+                    swapchain_image.clone(),
+                );
+                copy.regions[0].buffer_row_length = host.row_length;
+                upload.copy_buffer_to_image(&copy)?;
+                upload.pipeline_barrier(&color_barrier(
+                    swapchain_image.clone(),
+                    ImageLayout::TransferDstOptimal,
+                    ImageLayout::ColorAttachmentOptimal,
+                    (PipelineStages::ALL_TRANSFER, AccessFlags::TRANSFER_WRITE),
+                    (PipelineStages::BOTTOM_OF_PIPE, AccessFlags::empty()),
+                    None,
+                ))?;
+            }
+            Some(Arc::new(unsafe { upload.end() }?))
+        } else {
+            None
+        };
         let mut cmd = RecordingCommandBuffer::new(
             self.command_buffer_allocator.clone(),
             qfi,
@@ -648,25 +747,45 @@ impl Renderer {
             if has_new_overlay && let Some(ref overlay) = self.current_overlay {
                 cmd.pipeline_barrier(&acquire_from_external(overlay.image.clone(), qfi))?;
             }
-            // Transition swapchain for rendering
-            cmd.pipeline_barrier(&color_barrier(
-                swapchain_image.clone(),
-                ImageLayout::Undefined,
-                ImageLayout::ColorAttachmentOptimal,
-                (PipelineStages::TOP_OF_PIPE, AccessFlags::empty()),
-                (
-                    PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-                    AccessFlags::COLOR_ATTACHMENT_WRITE,
-                ),
-                None,
-            ))?;
-
+            if !copy_base {
+                cmd.pipeline_barrier(&color_barrier(
+                    swapchain_image.clone(),
+                    ImageLayout::Undefined,
+                    ImageLayout::TransferDstOptimal,
+                    (PipelineStages::TOP_OF_PIPE, AccessFlags::empty()),
+                    (PipelineStages::ALL_TRANSFER, AccessFlags::TRANSFER_WRITE),
+                    None,
+                ))?;
+                cmd.clear_color_image(&ClearColorImageInfo {
+                    image_layout: ImageLayout::TransferDstOptimal,
+                    clear_value: [0.0, 0.0, 0.0, 1.0].into(),
+                    ..ClearColorImageInfo::image(swapchain_image.clone())
+                })?;
+                cmd.pipeline_barrier(&color_barrier(
+                    swapchain_image.clone(),
+                    ImageLayout::TransferDstOptimal,
+                    ImageLayout::ColorAttachmentOptimal,
+                    (PipelineStages::ALL_TRANSFER, AccessFlags::TRANSFER_WRITE),
+                    (
+                        PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+                        AccessFlags::COLOR_ATTACHMENT_READ | AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    ),
+                    None,
+                ))?;
+            }
             cmd.begin_render_pass(
                 &RenderPassBeginInfo {
-                    clear_values: vec![Some([0.0, 0.0, 0.0, 0.0].into())],
+                    clear_values: vec![None],
                     ..RenderPassBeginInfo::framebuffer(fb.clone())
                 },
                 &SubpassBeginInfo::default(),
+            )?;
+            cmd.set_scissor(
+                0,
+                &[Scissor {
+                    offset: [0, 0],
+                    extent: self.swapchain.image_extent(),
+                }],
             )?;
             cmd.bind_pipeline_graphics(&self.textured_pipeline)?;
             let content = sizer.render_sizing.content;
@@ -679,39 +798,33 @@ impl Renderer {
                 }],
             )?;
 
-            cmd.set_scissor(
-                0,
-                &[Scissor {
-                    offset: [0, 0],
-                    extent: self.swapchain.image_extent(),
-                }],
-            )?;
-
-            // Raw command recording does not retain descriptors or their images.
-            // Keep each set with this submission until its fence completes.
-            let base_set = textured_set(
-                &self.descriptor_set_allocator,
-                &self.textured_pipeline,
-                &self.sampler,
-                image.clone(),
-            )?;
-            cmd.bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.textured_pipeline.layout(),
-                0,
-                &[base_set.as_raw()],
-                &[],
-            )?;
-            ifl.descriptor_sets.push(base_set);
-            cmd.push_constants(
-                self.textured_pipeline.layout(),
-                0,
-                &TexturedPushConstants { opaque: 1 },
-            )?;
-            cmd.draw(3, 1, 0, 0)?;
-
+            if !copy_base {
+                // Raw command recording does not retain descriptors or their images.
+                // Keep each set with this submission until its fence completes.
+                let base_set = textured_set(
+                    &self.descriptor_set_allocator,
+                    &self.textured_pipeline,
+                    &self.sampler,
+                    image.clone(),
+                )?;
+                cmd.bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.textured_pipeline.layout(),
+                    0,
+                    &[base_set.as_raw()],
+                    &[],
+                )?;
+                ifl.descriptor_sets.push(base_set);
+                cmd.push_constants(
+                    self.textured_pipeline.layout(),
+                    0,
+                    &TexturedPushConstants { opaque: 1 },
+                )?;
+                cmd.draw(3, 1, 0, 0)?;
+            }
             // Draw 2: Overlay (alpha-blended)
             if let Some(ref overlay) = self.current_overlay {
+                cmd.bind_pipeline_graphics(&self.textured_pipeline)?;
                 let overlay_set = textured_set(
                     &self.descriptor_set_allocator,
                     &self.textured_pipeline,
@@ -789,8 +902,12 @@ impl Renderer {
 
         ifl.last_command_buffer = Some(command_buffer as Arc<dyn Send + Sync>);
 
-        let mut wait_semaphores = vec![ifl.acquire.handle()];
-        let mut wait_stages = vec![ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let mut wait_semaphores = vec![if copy_base {
+            ifl.uploaded.handle()
+        } else {
+            ifl.acquire.handle()
+        }];
+        let mut wait_stages = vec![ash::vk::PipelineStageFlags::TOP_OF_PIPE];
         if let Some(ref sem) = overlay_acquire {
             wait_semaphores.push(sem.handle());
             wait_stages.push(ash::vk::PipelineStageFlags::FRAGMENT_SHADER);
@@ -802,12 +919,33 @@ impl Renderer {
             .wait_dst_stage_mask(&wait_stages)
             .signal_semaphores(&present_semaphore);
 
+        let feedback = info.map(|mut info| {
+            info.mark_commit();
+            self.dc.request_feedback(info)
+        });
+        let submit_start = Instant::now();
+        if let Some(upload) = upload {
+            let cmds = [upload.handle()];
+            let wait = [ifl.acquire.handle()];
+            let signal = [ifl.uploaded.handle()];
+            let stages = [ash::vk::PipelineStageFlags::TOP_OF_PIPE];
+            let submit = ash::vk::SubmitInfo::default()
+                .command_buffers(&cmds)
+                .wait_semaphores(&wait)
+                .wait_dst_stage_mask(&stages)
+                .signal_semaphores(&signal);
+            self.transfer_queue.with(|_| unsafe {
+                (self.device.fns().v1_0.queue_submit)(
+                    self.transfer_queue.handle(),
+                    1,
+                    &submit,
+                    ash::vk::Fence::null(),
+                )
+                .result()
+            })?;
+            ifl.upload_command = Some(upload);
+        }
         let present_suboptimal = self.queue.with(|mut guard| unsafe {
-            let feedback = info.map(|mut info| {
-                info.mark_commit();
-                self.dc.request_feedback(info)
-            });
-            let submit_start = Instant::now();
             (self.device.fns().v1_0.queue_submit)(
                 self.queue.handle(),
                 1,
@@ -952,6 +1090,7 @@ impl Drop for Renderer {
         unsafe { self.device.wait_idle() }.unwrap();
         for frame in &mut self.in_flight {
             frame.last_command_buffer = None;
+            frame.upload_command = None;
             frame.descriptor_sets.clear();
         }
     }
@@ -1063,6 +1202,8 @@ pub enum RenderMsg {
     Configured,
     Frame,
     CaptureReady,
+    // Monotonic presentation timestamp and refresh period, for direct scanout.
+    PresentationDone(Option<(u64, u32)>),
     Redraw,
     Quit,
     Screenshot(UnixStream),
@@ -1096,14 +1237,21 @@ fn render_loop(
 ) -> Result<()> {
     let frame_driven = backend.frame_driven();
     let mut configured = false;
+    let mut next_draw_ns = 0u64;
     let mut last_draw = Instant::now();
     let mut idle_start = Instant::now();
-    // Keep controls, resize and overlays responsive even when the source is static
-    // or capture is disabled. Fresh NVFBC frames bypass this maintenance cadence.
+    // Keep controls, resize and overlays responsive with a static source or no
+    // presentation feedback (for example while the window is hidden).
     let maintenance = Duration::from_millis(50);
     loop {
         let msg = if frame_driven && configured {
-            match render_rx.recv_timeout(maintenance.saturating_sub(last_draw.elapsed())) {
+            let mut timeout = maintenance.saturating_sub(last_draw.elapsed());
+            if next_draw_ns != 0 {
+                timeout = timeout.min(Duration::from_nanos(
+                    next_draw_ns.saturating_sub(crate::utils::clock_monotonic_ns()),
+                ));
+            }
+            match render_rx.recv_timeout(timeout) {
                 Ok(msg) => msg,
                 Err(mpsc::RecvTimeoutError::Timeout) => RenderMsg::Redraw,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -1114,16 +1262,47 @@ fn render_loop(
                 Err(mpsc::RecvError) => return Ok(()),
             }
         };
+        if let RenderMsg::PresentationDone(timing) = &msg {
+            // Leave 5 ms for SDMA, graphics, WSI and compositor scheduling.
+            // Until then the capture thread keeps replacing its pending slot.
+            // Measured GPU work is about 1.3 ms on the target RADV iGPU.
+            const RENDER_AHEAD_NS: u64 = 5_000_000;
+            next_draw_ns = match timing {
+                Some((presented, refresh))
+                    if renderer.scanout_pacing && u64::from(*refresh) > RENDER_AHEAD_NS =>
+                {
+                    presented + u64::from(*refresh) - RENDER_AHEAD_NS
+                }
+                _ => 0,
+            };
+        }
         match msg {
             RenderMsg::Quit => return Ok(()),
             RenderMsg::Frame if frame_driven => continue,
+            RenderMsg::PresentationDone(..) if !frame_driven => continue,
             RenderMsg::CaptureReady | RenderMsg::Redraw if !configured => continue,
             RenderMsg::Configured
             | RenderMsg::Frame
+            | RenderMsg::PresentationDone(..)
             | RenderMsg::CaptureReady
             | RenderMsg::Redraw => {
                 configured = true;
                 let capturing = dc.global_state.load().capture;
+                // Do not queue another source frame behind the next page flip.
+                // Expire the gate after maintenance so missing feedback cannot
+                // freeze controls or prevent the window from recovering.
+                if frame_driven
+                    && capturing
+                    && dc.has_pending_presentation()
+                    && last_draw.elapsed() < maintenance
+                {
+                    next_draw_ns = 0;
+                    continue;
+                }
+                if frame_driven && capturing && next_draw_ns > crate::utils::clock_monotonic_ns() {
+                    continue;
+                }
+                next_draw_ns = 0;
                 // Drain a pending NVFBC image even while disabled so its slot can
                 // notify us again after capture resumes.
                 let capture = if capturing || frame_driven {
@@ -1134,8 +1313,12 @@ fn render_loop(
                 if frame_driven
                     && capturing
                     && capture.is_none()
-                    && matches!(msg, RenderMsg::CaptureReady)
+                    && !matches!(msg, RenderMsg::Configured)
+                    && last_draw.elapsed() < maintenance
                 {
+                    // A deadline is permission to take a frame, not a reason to
+                    // resubmit the previous one. If capture is a little late,
+                    // wait for its notification instead of queuing a duplicate.
                     continue;
                 }
                 dc.mon.idle(idle_start.elapsed());

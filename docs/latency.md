@@ -57,11 +57,16 @@ direct scanout or a hardware overlay. It is independent of NVFBC direct capture.
 NVFBC grabs on a dedicated thread with a 50 ms timeout, completes the CUDA copy,
 and publishes the image into one replaceable slot. Only the empty→occupied
 transition wakes rendering, so slow rendering does not create a FIFO of stale
-frames. The renderer takes the latest image and submits immediately with Mailbox;
-it does not wait for a Wayland frame callback or presentation feedback. A single
-outstanding frame-callback request reports callback delivery cadence; it does
-not measure output refresh rate. A 50 ms
-maintenance redraw handles static sources, overlays, and capture-off state.
+frames. The renderer allows one pending source presentation, with a 50 ms
+maintenance fallback when feedback is absent. For unscaled dedicated-SDMA output,
+monotonic ZERO_COPY feedback supplies the next refresh estimate. Rendering starts
+5 ms before that refresh and takes the newest completed capture at that point.
+The wait remains visible in `render_queue_ms`; no timestamp boundary is moved to
+hide it. Mailbox presentation remains asynchronous. Other NVFBC draws proceed
+on arrival/feedback without this deadline. A single outstanding frame-callback
+request reports callback delivery cadence; it does not pace NVFBC or measure
+output refresh rate. Maintenance redraws handle static sources, overlays, and
+capture-off state.
 
 The NVFBC buffer is valid only until the next grab, so the copy is synchronous.
 GPU references keep copied images out of the pool until rendering finishes.

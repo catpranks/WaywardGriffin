@@ -85,6 +85,10 @@ struct PendingFeedback {
 }
 
 impl DisplayCtx {
+    pub fn has_pending_presentation(&self) -> bool {
+        !self.pending_feedback.lock().unwrap().is_empty()
+    }
+
     pub fn request_frame(&self) {
         if !self.frame_pending.swap(true, Ordering::Relaxed) {
             self.surface
@@ -443,6 +447,7 @@ impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppDat
                 tv_sec_lo,
                 tv_nsec,
                 flags,
+                refresh,
                 ..
             } => {
                 let received = clock_monotonic_ns();
@@ -458,11 +463,16 @@ impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppDat
                             .set_present(compose_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec));
                     }
                 });
+                let _ = state.render_tx.send(RenderMsg::PresentationDone(
+                    (clock_matches && u32::from(flags) & 8 != 0 && refresh != 0)
+                        .then(|| (compose_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec), refresh)),
+                ));
             }
             wp_presentation_feedback::Event::Discarded => {
                 state
                     .dc
                     .update_feedback(feedback.id(), |pending| pending.outcome = Some(false));
+                let _ = state.render_tx.send(RenderMsg::PresentationDone(None));
             }
             _ => {}
         }
