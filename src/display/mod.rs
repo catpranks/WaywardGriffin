@@ -9,7 +9,7 @@ use crate::overlay::OverlayHandle;
 use crate::render::{RenderMsg, Renderer};
 use crate::sizer::SharedSizer;
 use crate::source::{CaptureEnv, create_backend_builder};
-use crate::utils::clock_monotonic_ns;
+use crate::utils::{clock_monotonic_ns, compose_timestamp};
 use crate::{GlobalState, Opts};
 use anyhow::{Result, anyhow, bail};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
@@ -51,6 +51,7 @@ use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_han
 use std::collections::VecDeque;
 use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::net::{SocketAddr, UnixListener};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -67,26 +68,71 @@ pub struct DisplayCtx {
     pub viewport: WpViewport,
     pub compositor_state: CompositorState,
     presentation: wp_presentation::WpPresentation,
-    pending_feedback: Arc<Mutex<VecDeque<(ObjectId, FrameInfo)>>>,
+    pending_feedback: Arc<Mutex<VecDeque<(ObjectId, PendingFeedback)>>>,
+    presentation_clock: Arc<AtomicU32>,
+    frame_pending: Arc<AtomicBool>,
     qh: QueueHandle<App>,
+}
+
+struct PendingFeedback {
+    info: FrameInfo,
+    /// Some(true) for presented, Some(false) for discarded.
+    outcome: Option<bool>,
 }
 
 impl DisplayCtx {
     pub fn request_frame(&self) {
-        self.surface
-            .frame(&self.qh, FrameCallbackData(self.surface.clone()));
+        if !self.frame_pending.swap(true, Ordering::Relaxed) {
+            self.surface
+                .frame(&self.qh, FrameCallbackData(self.surface.clone()));
+        }
     }
 
-    pub fn request_feedback(&self, info: FrameInfo) {
+    pub fn request_feedback(&self, info: FrameInfo) -> ObjectId {
         let fb = self.presentation.feedback(&self.surface, &self.qh, AppData);
         let mut deque = self.pending_feedback.lock().unwrap();
         while let Some((_, front)) = deque.front()
-            && front.start.elapsed() > Duration::from_secs(1)
+            && front.info.start.elapsed() > Duration::from_secs(1)
         {
             deque.pop_front();
-            info!("presentation feedback timed out");
+            self.mon.feedback_timeout();
         }
-        deque.push_back((fb.id(), info));
+        let id = fb.id();
+        deque.push_back((
+            id.clone(),
+            PendingFeedback {
+                info,
+                outcome: None,
+            },
+        ));
+        id
+    }
+
+    pub fn finish_present(&self, id: ObjectId, submit: Duration, present: Duration, returned: u64) {
+        self.update_feedback(id, |pending| {
+            pending.info.latency.queue_submit = submit;
+            pending.info.latency.queue_present = Some(present);
+            pending.info.latency.present_return_mono_ns = Some(returned);
+        });
+    }
+
+    // Feedback can arrive before queue_present returns. Join the two halves without
+    // holding a lock during WSI calls or blocking Wayland event dispatch.
+    fn update_feedback(&self, id: ObjectId, update: impl FnOnce(&mut PendingFeedback)) {
+        let mut deque = self.pending_feedback.lock().unwrap();
+        let Some(pos) = deque.iter().position(|(pending_id, _)| *pending_id == id) else {
+            return;
+        };
+        let pending = &mut deque[pos].1;
+        update(pending);
+        if pending.info.latency.queue_present.is_some() && pending.outcome.is_some() {
+            let (_, pending) = deque.remove(pos).unwrap();
+            if pending.outcome == Some(true) {
+                self.mon.render(pending.info);
+            } else {
+                self.mon.discard();
+            }
+        }
     }
 }
 
@@ -185,7 +231,7 @@ impl WindowHandler for App {
         if self.first_configure {
             self.first_configure = false;
             self.handle_resize();
-            let _ = self.render_tx.send(RenderMsg::Frame);
+            let _ = self.render_tx.send(RenderMsg::Configured);
         } else {
             self.sched_resize();
         }
@@ -218,6 +264,8 @@ impl CompositorHandler for App {
         _surface: &WlSurface,
         _time: u32,
     ) {
+        self.dc.frame_pending.store(false, Ordering::Relaxed);
+        self.dc.mon.callback();
         let _ = self.render_tx.send(RenderMsg::Frame);
     }
 
@@ -359,14 +407,18 @@ impl Dispatch2<WpFractionalScaleManagerV1, App> for AppData {
 impl Dispatch2<wp_presentation::WpPresentation, App> for AppData {
     fn event(
         &self,
-        _state: &mut App,
+        state: &mut App,
         _proxy: &wp_presentation::WpPresentation,
         event: wp_presentation::Event,
         _conn: &Connection,
         _qh: &QueueHandle<App>,
     ) {
         if let wp_presentation::Event::ClockId { clk_id } = event {
-            info!("clock_id: {clk_id}");
+            state.dc.presentation_clock.store(clk_id, Ordering::Relaxed);
+            info!("presentation clock_id: {clk_id}");
+            if clk_id != nix::libc::CLOCK_MONOTONIC as u32 {
+                warn!("presentation clock is not CLOCK_MONOTONIC; cross-clock latency unavailable");
+            }
         }
     }
 }
@@ -381,20 +433,31 @@ impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppDat
         _qh: &QueueHandle<App>,
     ) {
         match event {
-            wp_presentation_feedback::Event::Presented { .. } => {
-                let now = clock_monotonic_ns();
-                let mut deque = state.dc.pending_feedback.lock().unwrap();
-                if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
-                    let (_, mut info) = deque.remove(pos).unwrap();
-                    info.set_present(now);
-                    state.dc.mon.render(info);
-                }
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                flags,
+                ..
+            } => {
+                let received = clock_monotonic_ns();
+                let clock_matches = state.dc.presentation_clock.load(Ordering::Relaxed)
+                    == nix::libc::CLOCK_MONOTONIC as u32;
+                state.dc.update_feedback(feedback.id(), |pending| {
+                    pending.outcome = Some(true);
+                    pending.info.latency.feedback_mono_ns = Some(received);
+                    pending.info.latency.presentation_flags = Some(flags.into());
+                    if clock_matches {
+                        pending
+                            .info
+                            .set_present(compose_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec));
+                    }
+                });
             }
             wp_presentation_feedback::Event::Discarded => {
-                let mut deque = state.dc.pending_feedback.lock().unwrap();
-                if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
-                    deque.remove(pos);
-                }
+                state
+                    .dc
+                    .update_feedback(feedback.id(), |pending| pending.outcome = Some(false));
             }
             _ => {}
         }
@@ -440,6 +503,7 @@ pub fn run(
     }
 
     let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, AppData)?;
+    let (render_tx, render_rx) = mpsc::channel();
     let dc = DisplayCtx {
         mon: mon.clone(),
         global_state: global_state.clone(),
@@ -448,6 +512,8 @@ pub fn run(
         compositor_state,
         presentation,
         pending_feedback: Arc::new(Mutex::new(VecDeque::new())),
+        presentation_clock: Arc::new(AtomicU32::new(u32::MAX)),
+        frame_pending: Arc::new(AtomicBool::new(false)),
         qh: qh.clone(),
     };
     let backend_builder = create_backend_builder(&opts.capture_opts)?;
@@ -465,6 +531,7 @@ pub fn run(
     )?;
 
     let env = CaptureEnv {
+        render_tx: render_tx.clone(),
         mon,
         global_state,
         device: renderer.device.clone(),
@@ -482,7 +549,6 @@ pub fn run(
         config,
     )?;
 
-    let (render_tx, render_rx) = mpsc::channel();
     let render_thread =
         crate::render::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
 
@@ -560,6 +626,7 @@ pub fn run(
         event_loop.dispatch(None, &mut app)?;
         if app.res.is_some() {
             let res = app.res.take().unwrap();
+            let _ = app.render_tx.send(RenderMsg::Quit);
             drop(app);
             // vulkan swapchain borrows our connection
             let _ = render_thread.join();

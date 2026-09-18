@@ -19,10 +19,16 @@ use tracing::info;
 #[derive(Debug)]
 enum MonitorEvent {
     Log(String),
-    Render(FrameInfo),
+    Render(Box<FrameInfo>),
     Skip(Instant),
     Capture(Instant),
     CaptureMiss(Instant),
+    CaptureDrop(Instant),
+    Callback(Instant),
+    Idle(Instant, Duration),
+    Submit(Instant),
+    Discard(Instant),
+    FeedbackTimeout(Instant),
     Fatal(Result<()>),
 }
 
@@ -35,7 +41,7 @@ impl MonitorHandle {
     }
 
     pub fn render(&self, info: FrameInfo) {
-        let _ = self.0.try_send(MonitorEvent::Render(info));
+        let _ = self.0.try_send(MonitorEvent::Render(Box::new(info)));
     }
 
     pub fn skip(&self) {
@@ -48,6 +54,30 @@ impl MonitorHandle {
 
     pub fn capture_miss(&self) {
         let _ = self.0.try_send(MonitorEvent::CaptureMiss(Instant::now()));
+    }
+
+    pub fn capture_drop(&self) {
+        let _ = self.0.try_send(MonitorEvent::CaptureDrop(Instant::now()));
+    }
+
+    pub fn callback(&self) {
+        let _ = self.0.try_send(MonitorEvent::Callback(Instant::now()));
+    }
+    pub fn idle(&self, duration: Duration) {
+        let _ = self
+            .0
+            .try_send(MonitorEvent::Idle(Instant::now(), duration));
+    }
+    pub fn submit(&self) {
+        let _ = self.0.try_send(MonitorEvent::Submit(Instant::now()));
+    }
+    pub fn discard(&self) {
+        let _ = self.0.try_send(MonitorEvent::Discard(Instant::now()));
+    }
+    pub fn feedback_timeout(&self) {
+        let _ = self
+            .0
+            .try_send(MonitorEvent::FeedbackTimeout(Instant::now()));
     }
 
     /// Terminates the process with `res`. Every thread entry point wraps its result in this.
@@ -139,10 +169,16 @@ impl Monitor {
         loop {
             match self.rx.recv_timeout(PUBLISH_EVERY) {
                 Ok(MonitorEvent::Log(msg)) => print!("{msg}"),
-                Ok(MonitorEvent::Render(info)) => stats.render(info),
+                Ok(MonitorEvent::Render(info)) => stats.render(*info),
                 Ok(MonitorEvent::Skip(t)) => stats.skip(t),
                 Ok(MonitorEvent::Capture(t)) => stats.capture(t),
                 Ok(MonitorEvent::CaptureMiss(t)) => stats.capture_miss(t),
+                Ok(MonitorEvent::CaptureDrop(t)) => stats.capture_drop(t),
+                Ok(MonitorEvent::Callback(t)) => stats.callback(t),
+                Ok(MonitorEvent::Idle(t, d)) => stats.idle(t, d),
+                Ok(MonitorEvent::Submit(t)) => stats.submit(t),
+                Ok(MonitorEvent::Discard(t)) => stats.discard(t),
+                Ok(MonitorEvent::FeedbackTimeout(t)) => stats.feedback_timeout(t),
                 Ok(MonitorEvent::Fatal(res)) => return res,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -203,10 +239,16 @@ impl Monitor {
                         app.logs.extend(msg.split('\n').map(str::to_owned));
                         app.log_scroll = 0;
                     }
-                    MonitorEvent::Render(info) => app.stats.render(info),
+                    MonitorEvent::Render(info) => app.stats.render(*info),
                     MonitorEvent::Skip(t) => app.stats.skip(t),
                     MonitorEvent::Capture(t) => app.stats.capture(t),
                     MonitorEvent::CaptureMiss(t) => app.stats.capture_miss(t),
+                    MonitorEvent::CaptureDrop(t) => app.stats.capture_drop(t),
+                    MonitorEvent::Callback(t) => app.stats.callback(t),
+                    MonitorEvent::Idle(t, d) => app.stats.idle(t, d),
+                    MonitorEvent::Submit(t) => app.stats.submit(t),
+                    MonitorEvent::Discard(t) => app.stats.discard(t),
+                    MonitorEvent::FeedbackTimeout(t) => app.stats.feedback_timeout(t),
                     MonitorEvent::Fatal(res) => return res,
                 }
             }

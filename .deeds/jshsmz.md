@@ -1,5 +1,6 @@
 ---
 tier: objective
+blocked-by: [g6hzzz, z7jks9, 5jgf2q, nf466r, 8kxgv6]
 ---
 # Cursor latency investigation and optimization
 

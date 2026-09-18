@@ -333,6 +333,7 @@ fn run(
         global_state,
         device,
         allocator,
+        ..
     } = env;
     let use_screencopy = backend == BackendType::Screencopy;
     let conn = wayland_connect(display)?;

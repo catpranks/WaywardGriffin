@@ -39,6 +39,7 @@ pub enum DeviceId {
 }
 
 pub struct CaptureEnv {
+    pub render_tx: mpsc::Sender<crate::render::RenderMsg>,
     pub mon: MonitorHandle,
     pub global_state: GlobalState,
     pub device: Arc<Device>,
@@ -55,6 +56,9 @@ pub trait CaptureBackendBuilder: 'static {
 }
 
 pub trait CaptureBackend: Send + 'static {
+    fn frame_driven(&self) -> bool {
+        false
+    }
     fn capture(&mut self) -> Result<Option<CapturedFrame>>;
 }
 

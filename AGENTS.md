@@ -51,12 +51,13 @@ All abstract Unix sockets, one instance per machine for now (`waygriff-0`).
 | Main | `lib.rs:run()` | Loads config, spawns everything, then runs the monitor (TUI or headless log/stats printer). |
 | Control | `control.rs:spawn()` | Accepts control socket connections, one thread each. Display-bound requests carry an ack channel and reply after the display thread applied them. |
 | Display | `display/mod.rs:run()` | Wayland window, compositor events, input handling (`display/input.rs`), control requests, snapshot socket accept. Forwards frame callbacks to the render thread. |
-| Render | `render/mod.rs:render_loop()` | Capture polling, Vulkan render, present, screenshots. |
+| Render | `render/mod.rs:render_loop()` | NVFBC frame arrivals or Wayland capture polling, Vulkan render, present, screenshots. |
 | Overlay | `overlay/mod.rs` | Smithay-based Wayland server for the overlay surface. |
+| Capture (NVFBC) | `source/nvfbc/mod.rs` | Blocking grab and synchronous CUDA copy, publish the latest frame and wake render. |
 | Capture (Wayland backends only) | `source/wayland/mod.rs:run()` | screencopy/image-copy loop; frames land in a mutex slot. |
 | WaylandInputDispatch (Wayland backends only) | `bridge/wayland.rs` | Clipboard dispatch on the source compositor. |
 
-NVFBC has no capture thread: `CaptureBackend::capture()` runs synchronously on the render thread.
+NVFBC captures on its own thread into one replaceable pending slot. The renderer takes the newest frame on arrival; Wayland frame callbacks remain diagnostic and do not pace NVFBC. A 50 ms maintenance redraw handles static sources, overlays, and capture-off state. Capture uses a 50 ms grab timeout and its thread is joined on shutdown. Wayland capture backends retain callback-driven polling.
 
 Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, screenshot streams); control→display via calloop channel of `ControlReq`; shared flags in `ArcSwap<GlobalStateInner>` updated through `GlobalStateExt::update`; window/source geometry in `SharedSizer` (also `ArcSwap`). Stats flow render→monitor through `MonitorHandle` events; the monitor publishes a `stats::Snapshot` every 100 ms that the control thread serves.
 
@@ -65,7 +66,7 @@ Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, sc
 - `lib.rs` - CLI opts, `GlobalStateInner` + `GlobalStateExt`, thread spawn, tracing setup (log lines route through the monitor).
 - `control.rs` - control socket protocol.
 - `monitor.rs` - `Monitor` (main-thread consumer of render events), TUI (`ratatui`) and headless modes, `MonitorHandle` for producers.
-- `stats.rs` - `FrameInfo` timings, rate windows, `Snapshot` (serde, what `stats` returns).
+- `stats.rs` - `FrameInfo` timings, rate windows, `Snapshot` (serde, what `stats` returns). Timing boundaries and accounting: `docs/latency.md`.
 - `sizer.rs` - source/window/render coordinate transforms.
 - `config.rs` - `~/.config/waygriff/config.toml` key block/remap (see `docs/key-filtering.md`).
 - `display/mod.rs` - Wayland client boilerplate (sctk 0.21: `delegate_dispatch2!` plus `Dispatch2` impls on marker types), window, presentation feedback.
@@ -89,7 +90,7 @@ NVFBC:
 NVFBC → CUDA device mem → 2D memcpy → Vulkan image (opaque fd) → fragment shader → swapchain → Wayland
 ```
 
-Two frames in flight, Mailbox present mode. The NVFBC buffer is only valid until the next capture call, so the copy is synchronous.
+Two frames in flight, Mailbox present mode. The NVFBC buffer is only valid until the next capture call, so the capture thread completes the copy before grabbing again. Copied images return to its pool only after the renderer releases all GPU/frame references.
 
 Wayland backends:
 
@@ -106,12 +107,12 @@ Nix flake with crane. `nix develop` gives a shell whose `LD_LIBRARY_PATH` carrie
 - Hyprland 0.56 with a Lua config. `hyprctl keyword` and legacy dispatch strings are rejected; use `hyprctl eval '<lua>'`. Window rules at exec time: `hl.exec_cmd("cmd", { workspace = "name:F1 silent", fullscreen = true })`. Stubs for the API ship in the Hyprland package under `share/hypr/stubs/hl.meta.lua`.
 - `HYPRLAND_INSTANCE_SIGNATURE` may be unset in agent shells; `waygriffctl` finds the newest `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`.
 - The exec'd command goes through `sh -c`, so shell-quote before Lua-quoting.
-- Workspace `F1` lives on the 4K@120 monitor. Fullscreen there without focus does not guarantee direct scanout; see the cursor-latency issue in `.deeds/`.
+- Workspace `F1` lives on the 4K@120 monitor. With the current Nvidia WSI path, use `render:direct_scanout=2` (auto). Setting 1 repeatedly attempts scanout of buffers rejected by AMD KMS and triggers blocking modesets; see `.deeds/5jgf2q.md`. Waygriff does not set content type `game`, so auto keeps it composited.
 
 ## Gotchas
 
 - Capture and display are independent connections: the backend talks to the source (X11 or a Wayland compositor), the display thread talks to the destination compositor. Don't conflate them.
-- No cross-vendor DMA-BUF: an Nvidia buffer cannot be handed to the AMD iGPU. Everything crosses through host-visible memory or stays on one device.
+- Nvidia WSI exports linear system-memory DMA-BUFs that AMD can import for composition but rejects for scanout. This does not imply sharing Nvidia optimal-tiled VRAM images with AMD; see `.deeds/5jgf2q.md`.
 - `set_cursor` needs a pointer-enter serial; control-socket `set confine` before the pointer has entered must skip the cursor update.
 - A panic on any thread exits the process (hook in `lib.rs`); otherwise a dead render thread leaves a frozen window and a live control socket.
 - The control socket binds before the display thread exists. Use `ping` for readiness, not connect.

@@ -224,6 +224,7 @@ impl Dispatch2<ExtImageCopyCaptureFrameV1, State> for CaptureData {
                     start,
                     wait,
                     obtain,
+                    latency: Default::default(),
                     commit: None,
                     capture_mono_ns,
                     present: None,

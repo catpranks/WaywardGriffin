@@ -504,7 +504,10 @@ impl Renderer {
 
     pub fn render(&mut self, mut new: Option<CapturedFrame>, overlay: OverlayState) -> Result<()> {
         let has_new_frame = new.is_some();
-        let info = new.as_mut().and_then(|f| f.info.take());
+        let mut info = new.as_mut().and_then(|f| f.info.take());
+        if let Some(info) = info.as_mut() {
+            info.latency.render_queue = info.obtain.elapsed();
+        }
         let old_frame = new.and_then(|f| self.current_frame.replace(Arc::new(f)));
         let Some(current_frame) = self.current_frame.clone() else {
             return self.blank();
@@ -528,7 +531,11 @@ impl Renderer {
 
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
+        let fence_start = Instant::now();
         ifl.fence.wait(None)?;
+        if let Some(info) = info.as_mut() {
+            info.latency.fence_wait = fence_start.elapsed();
+        }
         ifl.frames.clear();
         if let Some(ref old) = old_frame {
             ifl.frames.push(old.clone());
@@ -552,6 +559,7 @@ impl Renderer {
         };
         ifl.overlay_acquire = overlay_acquire.clone();
 
+        let acquire_start = Instant::now();
         let AcquiredImage {
             image_index,
             is_suboptimal,
@@ -561,6 +569,9 @@ impl Renderer {
                 ..Default::default()
             })
         }?;
+        if let Some(info) = info.as_mut() {
+            info.latency.acquire = acquire_start.elapsed();
+        }
         unsafe { ifl.fence.reset() }?;
 
         let fb = self.images[image_index as usize].clone();
@@ -718,12 +729,12 @@ impl Renderer {
             .wait_dst_stage_mask(&wait_stages)
             .signal_semaphores(&present_semaphore);
 
-        if let Some(mut info) = info {
-            info.mark_commit();
-            self.dc.request_feedback(info);
-        }
-
         let present_suboptimal = self.queue.with(|mut guard| unsafe {
+            let feedback = info.map(|mut info| {
+                info.mark_commit();
+                self.dc.request_feedback(info)
+            });
+            let submit_start = Instant::now();
             (self.device.fns().v1_0.queue_submit)(
                 self.queue.handle(),
                 1,
@@ -732,7 +743,10 @@ impl Renderer {
             )
             .result()?;
 
-            guard
+            let submit_elapsed = submit_start.elapsed();
+            self.dc.mon.submit();
+            let present_start = Instant::now();
+            let result = guard
                 .present(&PresentInfo {
                     wait_semaphores: vec![SemaphorePresentInfo::new(ifl.present.clone())],
                     swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
@@ -743,7 +757,14 @@ impl Renderer {
                 })?
                 .next()
                 .unwrap()
-                .context("present")
+                .context("present");
+            let present_elapsed = present_start.elapsed();
+            let returned = crate::utils::clock_monotonic_ns();
+            if let Some(id) = feedback {
+                self.dc
+                    .finish_present(id, submit_elapsed, present_elapsed, returned);
+            }
+            result
         })?;
 
         if has_new_overlay && let Some(ref overlay) = self.current_overlay {
@@ -936,7 +957,11 @@ pub struct ScreenshotData {
 }
 
 pub enum RenderMsg {
+    Configured,
     Frame,
+    CaptureReady,
+    Redraw,
+    Quit,
     Screenshot(UnixStream),
 }
 
@@ -966,24 +991,63 @@ fn render_loop(
     overlay_handle: OverlayHandle,
     render_rx: mpsc::Receiver<RenderMsg>,
 ) -> Result<()> {
+    let frame_driven = backend.frame_driven();
+    let mut configured = false;
+    let mut last_draw = Instant::now();
+    let mut idle_start = Instant::now();
+    // Keep controls, resize and overlays responsive even when the source is static
+    // or capture is disabled. Fresh NVFBC frames bypass this maintenance cadence.
+    let maintenance = Duration::from_millis(50);
     loop {
-        let msg = match render_rx.recv() {
-            Ok(msg) => msg,
-            Err(mpsc::RecvError) => return Ok(()),
+        let msg = if frame_driven && configured {
+            match render_rx.recv_timeout(maintenance.saturating_sub(last_draw.elapsed())) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => RenderMsg::Redraw,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match render_rx.recv() {
+                Ok(msg) => msg,
+                Err(mpsc::RecvError) => return Ok(()),
+            }
         };
         match msg {
-            RenderMsg::Frame => {
-                dc.request_frame();
-                if !dc.global_state.load().capture {
-                    renderer.blank()?;
+            RenderMsg::Quit => return Ok(()),
+            RenderMsg::Frame if frame_driven => continue,
+            RenderMsg::CaptureReady | RenderMsg::Redraw if !configured => continue,
+            RenderMsg::Configured
+            | RenderMsg::Frame
+            | RenderMsg::CaptureReady
+            | RenderMsg::Redraw => {
+                configured = true;
+                let capturing = dc.global_state.load().capture;
+                // Drain a pending NVFBC image even while disabled so its slot can
+                // notify us again after capture resumes.
+                let capture = if capturing || frame_driven {
+                    backend.capture()?
+                } else {
+                    None
+                };
+                if frame_driven
+                    && capturing
+                    && capture.is_none()
+                    && matches!(msg, RenderMsg::CaptureReady)
+                {
                     continue;
                 }
-                let capture = backend.capture()?;
-                if capture.is_none() {
-                    dc.mon.skip();
+                dc.mon.idle(idle_start.elapsed());
+                dc.request_frame();
+                if !capturing {
+                    renderer.blank()?;
+                } else {
+                    if capture.is_none() && !frame_driven {
+                        dc.mon.skip();
+                    }
+                    let overlay = overlay_handle.take();
+                    renderer.render(capture, overlay)?;
                 }
-                let overlay = overlay_handle.take();
-                renderer.render(capture, overlay)?;
+                last_draw = Instant::now();
+                idle_start = last_draw;
             }
             RenderMsg::Screenshot(stream) => {
                 stream.set_write_timeout(Some(Duration::from_secs(5))).ok();

@@ -38,7 +38,7 @@ pub struct NvfbcFrameInfo {
     pub timestamp_us: u64,
     pub missed_frames: u32,
     required_post_processing: bool,
-    direct_capture: bool,
+    pub direct_capture: bool,
     pub cursor_visible: bool,
     cursor_composited: bool,
 }
@@ -130,7 +130,7 @@ impl NvCapture {
 
 // SAFETY: The NVFBC handle requires release_thread() before moving and
 // bind_thread() after. This is handled by the nvfbc Backend: build()
-// releases, first capture() binds. Only one thread uses it at a time.
+// releases, the capture thread binds before use and destroys it on that thread.
 unsafe impl Send for NvCapture {}
 
 impl Drop for NvCapture {
