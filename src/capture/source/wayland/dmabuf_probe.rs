@@ -5,7 +5,7 @@ use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::{delegate_dmabuf, delegate_registry, registry_handlers};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 
 // breaks rustfmt import sorting for some reason
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1;
@@ -80,4 +80,4 @@ impl DmabufHandler for State {
 }
 
 delegate_registry!(State);
-delegate_dmabuf!(State);
+delegate_dispatch2!(State);

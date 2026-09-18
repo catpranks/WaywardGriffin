@@ -1,16 +1,20 @@
+//! Main-thread event sink: collects log lines and frame timings from the other
+//! threads, publishes a stats snapshot, and either drives the TUI or prints logs.
+
 use crate::GlobalState;
-use crate::GlobalStateInner;
 use crate::sizer::SharedSizer;
+pub use crate::stats::FrameInfo;
+use crate::stats::{Snapshot, Stats};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::DefaultTerminal;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 #[derive(Debug)]
 enum PlotEvent {
@@ -46,299 +50,203 @@ impl PlotterHandle {
         let _ = self.0.try_send(PlotEvent::CaptureMiss(Instant::now()));
     }
 
+    /// Terminates the process with `res`. Every thread entry point wraps its result in this.
     pub fn fatal(&self, res: Result<()>) {
         let _ = self.0.send(PlotEvent::Fatal(res));
     }
 }
 
+pub enum Mode {
+    /// ratatui dashboard redrawn every `delay`.
+    Tui { delay: Duration },
+    /// Logs to stdout; optionally a stats line every `stats_every`.
+    Headless { stats_every: Option<Duration> },
+}
+
 pub struct Plotter {
     handle: PlotterHandle,
     rx: mpsc::Receiver<PlotEvent>,
-    global_state: Arc<ArcSwap<GlobalStateInner>>,
+    global_state: GlobalState,
     sizer: SharedSizer,
+    published: Arc<ArcSwap<Snapshot>>,
 }
 
+/// Frames of timing history per terminal column in the chart.
+const DENSITY_FACTOR: usize = 8;
+const HEADLESS_HISTORY: usize = 600;
+const PUBLISH_EVERY: Duration = Duration::from_millis(100);
+
 impl Plotter {
-    pub fn new(global_state: Arc<ArcSwap<GlobalStateInner>>, sizer: SharedSizer) -> Self {
+    pub fn new(global_state: GlobalState, sizer: SharedSizer) -> Self {
         let (tx, rx) = mpsc::sync_channel(1024);
         Self {
             handle: PlotterHandle(tx),
             rx,
             global_state,
             sizer,
+            published: Arc::new(ArcSwap::from_pointee(Snapshot::default())),
         }
-    }
-
-    pub fn run(self, delay: Option<Duration>) -> Result<()> {
-        let mut res = Ok(());
-        if let Some(delay) = delay {
-            let mut app = App::new(delay, self.global_state.clone(), self.sizer.clone());
-            let terminal = ratatui::init();
-            let app_result = app.run(&self.rx, terminal);
-            ratatui::restore();
-            res = app_result;
-        } else {
-            for event in &self.rx {
-                match event {
-                    PlotEvent::Log(msg) => {
-                        let msg = msg.trim_end_matches('\n');
-                        println!("{msg}");
-                    }
-                    PlotEvent::Render(_) => {}
-                    PlotEvent::Skip(_) => {}
-                    PlotEvent::Capture(_) => {}
-                    PlotEvent::CaptureMiss(_) => {}
-                    PlotEvent::Fatal(r) => {
-                        res = r;
-                        break;
-                    }
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        let mut printed = false;
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
-                PlotEvent::Render(_)
-                | PlotEvent::Skip(_)
-                | PlotEvent::Capture(_)
-                | PlotEvent::CaptureMiss(_) => continue,
-                PlotEvent::Fatal(Ok(())) => continue,
-                _ => {}
-            }
-            if !printed {
-                printed = true;
-                eprintln!("draining plotter queue on the floor:");
-            }
-            eprintln!("{event:#?}");
-        }
-        res
     }
 
     pub fn handle(&self) -> PlotterHandle {
         self.handle.clone()
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct FrameInfo {
-    pub start: Instant,
-    pub wait: Instant,
-    pub obtain: Instant,
-    pub commit: Option<Instant>,
-    pub capture_mono_ns: u64,
-    pub present: Option<Duration>,
-    pub cursor_visible: bool,
-}
-
-impl FrameInfo {
-    pub fn mark_commit(&mut self) {
-        self.commit = Some(Instant::now());
+    /// Latest stats snapshot, refreshed every 100ms while `run` is active.
+    pub fn snapshot(&self) -> Arc<ArcSwap<Snapshot>> {
+        self.published.clone()
     }
 
-    pub fn set_present(&mut self, presented_mono_ns: u64) {
-        self.present = Some(Duration::from_nanos(
-            presented_mono_ns.saturating_sub(self.capture_mono_ns),
-        ));
-    }
-
-    fn wait_ms(&self) -> f64 {
-        self.wait.duration_since(self.start).as_secs_f64() * 1000.0
-    }
-
-    fn obtain_ms(&self) -> f64 {
-        self.obtain.duration_since(self.wait).as_secs_f64() * 1000.0
-    }
-
-    fn commit_ms(&self) -> f64 {
-        self.commit
-            .map(|c| c.duration_since(self.obtain).as_secs_f64() * 1000.0)
-            .unwrap_or(0.0)
-    }
-
-    fn present_ms(&self) -> f64 {
-        self.present
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .unwrap_or(0.0)
-    }
-}
-
-const DENSITY_FACTOR: usize = 8;
-const SCROLL_FROM_START: bool = true;
-
-struct App {
-    logs: Vec<String>,
-    timings: VecDeque<FrameInfo>,
-    delay: Duration,
-    log_scroll: usize,
-    global_state: GlobalState,
-    sizer: SharedSizer,
-    renders: VecDeque<Instant>,
-    captures: VecDeque<Instant>,
-    capture_misses: VecDeque<Instant>,
-    skips: VecDeque<Instant>,
-}
-
-impl App {
-    fn new(delay: Duration, global_state: GlobalState, sizer: SharedSizer) -> Self {
-        Self {
-            logs: Vec::new(),
-            timings: VecDeque::new(),
-            delay,
-            log_scroll: 0,
-            global_state,
-            sizer,
-            renders: VecDeque::new(),
-            captures: VecDeque::new(),
-            capture_misses: VecDeque::new(),
-            skips: VecDeque::new(),
-        }
-    }
-
-    fn timings_avg(&self) -> (f64, f64, f64, f64) {
-        if self.timings.is_empty() {
-            return (0.0, 0.0, 0.0, 0.0);
-        }
-        let (wait, obtain, commit, present) =
-            self.timings
-                .iter()
-                .fold((0.0, 0.0, 0.0, 0.0), |(w, o, c, p), t| {
-                    (
-                        w + t.wait_ms(),
-                        o + t.obtain_ms(),
-                        c + t.commit_ms(),
-                        p + t.present_ms(),
-                    )
-                });
-        let len = self.timings.len() as f64;
-        (wait / len, obtain / len, commit / len, present / len)
-    }
-
-    fn timings_present_min_max(&self) -> (f64, f64) {
-        if self.timings.is_empty() {
-            return (0.0, 0.0);
-        }
-        self.timings
-            .iter()
-            .filter(|t| t.present.is_some())
-            .map(|t| t.present_ms())
-            .fold((f64::MAX, f64::MIN), |(min, max), v| {
-                (min.min(v), max.max(v))
-            })
-    }
-
-    fn rate(&self, events: &VecDeque<Instant>) -> f64 {
-        if events.len() < 2 {
-            return 0.0;
-        }
-        let duration = events
-            .back()
-            .unwrap()
-            .duration_since(*events.front().unwrap());
-        (events.len() - 1) as f64 / duration.as_secs_f64().max(1e-9)
-    }
-
-    fn run(&mut self, rx: &mpsc::Receiver<PlotEvent>, mut terminal: DefaultTerminal) -> Result<()> {
-        loop {
-            let history_size = terminal.size()?.width.saturating_sub(5) as usize * DENSITY_FACTOR;
-            while self.timings.len() > history_size {
-                self.timings.pop_front();
+    pub fn run(self, mode: Mode) -> Result<()> {
+        let res = match mode {
+            Mode::Tui { delay } => {
+                let terminal = ratatui::init();
+                let res = self.run_tui(delay, terminal);
+                ratatui::restore();
+                res
             }
-
-            let two_seconds_ago = Instant::now() - Duration::from_secs(2);
-            let trim_old = |q: &mut VecDeque<Instant>| {
-                while q.front().is_some_and(|t| *t < two_seconds_ago) {
-                    q.pop_front();
+            Mode::Headless { stats_every } => self.run_headless(stats_every),
+        };
+        // Give other threads a moment to report, then show anything they said.
+        std::thread::sleep(Duration::from_secs(1));
+        let mut printed = false;
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                PlotEvent::Log(msg) => {
+                    if !printed {
+                        printed = true;
+                        eprintln!("late log output:");
+                    }
+                    eprint!("{msg}");
                 }
-            };
-            trim_old(&mut self.renders);
-            trim_old(&mut self.captures);
-            trim_old(&mut self.capture_misses);
-            trim_old(&mut self.skips);
+                PlotEvent::Fatal(Err(e)) => eprintln!("late thread failure: {e:?}"),
+                _ => {}
+            }
+        }
+        res
+    }
 
-            terminal.draw(|f| self.ui(f, history_size))?;
+    fn publish(&self, stats: &mut Stats) {
+        stats.trim();
+        self.published
+            .store(Arc::new(stats.snapshot(&self.global_state, &self.sizer)));
+    }
 
-            if event::poll(self.delay)?
+    fn run_headless(&self, stats_every: Option<Duration>) -> Result<()> {
+        let mut stats = Stats::new(HEADLESS_HISTORY);
+        let mut last_publish = Instant::now();
+        let mut last_stats_log = Instant::now();
+        loop {
+            match self.rx.recv_timeout(PUBLISH_EVERY) {
+                Ok(PlotEvent::Log(msg)) => print!("{msg}"),
+                Ok(PlotEvent::Render(info)) => stats.render(info),
+                Ok(PlotEvent::Skip(t)) => stats.skip(t),
+                Ok(PlotEvent::Capture(t)) => stats.capture(t),
+                Ok(PlotEvent::CaptureMiss(t)) => stats.capture_miss(t),
+                Ok(PlotEvent::Fatal(res)) => return res,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            if last_publish.elapsed() >= PUBLISH_EVERY {
+                self.publish(&mut stats);
+                last_publish = Instant::now();
+            }
+            if let Some(every) = stats_every
+                && last_stats_log.elapsed() >= every
+            {
+                last_stats_log = Instant::now();
+                let snap = self.published.load();
+                info!(target: "stats", "{}", serde_json::to_string(&**snap)?);
+            }
+        }
+    }
+
+    fn run_tui(&self, delay: Duration, mut terminal: DefaultTerminal) -> Result<()> {
+        let mut app = TuiApp {
+            logs: Vec::new(),
+            log_scroll: 0,
+            stats: Stats::new(1),
+        };
+        loop {
+            app.stats.history = terminal.size()?.width.saturating_sub(5) as usize * DENSITY_FACTOR;
+            self.publish(&mut app.stats);
+            let snap = self.published.load();
+            terminal.draw(|f| app.ui(f, &snap))?;
+
+            if event::poll(delay)?
                 && let Event::Key(key) = event::read()?
             {
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::PageUp => {
-                        let terminal_width = terminal.size()?.width as usize;
-                        let wrapped_logs_len = self
+                        let size = terminal.size()?;
+                        let wrapped = app
                             .logs
                             .iter()
-                            .map(|m| m.len().div_ceil(terminal_width))
+                            .map(|m| m.len().div_ceil(size.width as usize))
                             .sum::<usize>();
-                        let terminal_height = terminal.size()?.height as usize;
-                        let log_height = terminal_height.saturating_sub(4);
-                        let max_scroll = wrapped_logs_len.saturating_sub(log_height);
-                        self.log_scroll = (self.log_scroll + 10).min(max_scroll);
+                        let log_height = (size.height as usize).saturating_sub(4);
+                        let max_scroll = wrapped.saturating_sub(log_height);
+                        app.log_scroll = (app.log_scroll + 10).min(max_scroll);
                     }
                     KeyCode::PageDown => {
-                        self.log_scroll = self.log_scroll.saturating_sub(10);
+                        app.log_scroll = app.log_scroll.saturating_sub(10);
                     }
                     _ => {}
                 }
             }
 
-            // Handle channel events
-            for event in rx.try_iter() {
+            for event in self.rx.try_iter() {
                 match event {
                     PlotEvent::Log(msg) => {
                         let msg = msg.trim_end_matches('\n');
-                        self.logs.extend(msg.split('\n').map(str::to_owned));
-                        self.log_scroll = 0;
+                        app.logs.extend(msg.split('\n').map(str::to_owned));
+                        app.log_scroll = 0;
                     }
-                    PlotEvent::Render(info) => {
-                        self.renders.push_back(info.start);
-                        self.timings.push_back(info);
-                    }
-                    PlotEvent::Skip(t) => {
-                        self.skips.push_back(t);
-                    }
-                    PlotEvent::Capture(t) => {
-                        self.captures.push_back(t);
-                    }
-                    PlotEvent::CaptureMiss(t) => {
-                        self.capture_misses.push_back(t);
-                    }
-                    PlotEvent::Fatal(res) => {
-                        return res;
-                    }
+                    PlotEvent::Render(info) => app.stats.render(info),
+                    PlotEvent::Skip(t) => app.stats.skip(t),
+                    PlotEvent::Capture(t) => app.stats.capture(t),
+                    PlotEvent::CaptureMiss(t) => app.stats.capture_miss(t),
+                    PlotEvent::Fatal(res) => return res,
                 }
             }
         }
     }
+}
 
-    fn ui(&mut self, f: &mut Frame, history_size: usize) {
+struct TuiApp {
+    logs: Vec<String>,
+    log_scroll: usize,
+    stats: Stats,
+}
+
+impl TuiApp {
+    fn ui(&self, f: &mut Frame, snap: &Snapshot) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints(
-                [
-                    Constraint::Percentage(50), // Chart
-                    Constraint::Length(1),      // Status
-                    Constraint::Min(7),         // Log
-                ]
-                .as_ref(),
-            )
+            .constraints([
+                Constraint::Percentage(50), // Chart
+                Constraint::Length(1),      // Status
+                Constraint::Min(7),         // Log
+            ])
             .split(f.area());
 
-        let lower_bound = if SCROLL_FROM_START {
-            -(history_size as f64 - 1.0)
-        } else {
-            -(self.timings.len() as f64 - 1.0)
-        };
-        let x_axis_bounds = [lower_bound, 0.0];
-
-        let present_data: Vec<_> = self
-            .timings
-            .iter()
+        let n = self.stats.timings_len();
+        let present_data: Vec<(f64, f64)> = self
+            .stats
+            .present_series()
             .enumerate()
-            .map(|(i, t)| (i as f64 - (self.timings.len() - 1) as f64, t.present_ms()))
+            .map(|(i, p)| (i as f64 - (n as f64 - 1.0), p))
             .collect();
-
+        let x_axis_bounds = [-(self.stats.history as f64 - 1.0), 0.0];
+        let max_timing = present_data.iter().map(|(_, p)| *p).fold(0.0, f64::max);
+        let y_axis_bounds = [0.0, (max_timing * 1.2).max(16.67)];
+        let y_labels: Vec<Line> = vec![
+            "0.0".into(),
+            format!("{:.1}", y_axis_bounds[1] / 2.0).into(),
+            format!("{:.1}", y_axis_bounds[1]).into(),
+        ];
         let datasets = vec![
             Dataset::default()
                 .name("Present")
@@ -346,28 +254,10 @@ impl App {
                 .style(Style::default().fg(Color::Yellow))
                 .data(&present_data),
         ];
-
-        let max_timing = self
-            .timings
-            .iter()
-            .map(|t| t.present_ms())
-            .fold(0.0, f64::max);
-        let y_axis_bounds = [0.0, (max_timing * 1.2).max(16.67)];
-
-        let y_labels: Vec<Line> = vec![
-            "0.0".into(),
-            format!("{:.1}", y_axis_bounds[1] / 2.0).into(),
-            format!("{:.1}", y_axis_bounds[1]).into(),
-        ];
-
-        let sizer = self.sizer.load();
-        let source_size = sizer.source_size;
-        let render_size = sizer.render_size;
         let chart_title = format!(
             "Present latency {}x{} -> {}x{}",
-            source_size.0, source_size.1, render_size.0, render_size.1
+            snap.source_size.0, snap.source_size.1, snap.render_size.0, snap.render_size.1
         );
-
         let chart = Chart::new(datasets)
             .block(Block::bordered().title(chart_title))
             .x_axis(
@@ -384,88 +274,66 @@ impl App {
             );
         f.render_widget(chart, chunks[0]);
 
-        let (avg_wait, avg_obtain, avg_commit, avg_present) = self.timings_avg();
-        let (min_present, max_present) = self.timings_present_min_max();
-        let render_fps = self.rate(&self.renders);
-
-        let capture_fps = self.rate(&self.captures);
-
-        let skip_rate = self.rate(&self.skips);
-        let miss_rate = self.rate(&self.capture_misses);
-
-        let state = self.global_state.load();
-        let cursor_visible = self.timings.back().is_some_and(|t| t.cursor_visible);
-        let mut state_tags = Vec::new();
-        if state.confine {
-            state_tags.push("G");
+        let mut tags = Vec::new();
+        if snap.confine {
+            tags.push("G");
         }
-        if state.capture {
-            state_tags.push("C");
+        if snap.capture {
+            tags.push("C");
         }
-        if state.force_relative {
-            state_tags.push("FR");
+        if snap.force_relative {
+            tags.push("FR");
         }
-        if cursor_visible {
-            state_tags.push("Cur");
+        if snap.cursor_visible {
+            tags.push("Cur");
         }
-        let state_display = format!("[{}]", state_tags.join(" "));
-
         let status_text = format!(
-            "R{:.1} C{:.1} | S:{:.1} M:{:.1} {} | W:{:.2} O:{:.2} C:{:.2} P:{:.2} ({:.2}-{:.2})",
-            render_fps,
-            capture_fps,
-            skip_rate,
-            miss_rate,
-            state_display,
-            avg_wait,
-            avg_obtain,
-            avg_commit,
-            avg_present,
-            min_present,
-            max_present
+            "R{:.1} C{:.1} | S:{:.1} M:{:.1} [{}] | W:{:.2} O:{:.2} C:{:.2} P:{:.2} ({:.2}-{:.2})",
+            snap.render_hz,
+            snap.capture_hz,
+            snap.skip_hz,
+            snap.miss_hz,
+            tags.join(" "),
+            snap.wait_ms,
+            snap.obtain_ms,
+            snap.commit_ms,
+            snap.present_ms,
+            snap.present_min_ms,
+            snap.present_max_ms,
         );
-        let status = Paragraph::new(status_text);
-        f.render_widget(status, chunks[1]);
+        f.render_widget(Paragraph::new(status_text), chunks[1]);
 
-        let log_block = Block::default();
-        let log_inner_area = log_block.inner(chunks[2]);
-        let log_height = log_inner_area.height as usize;
+        let log_area = chunks[2];
+        let width = log_area.width as usize;
+        let log_height = log_area.height as usize;
         let wrapped_logs: Vec<String> = self
             .logs
             .iter()
             .flat_map(|m| {
-                let width = log_inner_area.width as usize;
                 if m.len() <= width {
                     vec![m.clone()]
                 } else {
                     m.chars()
                         .collect::<Vec<_>>()
-                        .chunks(width)
+                        .chunks(width.max(1))
                         .map(|chunk| chunk.iter().collect::<String>())
                         .collect()
                 }
             })
             .collect();
-
-        let start_idx = if wrapped_logs.len() > log_height {
-            if self.log_scroll >= wrapped_logs.len() {
-                0
-            } else {
-                wrapped_logs
-                    .len()
-                    .saturating_sub(log_height + self.log_scroll)
-            }
+        let start_idx = if wrapped_logs.len() > log_height && self.log_scroll < wrapped_logs.len() {
+            wrapped_logs
+                .len()
+                .saturating_sub(log_height + self.log_scroll)
         } else {
             0
         };
-
         let log_lines: Vec<ListItem> = wrapped_logs
             .iter()
             .skip(start_idx)
             .take(log_height)
             .map(|m| ListItem::new(Line::from(m.as_str())))
             .collect();
-        let log = List::new(log_lines).block(log_block);
-        f.render_widget(log, chunks[2]);
+        f.render_widget(List::new(log_lines), log_area);
     }
 }

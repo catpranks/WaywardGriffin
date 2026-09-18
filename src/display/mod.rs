@@ -3,6 +3,7 @@ mod input;
 use crate::capture::source::{CaptureEnv, create_backend_builder};
 use crate::capture::{RenderMsg, Renderer};
 use crate::config::Config;
+use crate::control::ControlMsg;
 use crate::display::input::InputState;
 use crate::overlay::OverlayHandle;
 use crate::plotter::{FrameInfo, PlotterHandle};
@@ -10,9 +11,11 @@ use crate::sizer::SharedSizer;
 use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};
 use anyhow::{Result, anyhow, bail};
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
+use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop::channel;
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
@@ -22,10 +25,9 @@ use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::backend::ObjectId;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
-use smithay_client_toolkit::reexports::client::protocol::wl_callback;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
 };
@@ -44,10 +46,7 @@ use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::window::{
     Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
-use smithay_client_toolkit::{
-    delegate_compositor, delegate_dmabuf, delegate_output, delegate_registry, delegate_simple,
-    delegate_xdg_shell, delegate_xdg_window, registry_handlers,
-};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use std::collections::VecDeque;
 use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::net::{SocketAddr, UnixListener};
@@ -73,11 +72,12 @@ pub struct DisplayCtx {
 
 impl DisplayCtx {
     pub fn request_frame(&self) {
-        self.surface.frame(&self.qh, self.surface.clone());
+        self.surface
+            .frame(&self.qh, FrameCallbackData(self.surface.clone()));
     }
 
     pub fn request_feedback(&self, info: FrameInfo) {
-        let fb = self.presentation.feedback(&self.surface, &self.qh, ());
+        let fb = self.presentation.feedback(&self.surface, &self.qh, AppData);
         let mut deque = self.pending_feedback.lock().unwrap();
         while let Some((_, front)) = deque.front()
             && front.start.elapsed() > Duration::from_secs(1)
@@ -88,6 +88,8 @@ impl DisplayCtx {
         deque.push_back((fb.id(), info));
     }
 }
+
+struct AppData;
 
 pub struct App {
     loop_handle: LoopHandle<'static, App>,
@@ -115,6 +117,18 @@ pub struct App {
 }
 
 impl App {
+    fn handle_control(&mut self, msg: ControlMsg, conn: &Connection) {
+        info!("control: {msg:?}");
+        match msg {
+            ControlMsg::SetConfine(v) => self.input.set_confined(&self.dc, conn, v),
+            ControlMsg::SetForceRelative(v) => self.input.set_force_relative(&self.dc, v),
+            ControlMsg::SetCapture(v) => {
+                self.dc.global_state.rcu(|s| s.with_capture(v));
+            }
+            ControlMsg::Quit => self.res = Some(Ok(())),
+        }
+    }
+
     fn handle_resize(&mut self) {
         let sizer = self.sizer.load();
         if !sizer.ready() || (sizer.window_size == self.size && sizer.scale120 == self.scale120) {
@@ -282,14 +296,14 @@ impl ProvidesRegistryState for App {
     registry_handlers![OutputState, SeatState];
 }
 
-impl Dispatch<WpFractionalScaleV1, ()> for App {
+impl Dispatch2<WpFractionalScaleV1, App> for AppData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut App,
         _proxy: &WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<App>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             state.scale120 = scale;
@@ -304,38 +318,50 @@ impl AsMut<SimpleGlobal<WpViewporter, 1>> for App {
     }
 }
 
-impl Dispatch<WpViewport, ()> for App {
+impl Dispatch2<WpViewport, App> for AppData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut App,
         _proxy: &WpViewport,
         _event: wp_viewport::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<App>,
     ) {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for App {
+impl Dispatch2<WpViewporter, App> for AppData {
     fn event(
-        _state: &mut Self,
-        _proxy: &wl_callback::WlCallback,
-        _event: wl_callback::Event,
-        _data: &(),
+        &self,
+        _state: &mut App,
+        _proxy: &WpViewporter,
+        _event: <WpViewporter as smithay_client_toolkit::reexports::client::Proxy>::Event,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<App>,
     ) {
     }
 }
 
-impl Dispatch<wp_presentation::WpPresentation, ()> for App {
+impl Dispatch2<WpFractionalScaleManagerV1, App> for AppData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut App,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: <WpFractionalScaleManagerV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<App>,
+    ) {
+    }
+}
+
+impl Dispatch2<wp_presentation::WpPresentation, App> for AppData {
+    fn event(
+        &self,
+        _state: &mut App,
         _proxy: &wp_presentation::WpPresentation,
         event: wp_presentation::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<App>,
     ) {
         if let wp_presentation::Event::ClockId { clk_id } = event {
             info!("clock_id: {clk_id}");
@@ -343,14 +369,14 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for App {
     }
 }
 
-impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for App {
+impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut App,
         feedback: &wp_presentation_feedback::WpPresentationFeedback,
         event: wp_presentation_feedback::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<App>,
     ) {
         match event {
             wp_presentation_feedback::Event::Presented { .. } => {
@@ -373,14 +399,8 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for App {
     }
 }
 
-delegate_xdg_window!(App);
-delegate_xdg_shell!(App);
-delegate_compositor!(App);
-delegate_dmabuf!(App);
-delegate_output!(App);
 delegate_registry!(App);
-delegate_simple!(App, WpFractionalScaleManagerV1, 1);
-delegate_simple!(App, WpViewporter, 1);
+delegate_dispatch2!(App);
 
 pub fn run(
     opts: Opts,
@@ -388,6 +408,7 @@ pub fn run(
     ph: PlotterHandle,
     sizer: SharedSizer,
     config: Config,
+    control_rx: channel::Channel<ControlMsg>,
 ) -> Result<()> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
@@ -399,22 +420,24 @@ pub fn run(
     let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let surface = compositor_state.create_surface(&qh);
-    let wp_viewporter = SimpleGlobal::<WpViewporter, 1>::bind(&globals, &qh)?;
-    let viewport = wp_viewporter.get()?.get_viewport(&surface, &qh, ());
+    let wp_viewporter: SimpleGlobal<WpViewporter, 1> =
+        SimpleGlobal::from_bound(globals.bind(&qh, 1..=1, AppData)?);
+    let viewport = wp_viewporter.get()?.get_viewport(&surface, &qh, AppData);
 
     let window = xdg_shell.create_window(surface.clone(), WindowDecorations::RequestServer, &qh);
     window.set_title("WaywardGriffin");
     window.set_app_id("waygriff");
     window.commit();
 
-    let mut wp_frac_mgr = None;
+    let mut wp_frac_mgr: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>> = None;
     let mut wp_frac = None;
-    if let Ok(mgr) = SimpleGlobal::<WpFractionalScaleManagerV1, 1>::bind(&globals, &qh) {
-        wp_frac = Some(mgr.get()?.get_fractional_scale(&surface, &qh, ()));
+    if let Ok(proxy) = globals.bind(&qh, 1..=1, AppData) {
+        let mgr: SimpleGlobal<WpFractionalScaleManagerV1, 1> = SimpleGlobal::from_bound(proxy);
+        wp_frac = Some(mgr.get()?.get_fractional_scale(&surface, &qh, AppData));
         wp_frac_mgr = Some(mgr);
     }
 
-    let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, ())?;
+    let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, AppData)?;
     let dc = DisplayCtx {
         ph: ph.clone(),
         global_state: global_state.clone(),
@@ -498,6 +521,15 @@ pub fn run(
     if app.feedback.is_none() {
         bail!("Compositor did not provide dmabuf feedback");
     }
+
+    let control_conn = conn.clone();
+    loop_handle
+        .insert_source(control_rx, move |event, _, app| {
+            if let channel::Event::Msg(msg) = event {
+                app.handle_control(msg, &control_conn);
+            }
+        })
+        .map_err(|e| anyhow!("{}", e.error))?;
 
     WaylandSource::new(conn, event_queue)
         .insert(loop_handle.clone())

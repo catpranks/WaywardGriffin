@@ -151,10 +151,11 @@ impl ApplicationHandler for App {
                     )
                     .expect("failed to render");
 
-                let surface_texture = surface
-                    .surface
-                    .get_current_texture()
-                    .expect("failed to get surface texture");
+                let surface_texture = match surface.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(t)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                    other => panic!("failed to get surface texture: {other:?}"),
+                };
 
                 let mut encoder =
                     device_handle

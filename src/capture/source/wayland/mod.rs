@@ -28,9 +28,7 @@ use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::{
-    delegate_dmabuf, delegate_output, delegate_registry, registry_handlers,
-};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsFd as _;
 use std::sync::mpsc;
@@ -57,6 +55,8 @@ pub struct Builder {
     backend: BackendType,
     feedback: DmabufFeedback,
 }
+
+pub(super) struct CaptureData;
 
 impl Builder {
     pub fn new(display: &str, backend: BackendType) -> Result<Self> {
@@ -317,8 +317,7 @@ impl DmabufHandler for State {
 }
 
 delegate_registry!(State);
-delegate_output!(State);
-delegate_dmabuf!(State);
+delegate_dispatch2!(State);
 
 fn run(
     env: CaptureEnv,
@@ -347,7 +346,7 @@ fn run(
     let screencopy_manager: Option<ZwlrScreencopyManagerV1> = if use_screencopy {
         Some(
             globals
-                .bind(&qh, 3..=3, ())
+                .bind(&qh, 3..=3, CaptureData)
                 .context("zwlr_screencopy_manager_v1 v3 not available")?,
         )
     } else {
@@ -391,18 +390,19 @@ fn run(
     state.output = Some(output.clone());
 
     if !use_screencopy {
-        let capture_manager: ExtImageCopyCaptureManagerV1 = globals
-            .bind(&qh, 1..=1, ())
-            .context("ext_image_copy_capture_manager_v1 not available")?;
+        let capture_manager: ExtImageCopyCaptureManagerV1 =
+            globals
+                .bind(&qh, 1..=1, CaptureData)
+                .context("ext_image_copy_capture_manager_v1 not available")?;
         let source_manager: ExtOutputImageCaptureSourceManagerV1 = globals
-            .bind(&qh, 1..=1, ())
+            .bind(&qh, 1..=1, CaptureData)
             .context("ext_output_image_capture_source_manager_v1 not available")?;
-        let source = source_manager.create_source(&output, &qh, ());
+        let source = source_manager.create_source(&output, &qh, CaptureData);
         let session = capture_manager.create_session(
             &source,
             ext_image_copy_capture_manager_v1::Options::PaintCursors,
             &qh,
-            (),
+            CaptureData,
         );
         state.image_copy = Some(ImageCopyState::new(session, source));
     }

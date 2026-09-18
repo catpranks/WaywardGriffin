@@ -10,6 +10,7 @@ use copypasta::wayland_clipboard::{
     self, Clipboard as WaylandClipboard, Primary as WaylandPrimary,
 };
 use smithay_client_toolkit::compositor::Region;
+use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
@@ -17,7 +18,7 @@ use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlK
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1;
 use smithay_client_toolkit::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1;
 use smithay_client_toolkit::registry::SimpleGlobal;
@@ -35,11 +36,7 @@ use smithay_client_toolkit::seat::relative_pointer::{
 };
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
-use smithay_client_toolkit::{
-    delegate_keyboard, delegate_pointer, delegate_pointer_constraints, delegate_relative_pointer,
-    delegate_seat, delegate_shm, delegate_simple,
-};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{App, DisplayCtx};
 
@@ -83,8 +80,15 @@ pub struct InputState {
     config: Config,
 }
 
+struct InputData;
+
 impl InputState {
-    fn set_confined(&mut self, dc: &DisplayCtx, conn: &Connection, confined: bool) {
+    pub(super) fn set_force_relative(&mut self, dc: &DisplayCtx, v: bool) {
+        self.force_relative = v;
+        dc.global_state.rcu(|s| s.with_force_relative(v));
+    }
+
+    pub(super) fn set_confined(&mut self, dc: &DisplayCtx, conn: &Connection, confined: bool) {
         if self.confined == confined {
             return;
         }
@@ -125,7 +129,7 @@ impl InputState {
                     &dc.surface,
                     &seat,
                     &dc.qh,
-                    (),
+                    InputData,
                 ));
             }
         } else if let Some(inhibitor) = self.shortcuts_inhibitor.take() {
@@ -134,15 +138,17 @@ impl InputState {
     }
 
     fn update_cursor(&mut self, conn: &Connection) {
+        // set_cursor needs the serial from a pointer enter; without one it fails.
+        if !self.cursor_over_surface {
+            return;
+        }
         if let Some(pointer) = self.pointer.as_mut() {
-            if !self.confined || !self.cursor_over_surface {
-                pointer
-                    .set_cursor(conn, CursorIcon::Crosshair)
-                    .expect("Failed to set cursor");
-            } else {
+            if self.confined {
                 pointer
                     .pointer()
                     .set_cursor(self.pointer_serial, None, 0, 0);
+            } else if let Err(e) = pointer.set_cursor(conn, CursorIcon::Crosshair) {
+                warn!("set cursor: {e}");
             }
         }
     }
@@ -214,8 +220,10 @@ impl InputState {
         let seat_state = SeatState::new(globals, qh);
         let relative_pointer_state = RelativePointerState::bind(globals, qh);
         let pointer_constraints_state = PointerConstraintsState::bind(globals, qh);
-        let shortcuts_inhibit_manager = match SimpleGlobal::bind(globals, qh) {
-            Ok(v) => Some(v),
+        let shortcuts_inhibit_manager = match globals
+            .bind::<ZwpKeyboardShortcutsInhibitManagerV1, _, _>(qh, 0..=1, InputData)
+        {
+            Ok(proxy) => Some(SimpleGlobal::from_bound(proxy)),
             Err(_) => {
                 info!(
                     "zwp_keyboard_shortcuts_inhibit_manager_v1 not available, grab won't inhibit compositor shortcuts"
@@ -495,10 +503,8 @@ impl KeyboardHandler for App {
                     self.input.set_confined(&self.dc, conn, confined);
                 }
                 Keysym::r => {
-                    self.input.force_relative = !self.input.force_relative;
-                    self.dc
-                        .global_state
-                        .rcu(|s| s.with_force_relative(self.input.force_relative));
+                    let v = !self.input.force_relative;
+                    self.input.set_force_relative(&self.dc, v);
                 }
                 Keysym::c => {
                     self.dc.global_state.rcu(|s| s.with_capture(!s.capture));
@@ -557,7 +563,7 @@ impl SeatHandler for App {
             let themed_pointer = self
                 .input
                 .seat_state
-                .get_pointer_with_theme(
+                .get_pointer_with_theme::<_, ()>(
                     qh,
                     &seat,
                     self.input.shm_state.wl_shm(),
@@ -613,14 +619,14 @@ impl ShmHandler for App {
     }
 }
 
-impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
+impl Dispatch2<ZwpKeyboardShortcutsInhibitorV1, App> for InputData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut App,
         _proxy: &ZwpKeyboardShortcutsInhibitorV1,
-        event: <ZwpKeyboardShortcutsInhibitorV1 as Proxy>::Event,
-        _data: &(),
+        event: zwp_keyboard_shortcuts_inhibitor_v1::Event,
         conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
+        _qhandle: &QueueHandle<App>,
     ) {
         match event {
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {}
@@ -632,16 +638,14 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
     }
 }
 
-impl AsMut<SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1>> for App {
-    fn as_mut(&mut self) -> &mut SimpleGlobal<ZwpKeyboardShortcutsInhibitManagerV1, 1> {
-        self.input.shortcuts_inhibit_manager.as_mut().unwrap()
+impl Dispatch2<ZwpKeyboardShortcutsInhibitManagerV1, App> for InputData {
+    fn event(
+        &self,
+        _state: &mut App,
+        _proxy: &ZwpKeyboardShortcutsInhibitManagerV1,
+        _event: <ZwpKeyboardShortcutsInhibitManagerV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<App>,
+    ) {
     }
 }
-
-delegate_seat!(App);
-delegate_pointer!(App);
-delegate_relative_pointer!(App);
-delegate_keyboard!(App);
-delegate_pointer_constraints!(App);
-delegate_shm!(App);
-delegate_simple!(App, ZwpKeyboardShortcutsInhibitManagerV1, 1);

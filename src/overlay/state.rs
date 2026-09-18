@@ -307,7 +307,7 @@ impl CompositorHandler for State {
                             warn!("committed buffer without explicit sync points");
                             return;
                         };
-                        let frame_callbacks = current.frame_callbacks.drain(..).collect();
+                        let frame_callbacks = std::mem::take(&mut current.frame_callbacks);
                         let frame = OverlayFrame {
                             image,
                             acquire_point,

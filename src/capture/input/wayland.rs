@@ -3,15 +3,16 @@ use crate::plotter::PlotterHandle;
 use crate::sizer::SharedSizer;
 use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result, anyhow};
+use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::{self, WlKeyboard};
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::{self, WlSeat};
 use smithay_client_toolkit::reexports::client::{
-    Connection, Dispatch, QueueHandle, WEnum, event_created_child,
+    Connection, QueueHandle, WEnum, event_created_child,
 };
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::{delegate_registry, registry_handlers};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use std::collections::HashMap;
 use std::io::{PipeReader, Read as _, Write as _};
 use std::os::unix::fs::FileExt;
@@ -60,22 +61,22 @@ impl WaylandInput {
         let qh = event_queue.handle();
 
         let vk_mgr: ZwpVirtualKeyboardManagerV1 = globals
-            .bind(&qh, 1..=1, ())
+            .bind(&qh, 1..=1, StateData)
             .context("zwp_virtual_keyboard_manager_v1 not available")?;
         let vp_mgr: ZwlrVirtualPointerManagerV1 = globals
-            .bind(&qh, 1..=2, ())
+            .bind(&qh, 1..=2, StateData)
             .context("zwlr_virtual_pointer_manager_v1 not available")?;
         let seat: WlSeat = globals
-            .bind(&qh, 1..=1, ())
+            .bind(&qh, 1..=1, StateData)
             .context("wl_seat not available")?;
         let data_control_mgr: ExtDataControlManagerV1 = globals
-            .bind(&qh, 1..=1, ())
+            .bind(&qh, 1..=1, StateData)
             .context("ext_data_control_manager_v1 not available")?;
 
-        let vkbd = vk_mgr.create_virtual_keyboard(&seat, &qh, ());
-        let vptr = vp_mgr.create_virtual_pointer(Some(&seat), &qh, ());
-        let keyboard = seat.get_keyboard(&qh, ());
-        let data_device = data_control_mgr.get_data_device(&seat, &qh, ());
+        let vkbd = vk_mgr.create_virtual_keyboard(&seat, &qh, StateData);
+        let vptr = vp_mgr.create_virtual_pointer(Some(&seat), &qh, StateData);
+        let keyboard = seat.get_keyboard(&qh, StateData);
+        let data_device = data_control_mgr.get_data_device(&seat, &qh, StateData);
 
         let clipboard = Arc::new(Mutex::new(ClipboardShared {
             selection: None,
@@ -171,7 +172,9 @@ impl WaylandInput {
     }
 
     fn set_source(&self, contents: String, primary: bool) {
-        let source = self.data_control_mgr.create_data_source(&self.qh, ());
+        let source = self
+            .data_control_mgr
+            .create_data_source(&self.qh, StateData);
         source.offer(TEXT_MIME.to_string());
         let data: Arc<[u8]> = Arc::from(contents.into_bytes());
         {
@@ -314,6 +317,8 @@ struct State {
     res: Option<Result<()>>,
 }
 
+struct StateData;
+
 impl ProvidesRegistryState for State {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -322,27 +327,28 @@ impl ProvidesRegistryState for State {
 }
 
 delegate_registry!(State);
+delegate_dispatch2!(State);
 
-impl Dispatch<WlSeat, ()> for State {
+impl Dispatch2<WlSeat, State> for StateData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &WlSeat,
         _event: wl_seat::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<WlKeyboard, ()> for State {
+impl Dispatch2<WlKeyboard, State> for StateData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         _proxy: &WlKeyboard,
         event: wl_keyboard::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         if let wl_keyboard::Event::Keymap { format, fd, size } = event
             && let WEnum::Value(wl_keyboard::KeymapFormat::XkbV1) = format
@@ -365,76 +371,76 @@ impl Dispatch<WlKeyboard, ()> for State {
     }
 }
 
-impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for State {
+impl Dispatch2<ZwpVirtualKeyboardManagerV1, State> for StateData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ZwpVirtualKeyboardManagerV1,
         _event: <ZwpVirtualKeyboardManagerV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
+impl Dispatch2<ZwpVirtualKeyboardV1, State> for StateData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ZwpVirtualKeyboardV1,
         _event: <ZwpVirtualKeyboardV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ZwlrVirtualPointerManagerV1, ()> for State {
+impl Dispatch2<ZwlrVirtualPointerManagerV1, State> for StateData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ZwlrVirtualPointerManagerV1,
         _event: <ZwlrVirtualPointerManagerV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ZwlrVirtualPointerV1, ()> for State {
+impl Dispatch2<ZwlrVirtualPointerV1, State> for StateData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ZwlrVirtualPointerV1,
         _event: <ZwlrVirtualPointerV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
 // ext-data-control dispatch impls
 
-impl Dispatch<ExtDataControlManagerV1, ()> for State {
+impl Dispatch2<ExtDataControlManagerV1, State> for StateData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ExtDataControlManagerV1,
         _event: <ExtDataControlManagerV1 as smithay_client_toolkit::reexports::client::Proxy>::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ExtDataControlDeviceV1, ()> for State {
+impl Dispatch2<ExtDataControlDeviceV1, State> for StateData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         _proxy: &ExtDataControlDeviceV1,
         event: ext_data_control_device_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         match event {
             ext_data_control_device_v1::Event::DataOffer { id } => {
@@ -472,18 +478,18 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
     }
 
     event_created_child!(State, ExtDataControlDeviceV1, [
-        0 => (ExtDataControlOfferV1, ()),
+        0 => (ExtDataControlOfferV1, StateData),
     ]);
 }
 
-impl Dispatch<ExtDataControlOfferV1, ()> for State {
+impl Dispatch2<ExtDataControlOfferV1, State> for StateData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         proxy: &ExtDataControlOfferV1,
         event: ext_data_control_offer_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         if let ext_data_control_offer_v1::Event::Offer { mime_type } = event
             && let Some(mimes) = state.pending_offers.get_mut(proxy)
@@ -493,14 +499,14 @@ impl Dispatch<ExtDataControlOfferV1, ()> for State {
     }
 }
 
-impl Dispatch<ExtDataControlSourceV1, ()> for State {
+impl Dispatch2<ExtDataControlSourceV1, State> for StateData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         proxy: &ExtDataControlSourceV1,
         event: ext_data_control_source_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         match event {
             ext_data_control_source_v1::Event::Send { mime_type: _, fd } => {

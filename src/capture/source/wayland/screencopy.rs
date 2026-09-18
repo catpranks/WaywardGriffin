@@ -1,9 +1,10 @@
-use super::{Buffer, FrameState, State};
+use super::{Buffer, CaptureData, FrameState, State};
 use crate::plotter::FrameInfo;
 use crate::utils::{compose_timestamp, fourcc_to_vk_format};
 use anyhow::{Context as _, Result, bail};
 use drm_fourcc::DrmFourcc;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
+use smithay_client_toolkit::dispatch2::Dispatch2;
+use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use std::time::Instant;
 
 // breaks rustfmt import sorting
@@ -20,7 +21,7 @@ impl State {
             /* overlay_cursor */ 1,
             output,
             &self.qh,
-            (),
+            CaptureData,
         );
     }
 
@@ -72,26 +73,26 @@ impl State {
     }
 }
 
-impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
+impl Dispatch2<ZwlrScreencopyManagerV1, State> for CaptureData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ZwlrScreencopyManagerV1,
         _event: zwlr_screencopy_manager_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
+impl Dispatch2<ZwlrScreencopyFrameV1, State> for CaptureData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         frame: &ZwlrScreencopyFrameV1,
         event: zwlr_screencopy_frame_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         match event {
             zwlr_screencopy_frame_v1::Event::LinuxDmabuf {

@@ -1,9 +1,10 @@
-use super::{Buffer, FrameState, State};
+use super::{Buffer, CaptureData, FrameState, State};
 use crate::plotter::FrameInfo;
 use crate::utils::compose_timestamp;
 use anyhow::{Context as _, Result, anyhow};
 use drm_fourcc::DrmFourcc;
-use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle, WEnum};
+use smithay_client_toolkit::dispatch2::Dispatch2;
+use smithay_client_toolkit::reexports::client::{Connection, QueueHandle, WEnum};
 use std::time::Instant;
 use tracing::info;
 
@@ -106,7 +107,7 @@ impl State {
         let wait = Instant::now();
 
         let ic = self.image_copy.as_ref().unwrap();
-        let frame = ic.session.create_frame(&self.qh, ());
+        let frame = ic.session.create_frame(&self.qh, CaptureData);
         frame.attach_buffer(&buf.wl_buffer);
         frame.damage_buffer(0, 0, width as i32, height as i32);
         frame.capture();
@@ -116,26 +117,26 @@ impl State {
     }
 }
 
-impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for State {
+impl Dispatch2<ExtImageCopyCaptureManagerV1, State> for CaptureData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ExtImageCopyCaptureManagerV1,
         _event: ext_image_copy_capture_manager_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
+impl Dispatch2<ExtImageCopyCaptureSessionV1, State> for CaptureData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         _proxy: &ExtImageCopyCaptureSessionV1,
         event: ext_image_copy_capture_session_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         let Some(ic) = &mut state.image_copy else {
             return;
@@ -151,8 +152,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
             }
             ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
                 let parsed_modifiers = modifiers
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect();
                 info!(
                     "{format:x} {:?} {parsed_modifiers:x?}",
@@ -186,14 +189,14 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
     }
 }
 
-impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
+impl Dispatch2<ExtImageCopyCaptureFrameV1, State> for CaptureData {
     fn event(
-        state: &mut Self,
+        &self,
+        state: &mut State,
         frame: &ExtImageCopyCaptureFrameV1,
         event: ext_image_copy_capture_frame_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
         match event {
             ext_image_copy_capture_frame_v1::Event::PresentationTime {
@@ -251,26 +254,26 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
     }
 }
 
-impl Dispatch<ExtImageCaptureSourceV1, ()> for State {
+impl Dispatch2<ExtImageCaptureSourceV1, State> for CaptureData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ExtImageCaptureSourceV1,
         _event: ext_image_capture_source_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
 
-impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for State {
+impl Dispatch2<ExtOutputImageCaptureSourceManagerV1, State> for CaptureData {
     fn event(
-        _state: &mut Self,
+        &self,
+        _state: &mut State,
         _proxy: &ExtOutputImageCaptureSourceManagerV1,
         _event: ext_output_image_capture_source_manager_v1::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<State>,
     ) {
     }
 }
