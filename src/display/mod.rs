@@ -2,7 +2,7 @@ mod input;
 
 use crate::GlobalStateExt as _;
 use crate::config::Config;
-use crate::control::ControlMsg;
+use crate::control::{ControlMsg, ControlReq};
 use crate::display::input::InputState;
 use crate::monitor::{FrameInfo, MonitorHandle};
 use crate::overlay::OverlayHandle;
@@ -126,6 +126,7 @@ impl App {
             ControlMsg::SetCapture(v) => {
                 self.dc.global_state.update(|s| s.capture = v);
             }
+            ControlMsg::Ping => {}
             ControlMsg::Quit => self.res = Some(Ok(())),
         }
     }
@@ -409,7 +410,7 @@ pub fn run(
     mon: MonitorHandle,
     sizer: SharedSizer,
     config: Config,
-    control_rx: channel::Channel<ControlMsg>,
+    control_rx: channel::Channel<ControlReq>,
 ) -> Result<()> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
@@ -526,8 +527,9 @@ pub fn run(
     let control_conn = conn.clone();
     loop_handle
         .insert_source(control_rx, move |event, _, app| {
-            if let channel::Event::Msg(msg) = event {
-                app.handle_control(msg, &control_conn);
+            if let channel::Event::Msg(req) = event {
+                app.handle_control(req.msg, &control_conn);
+                let _ = req.done.send(());
             }
         })
         .map_err(|e| anyhow!("{}", e.error))?;

@@ -1,8 +1,9 @@
 //! Control socket: a line-oriented request/response protocol on an abstract
 //! Unix socket so scripts and agents can read stats and flip state without the TUI.
 //!
-//! Request: one line, e.g. `stats`, `state`, `set confine on`, `quit`, `help`.
-//! Response: one JSON line, always with an `ok` field.
+//! Request: one line, e.g. `stats`, `state`, `set confine on`, `ping`, `quit`, `help`.
+//! Response: one JSON line, always with an `ok` field. Commands routed to the
+//! display thread reply only after it has applied them.
 
 use crate::GlobalState;
 use crate::stats::Snapshot;
@@ -13,7 +14,8 @@ use smithay_client_toolkit::reexports::calloop::channel::Sender;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use tracing::{info, warn};
 
 pub const SOCKET_NAME: &str = "waygriff-0.ctl";
@@ -24,8 +26,18 @@ pub enum ControlMsg {
     SetConfine(bool),
     SetForceRelative(bool),
     SetCapture(bool),
+    /// No-op; a reply proves the display thread is up and draining its queue.
+    Ping,
     Quit,
 }
+
+/// A message plus the channel the display thread signals once it has handled it.
+pub struct ControlReq {
+    pub msg: ControlMsg,
+    pub done: mpsc::Sender<()>,
+}
+
+const APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Everything a connection handler needs; cheap to clone per connection.
 #[derive(Clone)]
@@ -34,13 +46,13 @@ struct Ctx {
     snapshot: Arc<ArcSwap<Snapshot>>,
     /// Read live so `state` reflects a `set` immediately.
     global_state: GlobalState,
-    tx: Sender<ControlMsg>,
+    tx: Sender<ControlReq>,
 }
 
 pub fn spawn(
     snapshot: Arc<ArcSwap<Snapshot>>,
     global_state: GlobalState,
-    tx: Sender<ControlMsg>,
+    tx: Sender<ControlReq>,
 ) -> Result<()> {
     let addr = SocketAddr::from_abstract_name(SOCKET_NAME)?;
     let listener = UnixListener::bind_addr(&addr).context("bind control socket")?;
@@ -87,9 +99,20 @@ fn serve(stream: UnixStream, ctx: Ctx) {
 
 fn handle(line: &str, ctx: &Ctx) -> serde_json::Value {
     let words: Vec<&str> = line.split_whitespace().collect();
-    let send = |msg: ControlMsg| match ctx.tx.send(msg) {
-        Ok(()) => json!({"ok": true}),
-        Err(_) => json!({"ok": false, "error": "display thread gone"}),
+    let send = |msg: ControlMsg| {
+        let (done, applied) = mpsc::channel();
+        if ctx.tx.send(ControlReq { msg, done }).is_err() {
+            return json!({"ok": false, "error": "display thread gone"});
+        }
+        match applied.recv_timeout(APPLY_TIMEOUT) {
+            Ok(()) => json!({"ok": true}),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                json!({"ok": false, "error": "display thread did not apply it in time"})
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                json!({"ok": false, "error": "display thread dropped the request"})
+            }
+        }
     };
     match words.as_slice() {
         ["stats"] => {
@@ -118,10 +141,11 @@ fn handle(line: &str, ctx: &Ctx) -> serde_json::Value {
                 other => json!({"ok": false, "error": format!("unknown flag: {other}")}),
             }
         }
+        ["ping"] => send(ControlMsg::Ping),
         ["quit"] => send(ControlMsg::Quit),
         ["help"] | [] => json!({
             "ok": true,
-            "commands": ["stats", "state", "set confine|capture|relative on|off", "quit", "help"],
+            "commands": ["stats", "state", "set confine|capture|relative on|off", "ping", "quit", "help"],
         }),
         _ => json!({"ok": false, "error": format!("unknown command: {line}")}),
     }

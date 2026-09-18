@@ -13,7 +13,13 @@ use std::time::{Duration, Instant};
 
 const CTL_SOCKET: &str = "waygriff-0.ctl";
 const SNAP_SOCKET: &str = "waygriff-0.snap";
-const PROJECT_DIR: &str = env!("CARGO_MANIFEST_DIR");
+/// Where `target/`, `temp/` and relative output paths live. `WAYGRIFF_DIR`
+/// overrides the build-time checkout path (needed when the binary is built by Nix).
+fn project_dir() -> PathBuf {
+    std::env::var_os("WAYGRIFF_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
 
 #[derive(Parser)]
 #[command(version, about = "Control a running waygriff, or launch one")]
@@ -138,7 +144,7 @@ fn main() -> Result<()> {
 }
 
 fn temp_dir() -> PathBuf {
-    Path::new(PROJECT_DIR).join("temp")
+    project_dir().join("temp")
 }
 
 fn log_path() -> PathBuf {
@@ -155,13 +161,24 @@ fn ctl_connect() -> Result<UnixStream> {
         .with_context(|| format!("connect @{CTL_SOCKET}; is waygriff running?"))
 }
 
+/// One request, one JSON reply. Errors unless the reply says `ok: true`, so
+/// shell `&&` chains stop on rejected commands.
 fn ctl(line: &str) -> Result<String> {
     let mut stream = ctl_connect()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     writeln!(stream, "{line}")?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
-    Ok(reply.trim_end().to_owned())
+    let reply = reply.trim_end().to_owned();
+    if reply.is_empty() {
+        bail!("waygriff closed the control connection without replying to `{line}`");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&reply)
+        .with_context(|| format!("unparseable reply to `{line}`: {reply}"))?;
+    if parsed["ok"] != serde_json::Value::Bool(true) {
+        bail!("`{line}` rejected: {reply}");
+    }
+    Ok(reply)
 }
 
 fn read_pid() -> Option<u32> {
@@ -172,8 +189,28 @@ fn read_pid() -> Option<u32> {
         .ok()
 }
 
-fn pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+/// The PID file can outlive the process and the kernel reuses PIDs, so check
+/// that whatever holds it now is actually a waygriff binary.
+fn pid_is_waygriff(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+    Path::new(std::str::from_utf8(argv0).unwrap_or_default())
+        .file_name()
+        .is_some_and(|n| n == "waygriff")
+}
+
+/// Wait for the control socket to stop accepting connections.
+fn wait_ctl_gone(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while ctl_connect().is_ok() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
 fn hyprland_signature() -> Result<String> {
@@ -231,7 +268,7 @@ fn start(
     }
     if build {
         let status = Command::new("cargo")
-            .current_dir(PROJECT_DIR)
+            .current_dir(project_dir())
             .args(["build", "--release", "--bin", "waygriff"])
             .status()
             .context("run cargo")?;
@@ -240,7 +277,7 @@ fn start(
         }
     }
     std::fs::create_dir_all(temp_dir())?;
-    let bin = Path::new(PROJECT_DIR).join("target/release/waygriff");
+    let bin = project_dir().join("target/release/waygriff");
     if !bin.exists() {
         bail!("{} missing; build first", bin.display());
     }
@@ -263,7 +300,7 @@ fn start(
          exec {bin} {args} >> {log} 2>&1\n",
         pid = shell_quote(&pid_path().to_string_lossy()),
         ld = shell_quote(&ld),
-        project = shell_quote(PROJECT_DIR),
+        project = shell_quote(&project_dir().to_string_lossy()),
         bin = shell_quote(&bin.to_string_lossy()),
         args = quoted_args.join(" "),
         log = shell_quote(&log_path().to_string_lossy()),
@@ -288,9 +325,10 @@ fn start(
     if fullscreen {
         rules.push("fullscreen = true".into());
     }
+    // Hyprland hands the command to `sh -c`, so it needs shell quoting under the Lua quoting.
     let lua = format!(
         "hl.exec_cmd({}, {{ {} }})",
-        lua_string(&wrapper_path.to_string_lossy()),
+        lua_string(&shell_quote(&wrapper_path.to_string_lossy())),
         rules.join(", ")
     );
     let reply = hyprctl(&["eval", &lua])?;
@@ -298,13 +336,15 @@ fn start(
         bail!("hyprctl eval: {reply}");
     }
 
+    // The control socket binds before the display thread exists; `ping` only
+    // answers once the window is up and draining control requests.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if ctl_connect().is_ok() {
+        if ctl("ping").is_ok() {
             break;
         }
         if let Some(pid) = read_pid()
-            && !pid_alive(pid)
+            && !pid_is_waygriff(pid)
         {
             eprintln!("waygriff exited during startup; log tail:");
             print_log_tail(20);
@@ -312,7 +352,7 @@ fn start(
         }
         if Instant::now() > deadline {
             print_log_tail(20);
-            bail!("control socket did not come up within 20s");
+            bail!("display thread did not answer within 20s");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -340,30 +380,41 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn stop() -> Result<()> {
-    let pid = read_pid();
-    match ctl("quit") {
-        Ok(reply) => println!("{reply}"),
-        Err(e) => eprintln!("{e:#}"),
-    }
-    let Some(pid) = pid else {
-        return Ok(());
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while pid_alive(pid) {
-        if Instant::now() > deadline {
-            eprintln!("pid {pid} still alive, sending SIGTERM");
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-            break;
+    let pid = read_pid().filter(|&pid| pid_is_waygriff(pid));
+    let asked = match ctl("quit") {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("{e:#}");
+            false
         }
-        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Exit takes a moment after `quit` (log drain, thread joins); a following
+    // `start` must not see the old socket.
+    let gone = asked && wait_ctl_gone(Duration::from_secs(5));
+    if let Some(pid) = pid {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_is_waygriff(pid) {
+            if Instant::now() > deadline {
+                eprintln!("pid {pid} still alive, sending SIGTERM");
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+                if !wait_ctl_gone(Duration::from_secs(5)) {
+                    bail!("pid {pid} ignored SIGTERM");
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else if !gone {
+        bail!("no PID on file and the control socket is still answering");
     }
+    let _ = std::fs::remove_file(pid_path());
     println!("stopped");
     Ok(())
 }
 
 fn status() -> Result<()> {
     let pid = read_pid();
-    let alive = pid.is_some_and(pid_alive);
+    let alive = pid.is_some_and(pid_is_waygriff);
     match ctl("state") {
         Ok(reply) => println!("running pid={} {reply}", pid.unwrap_or(0)),
         Err(_) if alive => println!(
@@ -403,7 +454,7 @@ fn snap(out: &Path, show: bool) -> Result<()> {
     let out = if out.is_absolute() {
         out.to_path_buf()
     } else {
-        Path::new(PROJECT_DIR).join(out)
+        project_dir().join(out)
     };
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
