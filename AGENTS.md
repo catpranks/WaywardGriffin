@@ -1,3 +1,7 @@
+<!-- deeds:begin -->
+If present, use the `deeds` tool and skill for task tracking.
+<!-- deeds:end -->
+
 # WaywardGriffin
 
 Local display proxy: captures frames from a source display (X11 via NVFBC, or Wayland via screencopy/imagecopy), presents to a Wayland window, forwards input back to the source.
