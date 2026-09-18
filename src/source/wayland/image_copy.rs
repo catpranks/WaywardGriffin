@@ -1,5 +1,5 @@
 use super::{Buffer, CaptureData, FrameState, State};
-use crate::plotter::FrameInfo;
+use crate::monitor::FrameInfo;
 use crate::utils::compose_timestamp;
 use anyhow::{Context as _, Result, anyhow};
 use drm_fourcc::DrmFourcc;

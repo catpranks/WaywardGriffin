@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 #[derive(Debug)]
-enum PlotEvent {
+enum MonitorEvent {
     Log(String),
     Render(FrameInfo),
     Skip(Instant),
@@ -27,32 +27,32 @@ enum PlotEvent {
 }
 
 #[derive(Clone)]
-pub struct PlotterHandle(mpsc::SyncSender<PlotEvent>);
+pub struct MonitorHandle(mpsc::SyncSender<MonitorEvent>);
 
-impl PlotterHandle {
+impl MonitorHandle {
     pub fn log(&self, msg: impl Into<String>) {
-        let _ = self.0.try_send(PlotEvent::Log(msg.into()));
+        let _ = self.0.try_send(MonitorEvent::Log(msg.into()));
     }
 
     pub fn render(&self, info: FrameInfo) {
-        let _ = self.0.try_send(PlotEvent::Render(info));
+        let _ = self.0.try_send(MonitorEvent::Render(info));
     }
 
     pub fn skip(&self) {
-        let _ = self.0.try_send(PlotEvent::Skip(Instant::now()));
+        let _ = self.0.try_send(MonitorEvent::Skip(Instant::now()));
     }
 
     pub fn capture(&self) {
-        let _ = self.0.try_send(PlotEvent::Capture(Instant::now()));
+        let _ = self.0.try_send(MonitorEvent::Capture(Instant::now()));
     }
 
     pub fn capture_miss(&self) {
-        let _ = self.0.try_send(PlotEvent::CaptureMiss(Instant::now()));
+        let _ = self.0.try_send(MonitorEvent::CaptureMiss(Instant::now()));
     }
 
     /// Terminates the process with `res`. Every thread entry point wraps its result in this.
     pub fn fatal(&self, res: Result<()>) {
-        let _ = self.0.send(PlotEvent::Fatal(res));
+        let _ = self.0.send(MonitorEvent::Fatal(res));
     }
 }
 
@@ -63,9 +63,9 @@ pub enum Mode {
     Headless { stats_every: Option<Duration> },
 }
 
-pub struct Plotter {
-    handle: PlotterHandle,
-    rx: mpsc::Receiver<PlotEvent>,
+pub struct Monitor {
+    handle: MonitorHandle,
+    rx: mpsc::Receiver<MonitorEvent>,
     global_state: GlobalState,
     sizer: SharedSizer,
     published: Arc<ArcSwap<Snapshot>>,
@@ -76,11 +76,11 @@ const DENSITY_FACTOR: usize = 8;
 const HEADLESS_HISTORY: usize = 600;
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 
-impl Plotter {
+impl Monitor {
     pub fn new(global_state: GlobalState, sizer: SharedSizer) -> Self {
         let (tx, rx) = mpsc::sync_channel(1024);
         Self {
-            handle: PlotterHandle(tx),
+            handle: MonitorHandle(tx),
             rx,
             global_state,
             sizer,
@@ -88,7 +88,7 @@ impl Plotter {
         }
     }
 
-    pub fn handle(&self) -> PlotterHandle {
+    pub fn handle(&self) -> MonitorHandle {
         self.handle.clone()
     }
 
@@ -112,14 +112,14 @@ impl Plotter {
         let mut printed = false;
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                PlotEvent::Log(msg) => {
+                MonitorEvent::Log(msg) => {
                     if !printed {
                         printed = true;
                         eprintln!("late log output:");
                     }
                     eprint!("{msg}");
                 }
-                PlotEvent::Fatal(Err(e)) => eprintln!("late thread failure: {e:?}"),
+                MonitorEvent::Fatal(Err(e)) => eprintln!("late thread failure: {e:?}"),
                 _ => {}
             }
         }
@@ -138,12 +138,12 @@ impl Plotter {
         let mut last_stats_log = Instant::now();
         loop {
             match self.rx.recv_timeout(PUBLISH_EVERY) {
-                Ok(PlotEvent::Log(msg)) => print!("{msg}"),
-                Ok(PlotEvent::Render(info)) => stats.render(info),
-                Ok(PlotEvent::Skip(t)) => stats.skip(t),
-                Ok(PlotEvent::Capture(t)) => stats.capture(t),
-                Ok(PlotEvent::CaptureMiss(t)) => stats.capture_miss(t),
-                Ok(PlotEvent::Fatal(res)) => return res,
+                Ok(MonitorEvent::Log(msg)) => print!("{msg}"),
+                Ok(MonitorEvent::Render(info)) => stats.render(info),
+                Ok(MonitorEvent::Skip(t)) => stats.skip(t),
+                Ok(MonitorEvent::Capture(t)) => stats.capture(t),
+                Ok(MonitorEvent::CaptureMiss(t)) => stats.capture_miss(t),
+                Ok(MonitorEvent::Fatal(res)) => return res,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -198,16 +198,16 @@ impl Plotter {
 
             for event in self.rx.try_iter() {
                 match event {
-                    PlotEvent::Log(msg) => {
+                    MonitorEvent::Log(msg) => {
                         let msg = msg.trim_end_matches('\n');
                         app.logs.extend(msg.split('\n').map(str::to_owned));
                         app.log_scroll = 0;
                     }
-                    PlotEvent::Render(info) => app.stats.render(info),
-                    PlotEvent::Skip(t) => app.stats.skip(t),
-                    PlotEvent::Capture(t) => app.stats.capture(t),
-                    PlotEvent::CaptureMiss(t) => app.stats.capture_miss(t),
-                    PlotEvent::Fatal(res) => return res,
+                    MonitorEvent::Render(info) => app.stats.render(info),
+                    MonitorEvent::Skip(t) => app.stats.skip(t),
+                    MonitorEvent::Capture(t) => app.stats.capture(t),
+                    MonitorEvent::CaptureMiss(t) => app.stats.capture_miss(t),
+                    MonitorEvent::Fatal(res) => return res,
                 }
             }
         }

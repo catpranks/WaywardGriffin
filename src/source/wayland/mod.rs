@@ -6,11 +6,12 @@ use super::{
     BackendType, CaptureBackendBuilder, CaptureEnv, CapturedFrame, DeviceId, ReclaimedBuffer,
 };
 use crate::GlobalState;
-use crate::capture::input::InputBridge;
-use crate::capture::input::wayland::WaylandInput;
-use crate::capture::source::CaptureBackend;
-use crate::plotter::{FrameInfo, PlotterHandle};
+use crate::GlobalStateExt as _;
+use crate::bridge::InputBridge;
+use crate::bridge::wayland::WaylandInput;
+use crate::monitor::{FrameInfo, MonitorHandle};
 use crate::sizer::SharedSizer;
+use crate::source::CaptureBackend;
 use crate::utils::wayland_connect;
 use crate::utils::{OwningWlBuffer, create_drm_modifier_image, fourcc_to_vk_format};
 use anyhow::anyhow;
@@ -101,7 +102,7 @@ impl CaptureBackendBuilder for Builder {
         env: CaptureEnv,
         sizer: SharedSizer,
     ) -> Result<(Box<dyn CaptureBackend>, Box<dyn InputBridge>)> {
-        let bridge = Box::new(WaylandInput::new(&self.display, sizer, env.ph.clone())?);
+        let bridge = Box::new(WaylandInput::new(&self.display, sizer, env.mon.clone())?);
         let slot: Arc<Mutex<VecDeque<CapturedFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
         let (ping_tx, ping_rx) = calloop_channel::channel();
         let dmabuf_modifiers = feedback_format_modifiers(&self.feedback);
@@ -111,8 +112,8 @@ impl CaptureBackendBuilder for Builder {
             .spawn({
                 let slot = slot.clone();
                 move || {
-                    let ph = env.ph.clone();
-                    ph.fatal(
+                    let mon = env.mon.clone();
+                    mon.fatal(
                         run(
                             env,
                             &self.display,
@@ -144,7 +145,7 @@ impl CaptureBackend for Backend {
 }
 
 struct State {
-    ph: PlotterHandle,
+    mon: MonitorHandle,
     global_state: GlobalState,
     device: Arc<Device>,
     allocator: Arc<StandardMemoryAllocator>,
@@ -214,11 +215,11 @@ impl State {
             return;
         }
 
-        self.ph.capture();
+        self.mon.capture();
 
         if self.global_state.load().cursor_visible != info.cursor_visible {
             self.global_state
-                .rcu(|s| s.with_cursor_visible(info.cursor_visible));
+                .update(|s| s.cursor_visible = info.cursor_visible);
         }
 
         let Buffer { wl_buffer, image } = buf;
@@ -231,7 +232,7 @@ impl State {
         {
             let mut queue = self.slot.lock().unwrap();
             if queue.len() >= 2 {
-                self.ph.capture_miss();
+                self.mon.capture_miss();
                 queue.pop_front();
             }
             queue.push_back(frame);
@@ -328,7 +329,7 @@ fn run(
     ping_rx: Channel<()>,
 ) -> Result<()> {
     let CaptureEnv {
-        ph,
+        mon,
         global_state,
         device,
         allocator,
@@ -354,7 +355,7 @@ fn run(
     };
 
     let mut state = State {
-        ph,
+        mon,
         global_state,
         device,
         allocator,

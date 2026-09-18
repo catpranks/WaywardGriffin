@@ -15,3 +15,15 @@ Observations from reading the code (unverified by measurement):
 Candidate experiments: blocking NVFBC grab on a dedicated capture thread with the render thread presenting as soon as a frame lands (decoupled from frame callbacks); measure with the presentation-feedback latency that `FrameInfo::present` already records; compare windowed vs fullscreen.
 
 User note: the efficient fullscreen presentation path in Hyprland (direct scanout) may only kick in when waygriff also holds input (focused, grab active). The launcher places the window on `F1` fullscreen without focus, so stats gathered that way may not reflect the scanout path. Check `hyprctl monitors` / Hyprland debug output for scanout state when measuring.
+
+Measured 2026-09-18 via `waygriffctl stats` (window on F1 fullscreen, not focused, game at main menu showing 120 FPS on :80; window 3072x1728 logical, render 3840x2160):
+
+| metric | value |
+|---|---|
+| render_hz | 50-61 |
+| miss_hz (NVFBC NOWAIT returned no new frame) | 62-78 |
+| present_ms avg | 27 |
+| present_ms min/max | 20 / 56 |
+| wait+obtain+commit | < 1 ms |
+
+Render rate is a fraction of the source's 120 Hz and present latency is over two 120 Hz periods, so the scheduling gap dominates, not the copy. Check whether the fullscreen window is actually on direct scanout in this configuration before drawing conclusions.

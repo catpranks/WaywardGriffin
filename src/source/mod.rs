@@ -1,14 +1,13 @@
 mod nvfbc;
 mod wayland;
 
-use super::CaptureOpts;
-use super::input::InputBridge;
 use crate::GlobalState;
-use crate::plotter::FrameInfo;
-use crate::plotter::PlotterHandle;
+use crate::bridge::InputBridge;
+use crate::monitor::FrameInfo;
+use crate::monitor::MonitorHandle;
 use crate::sizer::SharedSizer;
 use anyhow::Result;
-use clap::ValueEnum;
+use clap::{Args, ValueEnum};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -16,12 +15,22 @@ use vulkano::device::Device;
 use vulkano::image::Image;
 use vulkano::memory::allocator::StandardMemoryAllocator;
 
+#[derive(Debug, Clone, Args)]
+pub struct CaptureOpts {
+    /// The display to capture
+    #[arg(long)]
+    pub display: String,
+
+    /// Capture backend to use
+    #[arg(long, value_enum)]
+    pub backend: BackendType,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendType {
     Nvfbc,
     Screencopy,
     Imagecopy,
-    Kms,
 }
 
 pub enum DeviceId {
@@ -30,7 +39,7 @@ pub enum DeviceId {
 }
 
 pub struct CaptureEnv {
-    pub ph: PlotterHandle,
+    pub mon: MonitorHandle,
     pub global_state: GlobalState,
     pub device: Arc<Device>,
     pub allocator: Arc<StandardMemoryAllocator>,
@@ -78,7 +87,6 @@ pub fn create_backend_builder(opts: &CaptureOpts) -> Result<Box<dyn CaptureBacke
         BackendType::Screencopy | BackendType::Imagecopy => {
             Box::new(wayland::Builder::new(&opts.display, opts.backend)?)
         }
-        BackendType::Kms => todo!("kms backend"),
     };
     Ok(b)
 }

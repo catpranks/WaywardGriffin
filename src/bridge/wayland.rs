@@ -1,5 +1,5 @@
 use super::InputBridge;
-use crate::plotter::PlotterHandle;
+use crate::monitor::MonitorHandle;
 use crate::sizer::SharedSizer;
 use crate::utils::wayland_connect;
 use anyhow::{Context as _, Result, anyhow};
@@ -54,7 +54,7 @@ pub struct WaylandInput {
 }
 
 impl WaylandInput {
-    pub fn new(display: &str, sizer: SharedSizer, ph: PlotterHandle) -> Result<Self> {
+    pub fn new(display: &str, sizer: SharedSizer, mon: MonitorHandle) -> Result<Self> {
         let conn = wayland_connect(display)?;
 
         let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
@@ -109,7 +109,7 @@ impl WaylandInput {
                         }
                     }
                     if let Some(res) = state.res.take() {
-                        ph.fatal(res.context("wayland input dispatch"));
+                        mon.fatal(res.context("wayland input dispatch"));
                         break;
                     }
                 }

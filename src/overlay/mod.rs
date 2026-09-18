@@ -1,6 +1,6 @@
 pub mod state;
 
-use crate::plotter::PlotterHandle;
+use crate::monitor::MonitorHandle;
 use crate::sizer::SharedSizer;
 use anyhow::{Context as _, Result, anyhow};
 use smithay::reexports::calloop::generic::Generic;
@@ -91,7 +91,7 @@ impl OverlayHandle {
     pub fn new(
         device: Arc<Device>,
         allocator: Arc<StandardMemoryAllocator>,
-        ph: PlotterHandle,
+        mon: MonitorHandle,
         sizer: SharedSizer,
     ) -> Result<Self> {
         let slot: OverlaySlot = Arc::new(Mutex::new(OverlayState::Inactive));
@@ -111,11 +111,11 @@ impl OverlayHandle {
             .to_owned();
         info!(socket = %socket_name, "overlay compositor listening");
 
-        let ph = ph.clone();
+        let mon = mon.clone();
         std::thread::Builder::new()
             .name("overlay".into())
             .spawn(move || {
-                ph.fatal(
+                mon.fatal(
                     run(display, state, listening_socket, flush_ping_source)
                         .context("overlay thread"),
                 );

@@ -1,20 +1,21 @@
 #![allow(clippy::new_without_default)]
 
-mod capture;
+mod bridge;
 mod config;
 pub mod control;
 mod display;
+pub mod monitor;
 pub mod overlay;
-pub mod plotter;
+mod render;
 pub mod sizer;
+mod source;
 pub mod stats;
 mod utils;
 
-use crate::capture::CaptureOpts;
-use crate::capture::source::BackendType;
 use crate::config::Config;
-use crate::plotter::{Mode, Plotter, PlotterHandle};
+use crate::monitor::{Mode, Monitor, MonitorHandle};
 use crate::sizer::{SharedSizer, Sizer};
+use crate::source::{BackendType, CaptureOpts};
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
@@ -76,8 +77,8 @@ pub fn run() -> Result<()> {
         force_relative: false,
     }));
     let sizer: SharedSizer = Arc::new(ArcSwap::from_pointee(Sizer::default()));
-    let plotter = Plotter::new(global_state.clone(), sizer.clone());
-    init_tracing(plotter.handle(), opts.tdelay.is_some());
+    let monitor = Monitor::new(global_state.clone(), sizer.clone());
+    init_tracing(monitor.handle(), opts.tdelay.is_some());
 
     let config = {
         let dirs = BaseDirectories::with_prefix("waygriff");
@@ -91,16 +92,16 @@ pub fn run() -> Result<()> {
     };
 
     let (control_tx, control_rx) = channel::channel();
-    control::spawn(plotter.snapshot(), global_state.clone(), control_tx)?;
+    control::spawn(monitor.snapshot(), global_state.clone(), control_tx)?;
 
-    let ph = plotter.handle();
+    let mon = monitor.handle();
     let opts2 = opts.clone();
     let sizer2 = sizer.clone();
     std::thread::Builder::new()
         .name("display".into())
         .spawn(move || {
-            ph.fatal(
-                display::run(opts2, global_state, ph.clone(), sizer2, config, control_rx)
+            mon.fatal(
+                display::run(opts2, global_state, mon.clone(), sizer2, config, control_rx)
                     .context("display thread"),
             );
         })?;
@@ -111,19 +112,19 @@ pub fn run() -> Result<()> {
             stats_every: opts.stats_every,
         },
     };
-    plotter.run(mode)
+    monitor.run(mode)
 }
 
-/// Route tracing output through the plotter so the TUI can show it.
-fn init_tracing(ph: PlotterHandle, tui: bool) {
+/// Route tracing output through the monitor so the TUI can show it.
+fn init_tracing(mon: MonitorHandle, tui: bool) {
     let crate_name = env!("CARGO_PKG_NAME");
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("info,{crate_name}=debug")));
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .compact()
-        .with_writer(move || PlotterWriter {
-            ph: ph.clone(),
+        .with_writer(move || MonitorWriter {
+            mon: mon.clone(),
             buf: vec![],
         });
     let registry = tracing_subscriber::registry().with(filter);
@@ -134,7 +135,7 @@ fn init_tracing(ph: PlotterHandle, tui: bool) {
     }
 }
 
-type GlobalState = Arc<ArcSwap<GlobalStateInner>>;
+pub type GlobalState = Arc<ArcSwap<GlobalStateInner>>;
 
 /// Flags shared by every thread. Replace wholesale with `rcu`; never mutate in place.
 #[derive(Clone, Default)]
@@ -149,39 +150,27 @@ pub struct GlobalStateInner {
     pub force_relative: bool,
 }
 
-impl GlobalStateInner {
-    pub fn with_cursor_visible(&self, v: bool) -> Self {
-        Self {
-            cursor_visible: v,
-            ..self.clone()
-        }
-    }
-    pub fn with_confine(&self, v: bool) -> Self {
-        Self {
-            confine: v,
-            ..self.clone()
-        }
-    }
-    pub fn with_capture(&self, v: bool) -> Self {
-        Self {
-            capture: v,
-            ..self.clone()
-        }
-    }
-    pub fn with_force_relative(&self, v: bool) -> Self {
-        Self {
-            force_relative: v,
-            ..self.clone()
-        }
+/// Flip one or more flags atomically: `state.update(|s| s.confine = true)`.
+pub trait GlobalStateExt {
+    fn update(&self, f: impl Fn(&mut GlobalStateInner));
+}
+
+impl GlobalStateExt for ArcSwap<GlobalStateInner> {
+    fn update(&self, f: impl Fn(&mut GlobalStateInner)) {
+        self.rcu(|s| {
+            let mut s = (**s).clone();
+            f(&mut s);
+            s
+        });
     }
 }
 
-struct PlotterWriter {
-    ph: PlotterHandle,
+struct MonitorWriter {
+    mon: MonitorHandle,
     buf: Vec<u8>,
 }
 
-impl std::io::Write for PlotterWriter {
+impl std::io::Write for MonitorWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(buf);
         Ok(buf.len())
@@ -192,8 +181,8 @@ impl std::io::Write for PlotterWriter {
     }
 }
 
-impl Drop for PlotterWriter {
+impl Drop for MonitorWriter {
     fn drop(&mut self) {
-        self.ph.log(String::from_utf8_lossy(&self.buf).to_string());
+        self.mon.log(String::from_utf8_lossy(&self.buf).to_string());
     }
 }

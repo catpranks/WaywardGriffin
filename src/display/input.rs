@@ -1,7 +1,8 @@
 use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 
-use crate::capture::input::InputBridge;
+use crate::GlobalStateExt as _;
+use crate::bridge::InputBridge;
 use crate::config::Config;
 use crate::sizer::SharedSizer;
 use anyhow::{Result, anyhow};
@@ -85,7 +86,7 @@ struct InputData;
 impl InputState {
     pub(super) fn set_force_relative(&mut self, dc: &DisplayCtx, v: bool) {
         self.force_relative = v;
-        dc.global_state.rcu(|s| s.with_force_relative(v));
+        dc.global_state.update(|s| s.force_relative = v);
     }
 
     pub(super) fn set_confined(&mut self, dc: &DisplayCtx, conn: &Connection, confined: bool) {
@@ -112,7 +113,7 @@ impl InputState {
 
         self.update_confine(dc);
         self.update_shortcut_inhibitor(dc);
-        dc.global_state.rcu(|s| s.with_confine(self.confined));
+        dc.global_state.update(|s| s.confine = self.confined);
         self.update_cursor(conn);
     }
 
@@ -507,7 +508,7 @@ impl KeyboardHandler for App {
                     self.input.set_force_relative(&self.dc, v);
                 }
                 Keysym::c => {
-                    self.dc.global_state.rcu(|s| s.with_capture(!s.capture));
+                    self.dc.global_state.update(|s| s.capture = !s.capture);
                 }
                 _ => {}
             }

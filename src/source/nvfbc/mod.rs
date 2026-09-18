@@ -3,11 +3,12 @@ mod nvcapture;
 use self::nvcapture::NvCapture;
 use super::{CaptureBackendBuilder, CaptureEnv, DeviceId};
 use crate::GlobalState;
-use crate::capture::input::InputBridge;
-use crate::capture::input::xinput::XInput;
-use crate::capture::source::{CaptureBackend, CapturedFrame, ReclaimedBuffer};
-use crate::plotter::{FrameInfo, PlotterHandle};
+use crate::GlobalStateExt as _;
+use crate::bridge::InputBridge;
+use crate::bridge::xinput::XInput;
+use crate::monitor::{FrameInfo, MonitorHandle};
 use crate::sizer::SharedSizer;
+use crate::source::{CaptureBackend, CapturedFrame, ReclaimedBuffer};
 use anyhow::{Context as _, Result};
 use cudarc::driver::result::external_memory::{
     destroy_external_memory, import_external_memory_opaque_fd,
@@ -74,7 +75,7 @@ impl CaptureBackendBuilder for Builder {
                 ctx: self.ctx,
                 capturer,
                 bound: false,
-                ph: env.ph,
+                mon: env.mon,
                 global_state: env.global_state,
                 device: env.device,
                 allocator: env.allocator,
@@ -91,7 +92,7 @@ pub struct Backend {
     ctx: Arc<CudaContext>,
     capturer: NvCapture,
     bound: bool,
-    ph: PlotterHandle,
+    mon: MonitorHandle,
     global_state: GlobalState,
     device: Arc<Device>,
     allocator: Arc<StandardMemoryAllocator>,
@@ -111,12 +112,12 @@ impl CaptureBackend for Backend {
         let start = Instant::now();
         let (dptr, info) = self.capturer.capture_frame(Some(Duration::ZERO))?;
         for _ in 0..info.missed_frames {
-            self.ph.capture_miss();
+            self.mon.capture_miss();
         }
         if !info.is_new_frame {
             return Ok(None);
         }
-        self.ph.capture();
+        self.mon.capture();
         // let capture_mono_ns = clock_monotonic_ns();
         let capture_mono_ns = info.timestamp_us * 1000;
 
@@ -169,7 +170,7 @@ impl CaptureBackend for Backend {
 
         if self.global_state.load().cursor_visible != info.cursor_visible {
             self.global_state
-                .rcu(|s| s.with_cursor_visible(info.cursor_visible));
+                .update(|s| s.cursor_visible = info.cursor_visible);
         }
 
         let info = FrameInfo {

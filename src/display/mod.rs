@@ -1,13 +1,14 @@
 mod input;
 
-use crate::capture::source::{CaptureEnv, create_backend_builder};
-use crate::capture::{RenderMsg, Renderer};
+use crate::GlobalStateExt as _;
 use crate::config::Config;
 use crate::control::ControlMsg;
 use crate::display::input::InputState;
+use crate::monitor::{FrameInfo, MonitorHandle};
 use crate::overlay::OverlayHandle;
-use crate::plotter::{FrameInfo, PlotterHandle};
+use crate::render::{RenderMsg, Renderer};
 use crate::sizer::SharedSizer;
+use crate::source::{CaptureEnv, create_backend_builder};
 use crate::utils::clock_monotonic_ns;
 use crate::{GlobalState, Opts};
 use anyhow::{Result, anyhow, bail};
@@ -60,7 +61,7 @@ use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::clie
 
 #[derive(Clone)]
 pub struct DisplayCtx {
-    pub ph: PlotterHandle,
+    pub mon: MonitorHandle,
     pub global_state: GlobalState,
     pub surface: WlSurface,
     pub viewport: WpViewport,
@@ -123,7 +124,7 @@ impl App {
             ControlMsg::SetConfine(v) => self.input.set_confined(&self.dc, conn, v),
             ControlMsg::SetForceRelative(v) => self.input.set_force_relative(&self.dc, v),
             ControlMsg::SetCapture(v) => {
-                self.dc.global_state.rcu(|s| s.with_capture(v));
+                self.dc.global_state.update(|s| s.capture = v);
             }
             ControlMsg::Quit => self.res = Some(Ok(())),
         }
@@ -385,7 +386,7 @@ impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppDat
                 if let Some(pos) = deque.iter().position(|(id, _)| *id == feedback.id()) {
                     let (_, mut info) = deque.remove(pos).unwrap();
                     info.set_present(now);
-                    state.dc.ph.render(info);
+                    state.dc.mon.render(info);
                 }
             }
             wp_presentation_feedback::Event::Discarded => {
@@ -405,7 +406,7 @@ delegate_dispatch2!(App);
 pub fn run(
     opts: Opts,
     global_state: GlobalState,
-    ph: PlotterHandle,
+    mon: MonitorHandle,
     sizer: SharedSizer,
     config: Config,
     control_rx: channel::Channel<ControlMsg>,
@@ -439,7 +440,7 @@ pub fn run(
 
     let presentation: wp_presentation::WpPresentation = globals.bind(&qh, 1..=1, AppData)?;
     let dc = DisplayCtx {
-        ph: ph.clone(),
+        mon: mon.clone(),
         global_state: global_state.clone(),
         surface: surface.clone(),
         viewport,
@@ -458,12 +459,12 @@ pub fn run(
     let overlay_handle = OverlayHandle::new(
         renderer.device.clone(),
         renderer.allocator.clone(),
-        ph.clone(),
+        mon.clone(),
         sizer.clone(),
     )?;
 
     let env = CaptureEnv {
-        ph,
+        mon,
         global_state,
         device: renderer.device.clone(),
         allocator: renderer.allocator.clone(),
@@ -482,7 +483,7 @@ pub fn run(
 
     let (render_tx, render_rx) = mpsc::channel();
     let render_thread =
-        crate::capture::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
+        crate::render::spawn(dc.clone(), renderer, backend, overlay_handle, render_rx)?;
 
     let mut app = App {
         loop_handle: loop_handle.clone(),

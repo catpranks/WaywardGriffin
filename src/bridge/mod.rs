@@ -1,4 +1,3 @@
-pub mod dummy;
 pub mod wayland;
 pub mod xinput;
 
