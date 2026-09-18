@@ -115,3 +115,57 @@ No commit was made.
 - Next: 8kxgv6, render and present on the AMD iGPU so direct scanout can engage
   (submit-to-present is now ~12-15 ms of the total, about 1.5-2 refresh periods
   of composition). Owner wants that work written up as a cross-GPU walkthrough.
+
+## 2026-09-18 AMD scanout and border milestone; latency objective remains open
+
+NVFBC now uses CUDA D2H into aligned, registered system pages imported as a RADV
+linear sRGB image. Rendering/presentation selects the integrated RADV device;
+the final swapchain remains AMD-native. Removed Nvidia Vulkan device selection,
+CUDA opaque-fd external-memory import and mipmapped-array wrappers. Content type
+game makes the surface eligible for Hyprland auto scanout. Live 4K120 checks
+reported matching directScanoutTo, flags 15 and ZERO_COPY=1, with zero modeset-log
+growth during the recorded comparisons.
+
+The owner identified the unconfined fullscreen blended border as a significant
+iGPU cost. GPU probes measured roughly 0.5–0.7 ms; four disjoint 25-pixel scissors
+reduced the isolated pass to about 0.03–0.04 ms while preserving the animation.
+All subsequent headline windows were confined; paired unconfined measurements
+and the measurement policy are recorded in the issue and latency documentation.
+
+The latency acceptance condition is not met. Confined c8e1455f windows gave
+15.710 and 10.310 ms total, versus 16.315 and 18.142 ms in retained AMD sampling
+windows at different source/output phases. These short windows cannot establish
+a speedup. Full tables, compositor conditions and trace boundaries are in
+8kxgv6. That issue stays open.
+
+Tried opaque base rendering, optimal-texture staging, image/buffer copies into
+the swapchain, a dedicated SDMA queue, and waiting for GPU completion before
+present. Actual SDMA reduced upload plus confined graphics to about 1.3 ms but
+did not remove the presentation delay. It needed RADV_EXPERIMENTAL=transfer_queue.
+Removed those experiments and all GPU timing/temporary file toggles, retaining
+the simpler sampled-image path. Hyprland direct_scanout=2,
+debug:ds_handle_same_buffer=true and misc:vrr=0 are restored; no power policy
+changed. The wire trace shows ready commits receiving a callback at one refresh
+and presentation feedback at the next, without locating the exact remaining
+compositor/kernel delay.
+
+Added docs/cross-gpu.md as the guided allocation, transfer, synchronization and
+scanout walkthrough; updated AGENTS.md and latency.md. Review fixed descriptor
+lifetime during raw command execution and framebuffer lifetime during resize,
+and added GPU-idle teardown before releasing imported host storage.
+
+Release build, release all-target clippy, formatting and the three existing
+timing tests passed. Read source and full-output PNGs; checked the breathing
+border, 1000×800 logical window with letterboxing, capture off/on and shutdown
+while disabled. The overlay demo completed repeated runs; a disposable variant
+with a larger translucent green rectangle made alpha composition unambiguous
+in the output PNG. The original demo binary was restored. Wayland capture
+backends compile; no Wayland source compositor was exercised.
+
+Final reviewed-build windows after a resize round trip: confined 119 Hz,
+17.341 ms total / 16.236 ms submit-to-present; unconfined 119 Hz,
+19.069 / 17.972 ms. Both reported ZERO_COPY=1 and zero modeset-log growth.
+No overlay, screenshot or build overlapped these windows. The border's GPU cost
+comes from the isolated timestamp probes, not subtraction of these phase-shifted
+end-to-end numbers. The final instance was stopped. Closed border issue jwydmn;
+the main latency objective remains open.

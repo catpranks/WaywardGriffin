@@ -39,19 +39,28 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
 
 ## GPU facts I learned
 
+The current NVFBC path uses CUDA D2H into pinned host pages, then renders and
+presents on the RADV iGPU. Direct scanout works; a latency improvement is still
+unproven. The [cross-GPU walkthrough](./docs/cross-gpu.md) explains the allocation,
+synchronization and scanout constraints with probes and source references.
+
 - The CUDA buffer produced by an NVFBC capture is only valid until the next capture call.
   This means the data has to be copied synchronously.
 - CUDA device-to-device memcpy is always asynchronous even if you call the non-Async variant.
   A subsequent stream sync does wait for it
-- It is not possible to export an Nvidia VRAM buffer to DMA-BUF and send it to the iGPU.
-- There is no sane way to expose a CUDA buffer as a DMA-BUF on PC.
+- Nvidia WSI exports linear system-memory DMA-BUFs that AMD can import for composition,
+  but the tested foreign allocations fail AMD KMS framebuffer registration.
+  That does not establish direct sharing of Nvidia optimal-tiled VRAM images.
+- Earlier attempts to expose a CUDA buffer directly as a DMA-BUF ran into driver restrictions.
   [A wizard managed to do it with private ioctls](https://forums.developer.nvidia.com/t/cuda-and-linux-dma-buf/194267/4).
   When the compositor tries to import the buffer, the amdgpu driver asks the nvidia driver to map the buffer to a virtual address and nvidia driver refuses.
   No idea whose fault this is!
-- Despite looking like a perfect fit, Wayland's [linux-drm-syncobj-v1](https://wayland.app/protocols/linux-drm-syncobj-v1) protocol and Vulkan's timeline semaphores are not compatible.
-  There's a Vulkan [spec bug](https://github.com/KhronosGroup/Vulkan-Docs/issues/2473) about it.
-- NVFBC blocking capture is very inconsistent. In windowed mode, it randomly delivers a new frame after 250-700us, perhaps because the desktop environment's clock changes and emits a damage event.
-  - In full screen mode, it oscillates between 95 and 115 Hz on a 120 Hz display.
+- The overlay converts each DRM-syncobj acquire point to a sync-file fd and
+  imports it as a temporary Vulkan binary semaphore. It does not assume that
+  an opaque Vulkan semaphore fd is interchangeable with a DRM timeline fd.
+- Early NVFBC loop measurements were inconsistent; later investigation found a
+  failed-scanout modeset storm in the compositor. The capture thread now reaches
+  120 Hz on the tested fullscreen source. See [latency stats](./docs/latency.md).
 - NVIDIA Vulkan WSI for Wayland implements vkWaitForPresentKHR by polling the server in a tight loop
 
 ## agent affordances
@@ -61,9 +70,9 @@ Unfortunately, Mesa's Wayland Vulkan WSI is even jankier than Nvidia's.
 
 ## code index
 
-- [display thread](./src/display/mod.rs). Wayland window boilerplate. Handles frame events and calls the renderer.
+- [display thread](./src/display/mod.rs). Wayland window boilerplate, input and presentation feedback; forwards events to the render thread.
 - [input](./src/display/input.rs). Input event forwarding, on the display thread.
-- [render](./src/render/mod.rs). Renders captured frames onto the Vulkan swapchain. Cool breathing border effect when input capture is disabled.
+- [render](./src/render/mod.rs). Renders captured frames onto the Vulkan swapchain. Breathing edge border when input is unconfined.
 - [nvfbc](./src/source/nvfbc/mod.rs). NVFBC capture backend.
 - [monitor](./src/monitor.rs). TUI with frame timing charts, or headless log printer.
 - [control](./src/control.rs) and [waygriffctl](./src/bin/waygriffctl.rs). Machine-readable stats and control.

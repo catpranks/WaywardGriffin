@@ -26,7 +26,8 @@ use vulkano::command_buffer::{
     SemaphoreSubmitInfo, SubmitInfo, SubpassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
+use vulkano::device::physical::{DriverId, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
@@ -45,7 +46,7 @@ use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveT
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::vertex_input::VertexInputState;
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
@@ -70,6 +71,7 @@ struct InFlight {
     fence: Arc<Fence>,
     last_command_buffer: Option<Arc<dyn Send + Sync>>,
     frames: Vec<Arc<CapturedFrame>>,
+    descriptor_sets: Vec<Arc<DescriptorSet>>,
     overlays: Vec<Arc<OverlayFrame>>,
     overlay_acquire: Option<Arc<Semaphore>>,
 }
@@ -97,7 +99,7 @@ pub struct Renderer {
     current_overlay: Option<Arc<OverlayFrame>>,
 
     pub allocator: Arc<StandardMemoryAllocator>,
-    queue: Arc<Queue>,
+    pub queue: Arc<Queue>,
     pub device: Arc<Device>,
     _surface: Arc<Surface>,
     start_time: Instant,
@@ -123,11 +125,15 @@ impl Renderer {
             },
         )?;
 
+        let host_capture = matches!(device_id, DeviceId::RadvIntegrated);
         let physical_device = match device_id {
-            DeviceId::Uuid(uuid) => instance
+            DeviceId::RadvIntegrated => instance
                 .enumerate_physical_devices()?
-                .find(|p| p.properties().device_uuid == Some(uuid))
-                .context("no physical device with matching UUID")?,
+                .find(|p| {
+                    p.properties().driver_id == Some(DriverId::MesaRADV)
+                        && p.properties().device_type == PhysicalDeviceType::IntegratedGpu
+                })
+                .context("NVFBC presentation requires a RADV integrated GPU")?,
             DeviceId::DevMajorMinor(major, minor) => instance
                 .enumerate_physical_devices()?
                 .find(|p| {
@@ -140,6 +146,8 @@ impl Renderer {
                 .context("no physical device with matching major/minor")?,
         };
 
+        info!(device = %physical_device.properties().device_name, "render/present device");
+
         let surface = unsafe {
             Surface::from_wayland(
                 instance,
@@ -151,6 +159,7 @@ impl Renderer {
 
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
+            ext_external_memory_host: host_capture,
             khr_external_memory: true,
             khr_external_memory_fd: true,
             ext_external_memory_dma_buf: true,
@@ -261,7 +270,9 @@ impl Renderer {
                             ..Default::default()
                         },
                     )),
-                    dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                    dynamic_state: [DynamicState::Viewport, DynamicState::Scissor]
+                        .into_iter()
+                        .collect(),
                     subpass: Some(subpass.into()),
                     ..GraphicsPipelineCreateInfo::layout(layout)
                 },
@@ -341,6 +352,7 @@ impl Renderer {
                     fence,
                     last_command_buffer: None,
                     frames: vec![],
+                    descriptor_sets: vec![],
                     overlays: vec![],
                     overlay_acquire: None,
                 })
@@ -396,6 +408,10 @@ impl Renderer {
     fn configure(&mut self, sizer: &Sizer) -> Result<()> {
         let [sw, sh] = self.swapchain.image_extent();
         if self.needs_recreate || (sw, sh) != sizer.render_size {
+            // Raw render commands do not retain the old framebuffers.
+            for frame in &self.in_flight {
+                frame.fence.wait(None)?;
+            }
             self.needs_recreate = false;
             let (r_w, r_h) = sizer.render_size;
             let (swapchain, images) = self.swapchain.recreate(SwapchainCreateInfo {
@@ -436,6 +452,7 @@ impl Renderer {
         let ifli = self.frame_idx % self.in_flight.len();
         let ifl = &mut self.in_flight[ifli];
         ifl.fence.wait(None)?;
+        ifl.descriptor_sets.clear();
         ifl.frames.clear();
         ifl.overlays.clear();
         ifl.overlay_acquire = None;
@@ -536,6 +553,7 @@ impl Renderer {
         if let Some(info) = info.as_mut() {
             info.latency.fence_wait = fence_start.elapsed();
         }
+        ifl.descriptor_sets.clear();
         ifl.frames.clear();
         if let Some(ref old) = old_frame {
             ifl.frames.push(old.clone());
@@ -590,7 +608,12 @@ impl Renderer {
         )?;
         unsafe {
             // Release old capture image to external (if replaced)
-            if let Some(ref old) = old_frame {
+            if let Some(ref old) = old_frame
+                && !old
+                    .image
+                    .external_memory_handle_types()
+                    .contains(vulkano::memory::ExternalMemoryHandleTypes::HOST_ALLOCATION)
+            {
                 cmd.pipeline_barrier(&release_to_external(old.image.clone(), qfi))?;
             }
             // Release old overlay image to external (if replaced)
@@ -599,7 +622,27 @@ impl Renderer {
             }
             // Acquire new capture image from external
             if has_new_frame {
-                cmd.pipeline_barrier(&acquire_from_external(image.clone(), qfi))?;
+                let host_image = image
+                    .external_memory_handle_types()
+                    .contains(vulkano::memory::ExternalMemoryHandleTypes::HOST_ALLOCATION);
+                let barrier = if host_image {
+                    // CUDA has completed the D2H write; no foreign Vulkan queue owns
+                    // these pages. Slots stay in General for host writes and sampling.
+                    color_barrier(
+                        image.clone(),
+                        ImageLayout::General,
+                        ImageLayout::General,
+                        (PipelineStages::HOST, AccessFlags::HOST_WRITE),
+                        (
+                            PipelineStages::FRAGMENT_SHADER | PipelineStages::COMPUTE_SHADER,
+                            AccessFlags::SHADER_SAMPLED_READ,
+                        ),
+                        None,
+                    )
+                } else {
+                    acquire_from_external(image.clone(), qfi)
+                };
+                cmd.pipeline_barrier(&barrier)?;
             }
             // Acquire new overlay image from external
             if has_new_overlay && let Some(ref overlay) = self.current_overlay {
@@ -636,20 +679,30 @@ impl Renderer {
                 }],
             )?;
 
-            // Draw 1: Base image (opaque)
+            cmd.set_scissor(
+                0,
+                &[Scissor {
+                    offset: [0, 0],
+                    extent: self.swapchain.image_extent(),
+                }],
+            )?;
+
+            // Raw command recording does not retain descriptors or their images.
+            // Keep each set with this submission until its fence completes.
+            let base_set = textured_set(
+                &self.descriptor_set_allocator,
+                &self.textured_pipeline,
+                &self.sampler,
+                image.clone(),
+            )?;
             cmd.bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 self.textured_pipeline.layout(),
                 0,
-                &[textured_set(
-                    &self.descriptor_set_allocator,
-                    &self.textured_pipeline,
-                    &self.sampler,
-                    image.clone(),
-                )?
-                .as_raw()],
+                &[base_set.as_raw()],
                 &[],
             )?;
+            ifl.descriptor_sets.push(base_set);
             cmd.push_constants(
                 self.textured_pipeline.layout(),
                 0,
@@ -659,19 +712,20 @@ impl Renderer {
 
             // Draw 2: Overlay (alpha-blended)
             if let Some(ref overlay) = self.current_overlay {
+                let overlay_set = textured_set(
+                    &self.descriptor_set_allocator,
+                    &self.textured_pipeline,
+                    &self.sampler,
+                    overlay.image.clone(),
+                )?;
                 cmd.bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     self.textured_pipeline.layout(),
                     0,
-                    &[textured_set(
-                        &self.descriptor_set_allocator,
-                        &self.textured_pipeline,
-                        &self.sampler,
-                        overlay.image.clone(),
-                    )?
-                    .as_raw()],
+                    &[overlay_set.as_raw()],
                     &[],
                 )?;
+                ifl.descriptor_sets.push(overlay_set);
                 cmd.push_constants(
                     self.textured_pipeline.layout(),
                     0,
@@ -692,7 +746,26 @@ impl Renderer {
                         content_height: content.height as f32,
                     },
                 )?;
-                cmd.draw(3, 1, 0, 0)?;
+                // The shader's maximum width is 25 pixels. Four disjoint strips
+                // retain its breathing animation without shading the interior.
+                let x = content.x;
+                let y = content.y;
+                let w = content.width;
+                let h = content.height;
+                let top = 25.min(h);
+                let bottom = 25.min(h - top);
+                let sides = h - top - bottom;
+                let left = 25.min(w);
+                let right = 25.min(w - left);
+                for (offset, extent) in [
+                    ([x, y], [w, top]),
+                    ([x, y + h - bottom], [w, bottom]),
+                    ([x, y + top], [left, sides]),
+                    ([x + w - right, y + top], [right, sides]),
+                ] {
+                    cmd.set_scissor(0, &[Scissor { offset, extent }])?;
+                    cmd.draw(3, 1, 0, 0)?;
+                }
             }
 
             cmd.end_render_pass(&Default::default())?;
@@ -812,7 +885,7 @@ impl Renderer {
             self.screenshot_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::sampler(0, self.sampler.clone()),
-                WriteDescriptorSet::image_view(1, ImageView::new_default(image)?),
+                sampled_image(image)?,
                 WriteDescriptorSet::buffer(2, staging.clone()),
             ],
             [],
@@ -872,6 +945,36 @@ impl Renderer {
     }
 }
 
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Raw queue submissions do not carry Vulkano's automatic lifetime tracking.
+        // Complete all reads before the capture slots and overlay releases drop.
+        unsafe { self.device.wait_idle() }.unwrap();
+        for frame in &mut self.in_flight {
+            frame.last_command_buffer = None;
+            frame.descriptor_sets.clear();
+        }
+    }
+}
+
+fn sampled_image(image: Arc<Image>) -> Result<WriteDescriptorSet> {
+    let image_layout = if image
+        .external_memory_handle_types()
+        .contains(vulkano::memory::ExternalMemoryHandleTypes::HOST_ALLOCATION)
+    {
+        ImageLayout::General
+    } else {
+        ImageLayout::ShaderReadOnlyOptimal
+    };
+    Ok(WriteDescriptorSet::image_view_with_layout(
+        1,
+        DescriptorImageViewInfo {
+            image_view: ImageView::new_default(image)?,
+            image_layout,
+        },
+    ))
+}
+
 /// Sampler + texture set for the textured pipeline.
 fn textured_set(
     allocator: &Arc<StandardDescriptorSetAllocator>,
@@ -884,7 +987,7 @@ fn textured_set(
         pipeline.layout().set_layouts()[0].clone(),
         [
             WriteDescriptorSet::sampler(0, sampler.clone()),
-            WriteDescriptorSet::image_view(1, ImageView::new_default(image)?),
+            sampled_image(image)?,
         ],
         [],
     )?)
@@ -919,7 +1022,7 @@ fn color_barrier(
     }
 }
 
-/// Take an imported (DMA-BUF / CUDA) image from the external queue family for sampling.
+/// Take an imported DMA-BUF image from the external queue family for sampling.
 fn acquire_from_external(image: Arc<Image>, qfi: u32) -> DependencyInfo {
     color_barrier(
         image,

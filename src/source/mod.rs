@@ -11,7 +11,7 @@ use clap::{Args, ValueEnum};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::mpsc;
-use vulkano::device::Device;
+use vulkano::device::{Device, Queue};
 use vulkano::image::Image;
 use vulkano::memory::allocator::StandardMemoryAllocator;
 
@@ -34,7 +34,7 @@ pub enum BackendType {
 }
 
 pub enum DeviceId {
-    Uuid([u8; 16]),
+    RadvIntegrated,
     DevMajorMinor(u64, u64),
 }
 
@@ -43,6 +43,7 @@ pub struct CaptureEnv {
     pub mon: MonitorHandle,
     pub global_state: GlobalState,
     pub device: Arc<Device>,
+    pub queue: Arc<Queue>,
     pub allocator: Arc<StandardMemoryAllocator>,
 }
 

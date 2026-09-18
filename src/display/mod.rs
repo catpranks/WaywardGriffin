@@ -8,7 +8,7 @@ use crate::monitor::{FrameInfo, MonitorHandle};
 use crate::overlay::OverlayHandle;
 use crate::render::{RenderMsg, Renderer};
 use crate::sizer::SharedSizer;
-use crate::source::{CaptureEnv, create_backend_builder};
+use crate::source::{BackendType, CaptureEnv, create_backend_builder};
 use crate::utils::{clock_monotonic_ns, compose_timestamp};
 use crate::{GlobalState, Opts};
 use anyhow::{Result, anyhow, bail};
@@ -29,6 +29,10 @@ use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOutput};
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::client::{Connection, Proxy, QueueHandle};
+use smithay_client_toolkit::reexports::protocols::wp::content_type::v1::client::{
+    wp_content_type_manager_v1::WpContentTypeManagerV1,
+    wp_content_type_v1::{Type as ContentType, WpContentTypeV1},
+};
 use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
 };
@@ -153,6 +157,7 @@ pub struct App {
     wp_viewporter: SimpleGlobal<WpViewporter, 1>,
     wp_frac_mgr: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
     _wp_frac: Option<WpFractionalScaleV1>,
+    _content_type: Option<WpContentTypeV1>,
 
     // Window State
     size: (u32, u32),
@@ -464,6 +469,30 @@ impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppDat
     }
 }
 
+impl Dispatch2<WpContentTypeManagerV1, App> for AppData {
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpContentTypeManagerV1,
+        _: <WpContentTypeManagerV1 as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
+}
+
+impl Dispatch2<WpContentTypeV1, App> for AppData {
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpContentTypeV1,
+        _: <WpContentTypeV1 as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
+}
+
 delegate_registry!(App);
 delegate_dispatch2!(App);
 
@@ -492,6 +521,17 @@ pub fn run(
     let window = xdg_shell.create_window(surface.clone(), WindowDecorations::RequestServer, &qh);
     window.set_title("WaywardGriffin");
     window.set_app_id("waygriff");
+    // Hyprland's direct_scanout=2 policy requires game content. Only opt in
+    // for the AMD presentation path; foreign Nvidia WSI buffers cannot scan out.
+    let content_type = if opts.capture_opts.backend == BackendType::Nvfbc {
+        let manager: WpContentTypeManagerV1 = globals.bind(&qh, 1..=1, AppData)?;
+        let content = manager.get_surface_content_type(&surface, &qh, AppData);
+        content.set_content_type(ContentType::Game);
+        manager.destroy();
+        Some(content)
+    } else {
+        None
+    };
     window.commit();
 
     let mut wp_frac_mgr: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>> = None;
@@ -535,6 +575,7 @@ pub fn run(
         mon,
         global_state,
         device: renderer.device.clone(),
+        queue: renderer.queue.clone(),
         allocator: renderer.allocator.clone(),
     };
     let (backend, bridge) = backend_builder.build(env, sizer.clone())?;
@@ -567,6 +608,7 @@ pub fn run(
         wp_viewporter,
         wp_frac_mgr,
         _wp_frac: wp_frac,
+        _content_type: content_type,
 
         // Window State
         size: (0, 0),

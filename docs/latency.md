@@ -25,7 +25,7 @@ present_ms = age_at_grab_ms + grab_to_submit_ms + submit_to_present_ms
 |---|---|
 | `age_at_grab_ms` | Source timestamp → NVFBC grab return. |
 | `wait_ms` | Time inside the blocking grab call, mostly waiting for the next source frame. This precedes that frame's lifetime; do not add it to source age. |
-| `obtain_ms` | Grab return → copied Vulkan image ready, including buffer selection/allocation and synchronous CUDA copy. |
+| `obtain_ms` | Grab return → copied Vulkan image ready, including buffer selection/allocation and synchronous CUDA D2H into RADV-imported host pages. |
 | `grab_to_submit_ms` | Grab return → start of Vulkan queue submission. |
 | `render_queue_ms` | Image ready → renderer starts handling it. Included in `commit_ms`. |
 | `fence_wait_ms`, `acquire_ms` | CPU wait for the reusable frame resource and for a swapchain image. Included in `commit_ms`. |
@@ -71,5 +71,21 @@ retain their callback-driven polling.
 GPU execution and compositor scheduling remain aggregated in
 `submit_to_present_ms`; the CPU fence and present-call timings cannot isolate them.
 On the current Hyprland/Nvidia/AMD setup, use `render:direct_scanout=2` to avoid
-failed direct-scanout attempts causing blocking modesets (see `.deeds/5jgf2q.md`).
-That compositor condition must be held fixed when comparing render-loop timings.
+failed direct-scanout attempts causing blocking modesets with the former Nvidia
+WSI path (see `.deeds/closed/5jgf2q.md`). The NVFBC path now renders on RADV and
+sets content type `game`, permitting auto scanout. Verify both
+`directScanoutTo` and ZERO_COPY feedback; null policy blockers alone do not prove
+successful scanout. See [cross-gpu.md](cross-gpu.md).
+
+Take headline measurements with `waygriffctl set confine on`: this is normal
+play and skips the breathing border. Compare an unconfined window when changing
+rendering. Its four edge scissors limit the extra draw, but the two states still
+perform different GPU work. Wait for the 600-frame timing window to refill after
+each change. Save monitor state and count modeset log entries around every
+measurement. If feedback stops, check for hyprlock and stop rather than bypassing
+the lock.
+
+The source and output clocks are not phase locked. Short consecutive windows can
+differ by several milliseconds or wrap across a refresh boundary without a code
+change. A small border-cost measurement needs GPU timestamps; subtracting two
+short `present_ms` windows can mistake clock phase for rendering cost.
