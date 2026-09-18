@@ -2,6 +2,8 @@
 
 Local display proxy: captures frames from a source display (X11 via NVFBC, or Wayland via screencopy/imagecopy), presents to a Wayland window, forwards input back to the source.
 
+- Vibe coded project: agents make commits as needed.
+
 ## Thread model
 
 | Thread | Entry | Does |
