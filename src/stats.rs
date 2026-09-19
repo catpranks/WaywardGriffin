@@ -41,6 +41,8 @@ pub struct FrameLatency {
     pub queue_present: Option<Duration>,
     pub direct_capture: Option<bool>,
     pub presentation_flags: Option<u32>,
+    /// Output refresh period reported with the presentation feedback.
+    pub refresh_ns: Option<u32>,
 }
 
 impl FrameInfo {
@@ -72,6 +74,14 @@ impl FrameInfo {
 
     pub fn present_ms(&self) -> f64 {
         self.present.map(ms).unwrap_or(0.0)
+    }
+
+    /// Submission start → compositor presentation, when both clocks are known.
+    pub fn submit_to_present_ms(&self) -> Option<f64> {
+        ns_between(
+            self.latency.presented_mono_ns?,
+            self.latency.submit_mono_ns?,
+        )
     }
 }
 
@@ -122,6 +132,8 @@ pub struct Snapshot {
     pub zero_copy_fraction: Option<f64>,
     /// Raw wp_presentation_feedback flags from the latest displayed frame.
     pub presentation_flags: Option<u32>,
+    /// Output refresh period from the latest presentation feedback.
+    pub refresh_ms: Option<f64>,
     pub frame_callback_hz: f64,
     pub frame_callback_interval_ms: Option<f64>,
     pub render_idle_ms: Option<f64>,
@@ -238,13 +250,26 @@ impl Stats {
         }
     }
 
-    /// Present latency per frame, oldest first. Chart input.
-    pub fn present_series(&self) -> impl Iterator<Item = f64> + '_ {
-        self.timings.iter().map(FrameInfo::present_ms)
+    /// Present latency per frame, oldest first; `None` without valid feedback. Chart input.
+    pub fn present_series(&self) -> impl Iterator<Item = Option<f64>> + '_ {
+        self.timings.iter().map(|t| t.present.map(ms))
+    }
+
+    /// Submit→present per frame, oldest first. Chart input.
+    pub fn submit_to_present_series(&self) -> impl Iterator<Item = Option<f64>> + '_ {
+        self.timings.iter().map(FrameInfo::submit_to_present_ms)
     }
 
     pub fn timings_len(&self) -> usize {
         self.timings.len()
+    }
+
+    /// Time between the oldest and newest frame in the timing window.
+    pub fn span(&self) -> Duration {
+        match (self.timings.front(), self.timings.back()) {
+            (Some(first), Some(last)) => last.start.duration_since(first.start),
+            _ => Duration::ZERO,
+        }
     }
 
     pub fn snapshot(&self, global_state: &GlobalState, sizer: &SharedSizer) -> Snapshot {
@@ -315,9 +340,7 @@ impl Stats {
                 .iter()
                 .filter_map(|t| t.latency.queue_present.map(ms))
                 .reduce(f64::max),
-            submit_to_present_ms: mean(|t| {
-                ns_between(t.latency.presented_mono_ns?, t.latency.submit_mono_ns?)
-            }),
+            submit_to_present_ms: mean(FrameInfo::submit_to_present_ms),
             present_return_to_present_ms: mean(|t| {
                 Some(
                     (t.latency.presented_mono_ns? as i128
@@ -340,6 +363,12 @@ impl Stats {
                 .timings
                 .back()
                 .and_then(|t| t.latency.presentation_flags),
+            refresh_ms: self
+                .timings
+                .iter()
+                .rev()
+                .find_map(|t| t.latency.refresh_ns)
+                .map(|ns| f64::from(ns) / 1e6),
             frame_callback_hz: callback_hz,
             frame_callback_interval_ms: callback_interval,
             render_idle_ms: average(self.idles.iter().map(|(_, d)| ms(*d))),

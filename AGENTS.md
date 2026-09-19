@@ -24,7 +24,8 @@ If present, use the `deeds` tool and skill for task tracking.
 
 | Command | Does |
 |---|---|
-| `start [--no-build] [--workspace F1] [--no-fullscreen] [-- extra args]` | `cargo build`, write `temp/waygriff-launch.sh`, ask Hyprland to exec it on workspace `name:F1 silent` fullscreen (no focus change), wait for the display thread to answer `ping`, print stats. Logs append to `temp/waygriff.log`; PID in `temp/waygriff.pid`. |
+| `start [--no-build] [--workspace F1] [--no-fullscreen] [--tui [--tui-size 180x50]] [-- extra args]` | `cargo build`, write `temp/waygriff-launch.sh`, ask Hyprland to exec it on workspace `name:F1 silent` fullscreen (no focus change), wait for the display thread to answer `ping`, print stats. Logs append to `temp/waygriff.log`; PID in `temp/waygriff.pid`. With `--tui` the script re-execs itself inside a detached tmux session (`waygriff` on `temp/tmux.sock`) running `--tdelay=250ms`; log lines then live in the TUI and only stderr reaches the log file. |
+| `tui [--size 100x30] [--attach]` | Print the TUI pane of a `start --tui` instance (`tmux capture-pane`), optionally resizing it first; `--attach` hands the terminal to tmux (detach with `C-a d`). |
 | `stop` | `quit` over the control socket, wait for the socket to close, SIGTERM fallback after 5 s. Only signals a PID whose `/proc` cmdline is a `waygriff` binary. |
 | `status`, `stats [--watch 1s]`, `state`, `set confine\|capture\|relative on\|off`, `raw <line>` | Control socket wrappers. Non-`ok` replies exit 1. |
 | `snap [-o path] [--show]` | Screenshot of the current frame as PNG (default `temp/snap.png`). |
@@ -32,7 +33,7 @@ If present, use the `deeds` tool and skill for task tracking.
 
 Paths resolve against the checkout (`CARGO_MANIFEST_DIR`), overridable with `WAYGRIFF_DIR`.
 
-Typical manual invocation: `cargo run --release --bin waygriff -- --backend=nvfbc --display=:80 --tdelay=1000ms` (the `--tdelay` flag turns on the TUI; without it logs go to stdout and `--stats-every 5s` prints JSON stats lines).
+Typical manual invocation: `cargo run --release --bin waygriff -- --backend=nvfbc --display=:80 --tdelay=250ms` (the `--tdelay` flag turns on the TUI and only paces redraws; input, the published snapshot and the control socket run at 100 ms regardless. Without it logs go to stdout and `--stats-every 5s` prints JSON stats lines). The TUI chart is source→present (yellow) and submit→present (cyan) over the last `width × 8` frames, axis in whole output refresh periods with dim guides, values above the axis clipped to the top edge in red. Three status lines: rates plus fixed flag slots (bold on, dim off, red when capture is off); the additive `age + submit + out` breakdown with zero-copy, direct-capture and feedback age alerts; capture-side CPU costs, geometry, uptime. The log pane colours levels, shows seconds since start, collapses consecutive repeats (`×N`), word-wraps, and follows the tail unless scrolled (PgUp/PgDn, arrows, Home/End; `q` or Ctrl-C quits). Check TUI changes with `waygriffctl start --tui && waygriffctl tui`, also at `--size 100x30`.
 
 ## Sockets
 
@@ -66,7 +67,7 @@ Communication: display→render via `mpsc::Sender<RenderMsg>` (frame signals, pr
 
 - `lib.rs` - CLI opts, `GlobalStateInner` + `GlobalStateExt`, thread spawn, tracing setup (log lines route through the monitor).
 - `control.rs` - control socket protocol.
-- `monitor.rs` - `Monitor` (main-thread consumer of render events), TUI (`ratatui`) and headless modes, `MonitorHandle` for producers.
+- `monitor.rs` - `Monitor` (main-thread consumer of render events), TUI (`ratatui`) and headless modes, `MonitorHandle` for producers, `MonitorLayer` (the only tracing layer: events arrive as structured `LogLine`s; headless mode formats them itself).
 - `stats.rs` - `FrameInfo` timings, rate windows, `Snapshot` (serde, what `stats` returns). Timing boundaries and accounting: `docs/latency.md`.
 - `sizer.rs` - source/window/render coordinate transforms.
 - `config.rs` - `~/.config/waygriff/config.toml` key block/remap (see `docs/key-filtering.md`).
@@ -118,3 +119,4 @@ Nix flake with crane. `nix develop` gives a shell whose `LD_LIBRARY_PATH` carrie
 - `set_cursor` needs a pointer-enter serial; control-socket `set confine` before the pointer has entered must skip the cursor update.
 - A panic on any thread exits the process (hook in `lib.rs`); otherwise a dead render thread leaves a frozen window and a live control socket.
 - The control socket binds before the display thread exists. Use `ping` for readiness, not connect.
+- Hyprland exec rules match windows through an environment token, so a tmux server started from the exec'd script still places the window; but that server lands on `/tmp/tmux-<uid>/default`, not the agent shell's runtime-dir socket. `start --tui` therefore pins `-S temp/tmux.sock`.

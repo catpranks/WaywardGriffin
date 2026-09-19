@@ -13,7 +13,7 @@ pub mod stats;
 mod utils;
 
 use crate::config::Config;
-use crate::monitor::{Mode, Monitor, MonitorHandle};
+use crate::monitor::{Mode, Monitor, MonitorHandle, MonitorLayer};
 use crate::sizer::{SharedSizer, Sizer};
 use crate::source::{BackendType, CaptureOpts};
 use anyhow::{Context as _, Result};
@@ -88,7 +88,7 @@ pub fn run() -> Result<()> {
     }));
     let sizer: SharedSizer = Arc::new(ArcSwap::from_pointee(Sizer::default()));
     let monitor = Monitor::new(global_state.clone(), sizer.clone());
-    init_tracing(monitor.handle(), opts.tdelay.is_some());
+    init_tracing(monitor.handle());
 
     let config = {
         let dirs = BaseDirectories::with_prefix("waygriff");
@@ -125,24 +125,15 @@ pub fn run() -> Result<()> {
     monitor.run(mode)
 }
 
-/// Route tracing output through the monitor so the TUI can show it.
-fn init_tracing(mon: MonitorHandle, tui: bool) {
+/// Route tracing events through the monitor: the TUI renders them, headless mode prints them.
+fn init_tracing(mon: MonitorHandle) {
     let crate_name = env!("CARGO_PKG_NAME");
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("info,{crate_name}=debug")));
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .compact()
-        .with_writer(move || MonitorWriter {
-            mon: mon.clone(),
-            buf: vec![],
-        });
-    let registry = tracing_subscriber::registry().with(filter);
-    if tui {
-        registry.with(fmt_layer.without_time()).init();
-    } else {
-        registry.with(fmt_layer).init();
-    }
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(MonitorLayer(mon))
+        .init();
 }
 
 pub type GlobalState = Arc<ArcSwap<GlobalStateInner>>;
@@ -172,27 +163,5 @@ impl GlobalStateExt for ArcSwap<GlobalStateInner> {
             f(&mut s);
             s
         });
-    }
-}
-
-struct MonitorWriter {
-    mon: MonitorHandle,
-    buf: Vec<u8>,
-}
-
-impl std::io::Write for MonitorWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for MonitorWriter {
-    fn drop(&mut self) {
-        self.mon.log(String::from_utf8_lossy(&self.buf).to_string());
     }
 }

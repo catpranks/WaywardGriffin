@@ -226,3 +226,37 @@ the modeset-line count stayed 109997 through both intervals. Formatting,
 all-target release clippy and release build passed. Pointer positions and focus
 were restored, then waygriff was stopped. No commit. Disposable probe, JSON
 measurements and filtered Wayland logs are in `temp/pointer-diag/`.
+
+## 2026-09-18 TUI review and rework
+
+Reviewed the `--tdelay` dashboard against a live NVFBC run at 4K@120, captured
+at 180x50 and 100x30 through tmux. The chart's `1.2 × max` axis let one 30 ms
+spike squash the 6 ms steady state into three rows; frames without feedback
+plotted as 0 ms; the status line reused `C` for three things and omitted the
+scanout health signals; the log pane had no level colour or timestamps, wrapped
+mid-token and reset scroll on every line; Ctrl-C was swallowed; the published
+snapshot followed `--tdelay`, so the control socket served second-old stats.
+
+Reworked `monitor.rs`: axis in whole refresh periods (`refresh_ms` now comes
+from presentation feedback) with dim guides, p99-based headroom, values above
+the axis clipped to the top edge in red, a second cyan series for
+submit→present, legend and axis title removed. Three labelled status lines with
+fixed flag slots, the additive `age + submit + out` breakdown, zero-copy /
+direct / feedback-age alerts. Logs now arrive as structured events through a
+`MonitorLayer` tracing layer instead of formatted text: level colour, seconds
+since start, word wrap via `Paragraph`, repeat collapse (`×N`), follow-or-pin
+scrolling with a `↓ N more` marker, Ctrl-C quits. Poll and publish run at
+100 ms; `--tdelay` only paces redraws. Per-slot host allocation lines are debug.
+
+`waygriffctl start --tui` re-execs the launch script inside a detached tmux
+session on `temp/tmux.sock`; Hyprland's exec-rule token survives into the tmux
+server, so the window still lands on F1. `waygriffctl tui [--size] [--attach]`
+reads or attaches. Verified: repeat collapse, PageUp marker, styling escape
+codes, 100x30 layout, `stop` tears the tmux server down.
+
+Present latency read 6.4 ms in the first run and 9.5–12 ms in later ones with
+`render_queue_ms` growing from 0.3 to 5.8; the sum stayed `age + submit + out`
+and zero-copy stayed 100%. That is the source/output phase drift already on
+file (e4gsqx, hqfcr3), not a TUI cost; the main thread wakes 10×/s. Formatting,
+all-target release clippy, release build and the three library tests passed.
+Wayland backends compile-checked only. Instance stopped.

@@ -5,7 +5,7 @@ use cudarc::driver::{safe::CudaContext, sys as cuda};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 use vulkano::VulkanObject as _;
 use vulkano::buffer::sys::RawBuffer;
 use vulkano::buffer::{BufferCreateInfo, BufferUsage, Subbuffer};
@@ -146,7 +146,7 @@ impl Buffer {
             image_layout.row_pitch >= u64::from(width) * 4,
             "host image row pitch"
         );
-        info!(
+        debug!(
             width,
             height,
             allocation_size,

@@ -457,6 +457,7 @@ impl Dispatch2<wp_presentation_feedback::WpPresentationFeedback, App> for AppDat
                     pending.outcome = Some(true);
                     pending.info.latency.feedback_mono_ns = Some(received);
                     pending.info.latency.presentation_flags = Some(flags.into());
+                    pending.info.latency.refresh_ns = (refresh != 0).then_some(refresh);
                     if clock_matches {
                         pending
                             .info

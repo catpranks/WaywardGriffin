@@ -48,6 +48,8 @@ All per-frame timing averages describe displayed source frames.
 requested.
 
 `direct_capture_fraction` reports NVFBC `bDirectCapture` over displayed frames.
+`refresh_ms` is the output refresh period from the latest presentation feedback;
+the TUI scales its chart axis and draws guides in whole periods of it.
 `presentation_flags` is the latest raw `wp_presentation_feedback` bitmask:
 1 = VSYNC, 2 = HW_CLOCK, 4 = HW_COMPLETION, 8 = ZERO_COPY.
 `zero_copy_fraction` reports bit 8 over displayed frames. ZERO_COPY means the

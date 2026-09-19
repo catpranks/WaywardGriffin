@@ -52,9 +52,25 @@ enum Cmd {
         /// Log a stats line at this interval, e.g. 5s
         #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
         stats_every: Duration,
+        /// Run the TUI inside a detached tmux session (temp/tmux.sock) instead of headless;
+        /// read it with `waygriffctl tui`
+        #[arg(long)]
+        tui: bool,
+        /// Terminal size for the tmux pane, COLSxROWS
+        #[arg(long, default_value = "180x50")]
+        tui_size: String,
         /// Extra arguments passed through to waygriff
         #[arg(last = true)]
         extra: Vec<String>,
+    },
+    /// Print the TUI pane of a `start --tui` instance
+    Tui {
+        /// Attach the terminal to the tmux session instead (detach with C-a d)
+        #[arg(long)]
+        attach: bool,
+        /// Resize the pane first, COLSxROWS
+        #[arg(long)]
+        size: Option<String>,
     },
     /// Ask waygriff to exit, falling back to SIGTERM
     Stop,
@@ -98,6 +114,8 @@ fn main() -> Result<()> {
             no_fullscreen,
             no_build,
             stats_every,
+            tui,
+            tui_size,
             extra,
         } => start(
             &backend,
@@ -105,9 +123,40 @@ fn main() -> Result<()> {
             &workspace,
             !no_fullscreen,
             !no_build,
-            stats_every,
+            match tui {
+                true => Output::Tui(parse_size(&tui_size)?),
+                false => Output::Headless { stats_every },
+            },
             &extra,
         ),
+        Cmd::Tui { attach, size } => {
+            if let Some(size) = size {
+                let (cols, rows) = parse_size(&size)?;
+                tmux(&[
+                    "resize-window",
+                    "-x",
+                    &cols.to_string(),
+                    "-y",
+                    &rows.to_string(),
+                ])?;
+                // Let the TUI notice the resize and redraw before reading it back.
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            if attach {
+                let status = Command::new("tmux")
+                    .arg("-S")
+                    .arg(tmux_socket())
+                    .args(["attach", "-t", TMUX_SESSION])
+                    .status()
+                    .context("run tmux")?;
+                if !status.success() {
+                    bail!("tmux attach failed");
+                }
+            } else {
+                print!("{}", tmux(&["capture-pane", "-p"])?);
+            }
+            Ok(())
+        }
         Cmd::Stop => stop(),
         Cmd::Status => status(),
         Cmd::Stats { watch } => {
@@ -260,7 +309,7 @@ fn start(
     workspace: &str,
     fullscreen: bool,
     build: bool,
-    stats_every: Duration,
+    output: Output,
     extra: &[String],
 ) -> Result<()> {
     if ctl_connect().is_ok() {
@@ -287,24 +336,52 @@ fn start(
     let mut args = vec![
         format!("--backend={backend}"),
         format!("--display={display}"),
-        format!("--stats-every={}", humantime::format_duration(stats_every)),
     ];
+    args.push(match output {
+        Output::Tui(_) => "--tdelay=250ms".to_owned(),
+        Output::Headless { stats_every } => {
+            format!("--stats-every={}", humantime::format_duration(stats_every))
+        }
+    });
     args.extend(extra.iter().cloned());
     let quoted_args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
     let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    // With --tui the script re-execs itself inside a detached tmux session. The
+    // tmux server inherits Hyprland's exec-rule token, so the window still lands
+    // on the requested workspace; the inner run records the real waygriff PID.
+    let tmux_hop = match output {
+        Output::Tui((cols, rows)) => format!(
+            "if [ -z \"$WAYGRIFF_IN_TMUX\" ]; then\n  \
+             WAYGRIFF_IN_TMUX=1 exec tmux -S {sock} new-session -d -s {session} -x {cols} -y {rows} \"$0\"\n\
+             fi\n",
+            sock = shell_quote(&tmux_socket().to_string_lossy()),
+            session = TMUX_SESSION,
+        ),
+        Output::Headless { .. } => String::new(),
+    };
+    let log = shell_quote(&log_path().to_string_lossy());
+    // The TUI owns stdout; only stderr (panics, late output) goes to the log file.
+    let redirect = match output {
+        Output::Tui(_) => format!("2>> {log}"),
+        Output::Headless { .. } => format!(">> {log} 2>&1"),
+    };
     let wrapper = format!(
         "#!/usr/bin/env sh\n\
-         echo $$ > {pid}\n\
          export LD_LIBRARY_PATH={ld}\n\
          cd {project}\n\
-         exec {bin} {args} >> {log} 2>&1\n",
+         {tmux_hop}\
+         echo $$ > {pid}\n\
+         exec {bin} {args} {redirect}\n",
         pid = shell_quote(&pid_path().to_string_lossy()),
         ld = shell_quote(&ld),
         project = shell_quote(&project_dir().to_string_lossy()),
         bin = shell_quote(&bin.to_string_lossy()),
         args = quoted_args.join(" "),
-        log = shell_quote(&log_path().to_string_lossy()),
     );
+    if matches!(output, Output::Tui(_)) {
+        // A stale server on the project socket would reject the session name.
+        let _ = tmux(&["kill-session"]);
+    }
     let wrapper_path = temp_dir().join("waygriff-launch.sh");
     std::fs::write(&wrapper_path, wrapper)?;
     std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
@@ -361,6 +438,9 @@ fn start(
         read_pid().unwrap_or(0),
         log_path().display()
     );
+    if matches!(output, Output::Tui(_)) {
+        println!("TUI in tmux session {TMUX_SESSION}; `waygriffctl tui` prints the pane");
+    }
     std::thread::sleep(Duration::from_secs(2));
     println!("{}", ctl("stats")?);
     Ok(())
@@ -377,6 +457,46 @@ fn print_log_tail(n: usize) {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Where a launched waygriff writes: JSON stats into the log, or a TUI in tmux.
+enum Output {
+    Headless { stats_every: Duration },
+    Tui((u16, u16)),
+}
+
+fn parse_size(s: &str) -> Result<(u16, u16)> {
+    let (cols, rows) = s.split_once('x').context("size must be COLSxROWS")?;
+    Ok((
+        cols.parse().with_context(|| format!("columns in {s}"))?,
+        rows.parse().with_context(|| format!("rows in {s}"))?,
+    ))
+}
+
+const TMUX_SESSION: &str = "waygriff";
+
+/// Project-local tmux socket: a server started from Hyprland's environment
+/// would otherwise land on a different default socket than the agent shell's.
+fn tmux_socket() -> PathBuf {
+    temp_dir().join("tmux.sock")
+}
+
+/// Run a tmux command against the `start --tui` session and return its stdout.
+fn tmux(args: &[&str]) -> Result<String> {
+    let out = Command::new("tmux")
+        .arg("-S")
+        .arg(tmux_socket())
+        .args(args)
+        .args(["-t", TMUX_SESSION])
+        .output()
+        .context("run tmux")?;
+    if !out.status.success() {
+        bail!(
+            "tmux {args:?}: {}; no `start --tui` instance?",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn stop() -> Result<()> {
