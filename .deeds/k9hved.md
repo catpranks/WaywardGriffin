@@ -1,5 +1,5 @@
 ---
-tier: nit
+tier: freezer
 ---
 # Tune the 5 ms render-ahead budget; consider making it a flag
 
@@ -10,10 +10,19 @@ iGPU at 4K@120 is about 1.3 ms (SDMA upload + confined graphics), so roughly
 present latency; the cost of trimming too far is a missed flip (one extra
 refresh, 8.3 ms) on that frame.
 
-Worth trying: 3 ms and 4 ms in 4-minute confined windows (`waygriffctl set
-confine on`, `waygriffctl stats`), watching `present_ms` mean and max together
-with `zero_copy_fraction` and `discard_hz`. If the sweet spot depends on load,
-a `--render-ahead` flag beats another constant.
+Bounds: floor about 3 ms (GPU 1.3 ms + Hyprland pickup and atomic commit), so
+4 ms is the realistic trim and 3 ms is marginal. The graphics pass shares the
+GFX ring with Hyprland compositing the 1440p monitor; SDMA has its own engine.
+
+Worth trying if ever needed: 3 ms and 4 ms in 4-minute confined windows
+(`waygriffctl set confine on`, `waygriffctl stats`), watching `present_ms` mean
+and max together with `zero_copy_fraction` and `discard_hz`. If the sweet spot
+depends on load, a `--render-ahead` flag beats another constant.
 
 The budget only applies on the SDMA path (unscaled output, dedicated transfer
 queue present). Scaled and Wayland-capture draws submit immediately.
+
+Parked 2026-09-18 by the owner: not worth a millisecond of ricing. The whole
+deadline scheme is superseded once VRR is available on the AMD HDMI output;
+see the VRR refactor issue. Revisit only if VRR slips or the constant starts
+missing flips.
