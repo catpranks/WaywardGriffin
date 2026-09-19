@@ -46,14 +46,6 @@ impl Sizer {
         self.source_size != (0, 0) && self.window_size != (0, 0)
     }
 
-    /// Scale a mouse delta
-    pub fn window_to_source_delta(&self, (dx, dy): (f64, f64)) -> (f64, f64) {
-        let content = self.window_sizing.content;
-        let dx = dx * (self.source_size.0 as f64 / content.width as f64);
-        let dy = dy * (self.source_size.1 as f64 / content.height as f64);
-        (dx, dy)
-    }
-
     /// LERP a pixel position, if it's in content area
     pub fn window_to_source(&self, (w, h): (u32, u32)) -> Option<(u32, u32)> {
         let content = self.window_sizing.content;

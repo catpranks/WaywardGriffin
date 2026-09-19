@@ -353,8 +353,11 @@ impl RelativePointerHandler for App {
         if !self.input.confined {
             return;
         }
-        let sizer = self.sizer.load();
-        let (x, y) = sizer.window_to_source_delta(event.delta);
+        // Relative motion carries raw mouse counts and the game applies its own
+        // sensitivity. Hyprland reports the delta in logical units without
+        // dividing by output scale, so rescaling by window geometry (as the
+        // absolute path must) would add gain under fractional scale.
+        let (x, y) = event.delta;
         self.input.bridge.mouse_delta(x, y).unwrap();
     }
 }

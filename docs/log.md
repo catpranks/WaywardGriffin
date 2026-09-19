@@ -209,3 +209,20 @@ Capture resumed correctly and stopping while disabled completed normally.
 All-target release clippy, formatting, release build and three existing library
 tests passed. Wayland backends were compile-checked only. No retained compositor
 or power-policy changes. Final instance stopped.
+
+## 2026-09-18 relative pointer diagnosis
+
+Measured Logitech evdev → Hyprland relative-pointer → XTest → `:80` on F1
+at scale 1.25. Both Wayland delta fields equaled injected integer counts;
+waygriff's logical-to-source transform added 25% gain. Removed that transform
+from relative forwarding, retaining `event.delta` and the existing XTest bridge.
+Eight counts now give eight pixels on either axis in either direction; 400
+counts at 1 kHz give 400 pixels with no observed delivery tail. The source-pixel
+socket was already exact. Findings and scope limits are in `.deeds/nf466r.md`.
+
+Used forced relative mode because HoN reported a visible cursor. Both snapshots
+showed the game. Before/after monitor records retained 4K120 at scale 1.25 and
+the modeset-line count stayed 109997 through both intervals. Formatting,
+all-target release clippy and release build passed. Pointer positions and focus
+were restored, then waygriff was stopped. No commit. Disposable probe, JSON
+measurements and filtered Wayland logs are in `temp/pointer-diag/`.
