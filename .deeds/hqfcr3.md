@@ -14,6 +14,13 @@ Why not vsync on instead: it locks the game to the Nvidia HDMI-0 scanout
 (119.88 Hz), which is just a different crystal against the AMD pixel clock,
 same ppm regime, plus the game's swapchain queue latency. No benefit.
 
+Trade-off: with the source faster than the fixed 120 Hz output, consecutive
+displayed frames carry uneven game-time spacing (up to one source period of
+jitter), i.e. classic vsync-off micro-stutter. At 240 fps that is up to 4 ms of
+unevenness on an 8.3 ms cadence; uncapped it shrinks further. 120 fps against
+120 Hz is the evenest animation short of VRR, at the cost of ~2 ms mean latency
+and the slow slip. VRR (848742) removes the trade-off.
+
 Costs to watch: RTX 5090 power and fan noise at 240+ fps on an old engine at
 4K; NVFBC capture thread copying every grabbed frame (0.9 ms each, so fine to
 several hundred fps); PCIe traffic 4 GB/s per 120 fps.
