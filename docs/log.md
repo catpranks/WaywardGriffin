@@ -260,3 +260,13 @@ and zero-copy stayed 100%. That is the source/output phase drift already on
 file (e4gsqx, hqfcr3), not a TUI cost; the main thread wakes 10×/s. Formatting,
 all-target release clippy, release build and the three library tests passed.
 Wayland backends compile-checked only. Instance stopped.
+
+## 2026-10-11 overlay hide on null attach
+
+A client attaching a null buffer used to leave its last frame composited.
+`BufferAssignment::Removed` now sets the overlay slot to `Inactive`, so the
+renderer releases the frame and skips the blend until the next buffer commit.
+Wanted by the d2r map overlay, which is shown only while the game's automap is
+open. Formatting and all-target release clippy passed; not runtime-checked
+(the running instance is the owner's play display and picks this up on its
+next restart).

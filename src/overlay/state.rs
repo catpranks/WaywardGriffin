@@ -323,7 +323,11 @@ impl CompositorHandler for State {
                         warn!("non-dmabuf buffer (shm?) ignored");
                     }
                 },
-                Some(BufferAssignment::Removed) => {}
+                Some(BufferAssignment::Removed) => {
+                    // A null attach hides the overlay: the renderer drops its
+                    // frame and skips the blend until the next buffer.
+                    *self.slot.lock().unwrap() = OverlayState::Inactive;
+                }
                 None => {}
             }
         });

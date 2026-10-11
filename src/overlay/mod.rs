@@ -77,7 +77,7 @@ pub enum OverlayState {
     Frame(OverlayFrame),
     /// Toplevels exist but no new frame since last take.
     Pending,
-    /// No toplevels connected.
+    /// No toplevels connected, or the client attached a null buffer.
     Inactive,
 }
 

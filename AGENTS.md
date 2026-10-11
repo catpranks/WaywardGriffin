@@ -44,7 +44,7 @@ All abstract Unix sockets, one instance per machine for now (`waygriff-0`).
 | `@waygriff-0.ctl` | stream, line protocol, JSON replies | `stats`, `state`, `set ...`, `ping`, `quit`, `help`. See `src/control.rs`. |
 | `@waygriff-0.snap` | stream | Connect, read `u32 LE width, height, stride` then `stride*height` bytes of BGRA. |
 | `@waygriff-0.input` | datagram, 12 bytes LE `{u32 type, f32, f32}` | type 0 = pointer delta, forwarded to the source. |
-| `waygriff-0` (`$XDG_RUNTIME_DIR`) | Wayland server | Overlay compositor: a client's surface is composited over the captured frame (alpha blended). `overlay-client` bin is a vello demo client. |
+| `waygriff-0` (`$XDG_RUNTIME_DIR`) | Wayland server | Overlay compositor: a client's surface is composited over the captured frame (alpha blended); attaching a null buffer hides it until the next commit with a buffer. `overlay-client` bin is a vello demo client. |
 
 ## Threads
 
